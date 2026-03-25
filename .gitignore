@@ -1,0 +1,7 @@
+*__pycache__*
+
+data/
+
+.env
+
+model/qwen3.5-0.8b/
