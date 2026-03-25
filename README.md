@@ -18,7 +18,7 @@ Depth Map ------------------------------------------------+
                                                           |
                                                           v
 RLE Masks ----> [RTI] Region Token Injection -----> token injection
-                  (mask_rgb + mask_depth)                  |
+                  (mask_rgb + mask_depth)                 |
                                                           v
 Question -----> [Tokenizer] --> text embeds ------> [Concat Fusion]
                                                           |
