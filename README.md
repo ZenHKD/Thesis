@@ -63,8 +63,9 @@ Thesis/
 │   ├── pipeline.py          # Full SpatialVLM pipeline (inference)
 │   ├── gsa.py               # Geometry Self-Attention (DFormerv2)
 │   ├── rti.py               # Region Token Injection
-│   ├── architecture.md      # Detailed architecture documentation
+│   ├── architecture.md      # Detailed architecture documentation (in progress)
 │   └── qwen3.5-0.8b/        # Local model weights (gitignored)
+├── src/
 ├── test/
 │   └── test_inference.py    # Inference test with real samples
 ├── data/                    # Dataset directory (gitignored)
