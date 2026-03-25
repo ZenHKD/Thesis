@@ -614,7 +614,7 @@ if __name__ == "__main__":
     for ex in examples:
         parsed = SpatialVLM.parse_output(ex)
         print(f"  Input:    {ex[:70]}...")
-        type_flag = "\u2705" if parsed['type_ok'] else "\u274c"
+        type_flag = "[OK]" if parsed['type_ok'] else "[FAIL]"
         print(f"  Parsed:   category={parsed['category']!r}  answer={parsed['answer']!r}  type_ok={type_flag}")
         print()
 
