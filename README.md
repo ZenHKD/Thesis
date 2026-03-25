@@ -69,6 +69,8 @@ Thesis/
 ├── test/
 │   └── test_inference.py    # Inference test with real samples
 ├── data/                    # Dataset directory (gitignored)
+├── count_qwen3_5_params.py  # Parameter counting script (outputs to Qwen3.5-0.8B.txt)
+├── Qwen3.5-0.8B.txt         # Parameter breakdown output
 ├── setup_nvidia_dataset.py  # Dataset download script
 ├── .env                     # HF_TOKEN (gitignored)
 └── README.md
