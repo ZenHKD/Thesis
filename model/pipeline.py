@@ -1,5 +1,5 @@
 """
-MODULE: Full Pipeline -- SpatialVLM (Test Inference only)
+MODULE: Full Pipeline -- SpatialVLM (Inference only)
 
 Architecture:
     1. Qwen 3.5 Vision Encoder (pretrained, 100.59M)
@@ -34,7 +34,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
-import pycocotools.mask as mask_utils
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -80,6 +79,30 @@ _ANSWER_TYPE = {
     "distance":   lambda a: '.' in a and not a.startswith('"'),
     "count":      lambda a: a.isdigit(),
 }
+
+
+def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
+    """Find token positions of <mask> in input_ids.
+
+    Qwen BPE tokenizes <mask> as 3 subtokens:
+      - isolated: ['<', 'mask', '>']  = [27, 10931, 29]
+      - in context: [' <', 'mask', '>'] = [361, 10931, 29]
+    Matches by decoded text to handle both cases.
+    """
+    ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
+    decoded = [tokenizer.decode([t]) for t in ids]
+
+    positions = []
+    i = 0
+    while i < len(decoded) - 2:
+        if (decoded[i].rstrip().endswith('<')
+                and decoded[i+1] == 'mask'
+                and decoded[i+2].lstrip().startswith('>')):
+            positions.append(i)
+            i += 3
+        else:
+            i += 1
+    return positions
 
 
 class SpatialVLM(nn.Module):
@@ -437,8 +460,7 @@ class SpatialVLM(nn.Module):
             }
         return {"free_answer": text.strip(), "category": "unknown", "answer": None, "type_ok": False}
 
-    # Full inference convenience method
-
+    # Full inference method
     @torch.no_grad()
     def predict(
         self,
@@ -446,11 +468,11 @@ class SpatialVLM(nn.Module):
         question: str,
         depth_map: torch.Tensor,        # [H, W] raw depth tensor
         rle_list: list = None,
-        mask_token_positions: list = None,
         max_new_tokens: int = 100,
     ) -> dict:
-        """End-to-end: image + question -> {free_answer, category, answer, type_ok}.
+        """End-to-end: image + question -> {free_answer, category, answer, type_ok, raw}.
 
+        Auto-finds <mask> positions in tokenized input and matches with rle_list.
         Adds SYSTEM_PROMPT automatically.
         """
         messages = [
@@ -472,15 +494,31 @@ class SpatialVLM(nn.Module):
         input_ids      = inputs["input_ids"].to(device=dev)
         depth_batch    = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
 
+        # Auto-find <mask> positions
+        mask_positions = find_mask_positions(input_ids, self.processor.tokenizer)
+
+        # Match mask count with RLE list
+        if rle_list is not None and len(rle_list) > 0:
+            n = min(len(mask_positions), len(rle_list))
+            mask_positions = mask_positions[:n]
+            rle_list = rle_list[:n]
+        else:
+            rle_list = None
+            mask_positions = None
+
         output_ids = self.generate(
             pixel_values, image_grid_thw, depth_batch, input_ids,
-            rle_list=rle_list, mask_token_positions=mask_token_positions,
+            rle_list=rle_list,
+            mask_token_positions=mask_positions,
             max_new_tokens=max_new_tokens,
         )
         decoded = self.processor.tokenizer.batch_decode(
             output_ids, skip_special_tokens=True
         )
-        return self.parse_output(decoded[0])
+        raw_output = decoded[0]
+        result = self.parse_output(raw_output)
+        result["raw"] = raw_output
+        return result
 
 
 # Parameter counting util
@@ -510,9 +548,6 @@ def print_vram_usage(label: str = ""):
 
 if __name__ == "__main__":
     import argparse
-    import numpy as np
-    from PIL import Image
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--device",   default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",    default="bfloat16", choices=["bfloat16", "float32"])
@@ -524,7 +559,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
     print("=" * 70)
-    print("MODULE: SpatialVLM -- Inference Only")
+    print("MODULE: SpatialVLM")
     print("=" * 70)
 
     pipeline = SpatialVLM(
