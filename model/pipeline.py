@@ -33,7 +33,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig, BitsAndBytesConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
 import pycocotools.mask as mask_utils
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -103,44 +103,21 @@ class SpatialVLM(nn.Module):
         dropout:                 float = 0.1,
         dtype                          = torch.bfloat16,
         device_map:              str   = "auto",
-        quantize:                bool  = False,   # QLoRA: load Qwen NF4, GSA+RTI stay bfloat16
         attn_implementation:     str   = "sdpa",  # "flash_attention_2", "sdpa", or "eager"
-        max_position_embeddings: int   = None,    # override context length (default: keep original)
     ):
         super().__init__()
 
-        # Load and optionally override config
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        if max_position_embeddings is not None:
-            config.text_config.max_position_embeddings = max_position_embeddings
-            print(f"  Context length overridden -> {max_position_embeddings}")
 
-        if quantize:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-            print(f"Loading {model_name} (QLoRA - NF4 base, bfloat16 compute)...")
-            self.qwen = AutoModelForImageTextToText.from_pretrained(
-                model_name,
-                config=config,
-                quantization_config=bnb_config,
-                attn_implementation=attn_implementation,
-                device_map=device_map,
-                trust_remote_code=True,
-            )
-        else:
-            print(f"Loading {model_name}...")
-            self.qwen = AutoModelForImageTextToText.from_pretrained(
-                model_name,
-                config=config,
-                dtype=dtype,
-                attn_implementation=attn_implementation,
-                device_map=device_map,
-                trust_remote_code=True,
-            )
+        print(f"Loading {model_name}...")
+        self.qwen = AutoModelForImageTextToText.from_pretrained(
+            model_name,
+            config=config,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
         print(f"  attn_implementation: {attn_implementation}")
 
         self.processor = AutoProcessor.from_pretrained(
@@ -539,13 +516,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--device",   default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",    default="bfloat16", choices=["bfloat16", "float32"])
-    parser.add_argument("--quantize", action="store_true",
-                        help="Load Qwen in NF4 (BitsAndBytes)")
     parser.add_argument("--attn-impl", default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"],
                         help="Attention implementation (default: flash_attention_2)")
-    parser.add_argument("--max-pos-embeddings", type=int, default=None,
-                        help="Override max_position_embeddings (context length)")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -558,9 +531,7 @@ if __name__ == "__main__":
         model_name=MODEL_NAME,
         dtype=dtype,
         device_map=args.device,
-        quantize=args.quantize,
         attn_implementation=args.attn_impl,
-        max_position_embeddings=args.max_pos_embeddings,
     )
     print_vram_usage("after model load")
 

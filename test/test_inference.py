@@ -4,7 +4,6 @@ Test SpatialVLM pipeline inference with real samples from train_sample.json.
 Usage:
     python test/test_inference.py
     python test/test_inference.py --num-samples 10
-    python test/test_inference.py --quantize          # NF4 QLoRA
     python test/test_inference.py --attn-impl sdpa    # SDPA attention
 """
 
@@ -102,7 +101,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test SpatialVLM with 5 real samples")
     parser.add_argument("--device",    default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",     default="bfloat16", choices=["bfloat16", "float32"])
-    parser.add_argument("--quantize",  action="store_true", help="Load Qwen in NF4")
+
     parser.add_argument("--attn-impl", default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--max-new-tokens", type=int, default=100)
@@ -136,7 +135,6 @@ def main():
     pipeline = SpatialVLM(
         dtype=dtype,
         device_map=args.device,
-        quantize=args.quantize,
         attn_implementation=args.attn_impl,
     )
     print_vram_usage("after model load")
