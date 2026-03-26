@@ -461,8 +461,9 @@ class SpatialVLM(nn.Module):
             ]},
         ]
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True,
         )
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
         inputs = self.processor(text=[text], images=[image], return_tensors="pt")
 
         dev   = self.device
@@ -615,8 +616,9 @@ if __name__ == "__main__":
         ]},
     ]
     text   = pipeline.processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,
     )
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     inputs = pipeline.processor(
         text=[text], images=[dummy_image], return_tensors="pt", padding=True
     )

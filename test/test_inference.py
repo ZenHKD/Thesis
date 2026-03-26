@@ -162,8 +162,9 @@ def main():
             ]},
         ]
         text = pipeline.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True,
         )
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
         inputs = pipeline.processor(
             text=[text], images=[s["image"]], return_tensors="pt", padding=True
         )
