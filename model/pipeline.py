@@ -463,7 +463,6 @@ class SpatialVLM(nn.Module):
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
         inputs = self.processor(text=[text], images=[image], return_tensors="pt")
 
         dev   = self.device
@@ -570,93 +569,3 @@ if __name__ == "__main__":
     print(f"  Qwen 3.5 unique:  {total_qwen:>12,} ({total_qwen/1e6:.4f}M)")
     print(f"  Custom modules:   {total_custom:>12,} ({total_custom/1e6:.4f}M)")
     print(f"  Total unique:     {total_qwen + total_custom:>12,} ({(total_qwen + total_custom)/1e6:.4f}M)")
-
-    # parse_output() demo
-    print(f"\n{'='*70}")
-    print("parse_output() DEMO")
-    print(f"{'='*70}")
-    examples = [
-        'CATEGORY: distance | ANSWER: 5.2 | FREE_ANSWER: The distance between the two pallets is about 5 meters.',
-        'CATEGORY: left_right | ANSWER: "left" | FREE_ANSWER: The object on the left appears closer.',
-        'CATEGORY: count | ANSWER: 3 | FREE_ANSWER: There are 3 pallets in the buffer zone.',
-        'CATEGORY: mcq | ANSWER: "2" | FREE_ANSWER: Pallet index 2 is optimal for the transporter.',
-        'CATEGORY: distance | ANSWER: 3 | FREE_ANSWER: Type mismatch -- integer instead of float.',
-        'Some unexpected output that does not match.',
-    ]
-    for ex in examples:
-        parsed = SpatialVLM.parse_output(ex)
-        print(f"  Input:    {ex[:70]}...")
-        type_flag = "[OK]" if parsed['type_ok'] else "[FAIL]"
-        print(f"  Parsed:   category={parsed['category']!r}  answer={parsed['answer']!r}  type_ok={type_flag}")
-        print()
-
-    # Forward pass test
-    print(f"{'='*70}")
-    print("FORWARD PASS TEST (FullHD 1920x1080)")
-    print(f"{'='*70}")
-
-    dev   = pipeline.device
-    B     = 1
-    H, W  = 1080, 1920
-
-    dummy_image = Image.fromarray(
-        np.random.randint(0, 255, (H, W, 3), dtype=np.uint8)
-    )
-    dummy_depth = torch.rand(B, H, W, device=dev, dtype=dtype) * 10.0
-
-    question = (
-        "Using the buffer masks <mask> <mask> and pallet masks <mask> <mask>, "
-        "how many pallets are in the buffer zone?"
-    )
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": [
-            {"type": "image", "image": dummy_image},
-            {"type": "text",  "text": question},
-        ]},
-    ]
-    text   = pipeline.processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-    inputs = pipeline.processor(
-        text=[text], images=[dummy_image], return_tensors="pt", padding=True
-    )
-
-    pixel_values   = inputs["pixel_values"].to(device=dev, dtype=dtype)
-    image_grid_thw = inputs["image_grid_thw"].to(device=dev)
-    input_ids      = inputs["input_ids"].to(device=dev)
-
-    # Dummy RLE: 200x400 rectangle (encoded via pycocotools)
-    mask_np = np.zeros((H, W), dtype=np.uint8, order="F")
-    mask_np[200:400, 300:700] = 1
-    dummy_rle = mask_utils.encode(mask_np)
-    dummy_rle["counts"] = dummy_rle["counts"].decode("utf-8")
-    dummy_rle_list       = [dummy_rle] * 4   # 4 <mask> in question
-    dummy_mask_positions = [5, 10, 15, 20]   # fake positions
-
-    print(f"\n  pixel_values:   {list(pixel_values.shape)}")
-    print(f"  image_grid_thw: {image_grid_thw.tolist()}")
-    print(f"  depth_map:      {list(dummy_depth.shape)}")
-    print(f"  input_ids:      {list(input_ids.shape)}")
-    print(f"  rle_list:       {len(dummy_rle_list)} masks")
-
-    # Reset peak stats to isolate inference-only peak
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    with torch.no_grad():
-        out = pipeline(
-            pixel_values, image_grid_thw, dummy_depth, input_ids,
-            rle_list=dummy_rle_list,
-            mask_token_positions=dummy_mask_positions,
-        )
-
-    print(f"\n  logits: {list(out['logits'].shape)}")
-    print_vram_usage("after forward pass")
-
-    print(f"\n{'='*70}")
-    print("  Pipeline OK: Qwen VE -> GSA -> RTI -> Concat -> Backbone -> LM Head")
-    print(f"   Custom: GSA + RTI |  Output: structured text")
-    print(f"{'='*70}")
-    print_vram_usage("final summary")
