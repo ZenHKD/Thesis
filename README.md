@@ -124,7 +124,9 @@ CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value> | FREE_ANSWER: <expl
 
 ## References
 
-- **Qwen 3.5**: [Qwen Team](https://huggingface.co/Qwen/Qwen3.5-0.8B)
-- **DFormerv2**: [CVPR 2025](https://arxiv.org/abs/2504.04701) -- Geometry Self-Attention
+- **SmolRGPT**: [arXiv 2509.15490](https://arxiv.org/abs/2509.15490) -- Region-level spatial reasoning for warehouse environments, submitted to ICCVW (primary inspiration for RTI)
+- **RegionGPT**: [CVPR 2024](https://arxiv.org/abs/2403.02330) -- Region understanding VLM with `<region>` token injection (foundation for RTI design)
+- **Qwen 3.5**: [Qwen Team](https://huggingface.co/Qwen/Qwen3.5-0.8B) -- Base VLM backbone
+- **DFormerv2**: [CVPR 2025](https://arxiv.org/abs/2504.04701) -- Geometry Self-Attention (GSA architecture)
 - **DBNet++**: [TPAMI 2022](https://arxiv.org/abs/2202.10304) -- Differentiable Binarization (soft mask in RTI)
-- **Gated Attention MIL**: [ICML 2018](https://arxiv.org/abs/1802.04712) -- Attention-based pooling
+- **Gated Attention MIL**: [ICML 2018](https://arxiv.org/abs/1802.04712) -- Attention-based pooling (RTI mask_rgb)
