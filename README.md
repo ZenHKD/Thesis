@@ -65,7 +65,12 @@ Thesis/
 │   ├── rti.py               # Region Token Injection
 │   ├── architecture.md      # Detailed architecture documentation (in progress)
 │   └── qwen3.5-0.8b/        # Local model weights (gitignored)
+├── notebooks/
+│   └── 00_EDA.ipynb         # Exploratory Data Analysis
 ├── src/
+│   ├── dataloader/
+│   ├── train_phase1/
+│   └── train_phase2/
 ├── test/
 │   └── test_inference.py    # Inference test with real samples
 ├── data/                    # Dataset directory (gitignored)
