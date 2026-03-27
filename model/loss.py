@@ -66,13 +66,22 @@ class SpatialVLMLoss(nn.Module):
         """Standard autoregressive language modeling loss.
 
         Args:
-            logits: [B, T, vocab_size] -- model output logits
-            labels: [B, T] -- target token ids, with -100 for ignored positions
+            logits: [B, L', vocab_size] -- model output logits (text tokens only)
+            labels: [B, L]  -- target token ids, with -100 for ignored positions
+                    L' may be shorter than L when RTI replaces <mask> (3 subtokens)
+                    with 2 region tokens, shortening the sequence by 1 per mask.
                     (shifted internally: logits[:-1] predicts labels[1:])
 
         Returns:
             Scalar CE loss
         """
+        # Align: RTI may shorten the text sequence (3 mask subtokens -> 2 region tokens)
+        # Trim leading labels (all -100 prompt tokens) to match logits length
+        if logits.shape[1] != labels.shape[1]:
+            diff = labels.shape[1] - logits.shape[1]
+            if diff > 0:
+                labels = labels[:, diff:]
+
         # Shift: predict next token
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
