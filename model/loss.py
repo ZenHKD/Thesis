@@ -25,9 +25,8 @@ _ANSWER_TYPE = {
 # Output parsing regex (same as pipeline.py)
 _OUTPUT_RE = re.compile(
     r"CATEGORY:\s*(?P<category>\S+)\s*\|\s*"
-    r"ANSWER:\s*(?P<answer>.+?)\s*\|\s*"
-    r"FREE_ANSWER:\s*(?P<free_answer>.+)",
-    re.IGNORECASE,
+    r"ANSWER:\s*(?P<answer>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -93,7 +92,7 @@ class SpatialVLMLoss(nn.Module):
         """Binary format-consistency penalty.
 
         For each sample in the batch, checks if the decoded output:
-        1. Matches the structured format: CATEGORY: ... | ANSWER: ... | FREE_ANSWER: ...
+        1. Matches the structured format: CATEGORY: ... | ANSWER: ...
         2. Has consistent CATEGORY <-> ANSWER types (e.g. distance -> float)
 
         Args:
@@ -158,7 +157,7 @@ def build_labels(
     """Build training labels from input_ids by masking everything before the answer.
 
     The model should only be trained to predict the answer portion
-    (CATEGORY: ... | ANSWER: ... | FREE_ANSWER: ...), not the prompt.
+    (CATEGORY: ... | ANSWER: ...), not the prompt.
 
     Args:
         input_ids:        [B, T] full input sequence
@@ -172,68 +171,3 @@ def build_labels(
     labels = input_ids.clone()
     labels[:, :answer_start_pos] = ignore_index
     return labels
-
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("LOSS MODULE TEST")
-    print("=" * 60)
-
-    criterion = SpatialVLMLoss(lambda_fmt=0.2)
-
-    # Simulate logits and labels (dummy inputs)
-    B, T, V = 2, 50, 248320
-    logits = torch.randn(B, T, V)
-    labels = torch.randint(0, V, (B, T))
-    labels[:, :20] = -100  # mask prompt
-
-    # Good format
-    decoded_good = [
-        'CATEGORY: distance | ANSWER: 5.2 | FREE_ANSWER: The distance is 5.2 meters.',
-        'CATEGORY: mcq | ANSWER: "2" | FREE_ANSWER: Option 2 is closest.',
-    ]
-    result = criterion(logits, labels, decoded_good)
-    print(f"\n  Good format:")
-    print(f"    L_lm    = {result['l_lm'].item():.4f}")
-    print(f"    L_fmt   = {result['l_fmt'].item():.4f}  (expect 0.0)")
-    print(f"    L_total = {result['loss'].item():.4f}")
-
-    # Bad format
-    decoded_bad = [
-        'CATEGORY: left_right | ANSWER: left',  # missing FREE_ANSWER
-        'CATEGORY: distance | ANSWER: "five" | FREE_ANSWER: wrong type',
-    ]
-    result = criterion(logits, labels, decoded_bad)
-    print(f"\n  Bad format:")
-    print(f"    L_lm    = {result['l_lm'].item():.4f}")
-    print(f"    L_fmt   = {result['l_fmt'].item():.4f}  (expect 1.0)")
-    print(f"    L_total = {result['loss'].item():.4f}")
-
-    # Mixed format
-    decoded_mixed = [
-        'CATEGORY: count | ANSWER: 3 | FREE_ANSWER: There are 3.',
-        'CATEGORY: mcq | ANSWER: five | FREE_ANSWER: wrong type',
-    ]
-    result = criterion(logits, labels, decoded_mixed)
-    print(f"\n  Mixed format (1 good, 1 bad):")
-    print(f"    L_lm    = {result['l_lm'].item():.4f}")
-    print(f"    L_fmt   = {result['l_fmt'].item():.4f}  (expect 0.5)")
-    print(f"    L_total = {result['loss'].item():.4f}")
-
-    # No format loss
-    result = criterion(logits, labels)
-    print(f"\n  No format loss (skipped):")
-    print(f"    L_lm    = {result['l_lm'].item():.4f}")
-    print(f"    L_fmt   = {result['l_fmt'].item():.4f}  (expect 0.0)")
-    print(f"    L_total = {result['loss'].item():.4f}")
-
-    # build_labels test
-    ids = torch.arange(100).unsqueeze(0)  # [1, 100]
-    lbl = build_labels(ids, answer_start_pos=70)
-    n_masked = (lbl == -100).sum().item()
-    n_active = (lbl != -100).sum().item()
-    print(f"\n  build_labels: {n_masked} masked, {n_active} active (expect 70/30)")
-
-    print(f"\n{'='*60}")
-    print("  Loss module [OK]")
-    print(f"{'='*60}")

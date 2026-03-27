@@ -13,7 +13,7 @@ Architecture:
     6. Qwen LM Head (built-in, tied with embeddings) -> structured text
 
 Output format:
-    CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value> | FREE_ANSWER: <explanation>
+    CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value>
 
 Qwen 3.5 0.8B model hierarchy (verified from weights):
     model.visual                          -> Vision Encoder (100.59M)
@@ -44,30 +44,29 @@ from model.rti import RTE
 MODEL_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen3.5-0.8b")
 
 # System Prompt (prepended to every input, train & inference)
-# Format: CATEGORY first -> ANSWER (type-committed) -> FREE_ANSWER (coherent explanation)
-# Approach 1: reversed order ensures FREE_ANSWER is always consistent with ANSWER.
+# Format: CATEGORY -> ANSWER (type-committed)
 SYSTEM_PROMPT = (
     "You are a spatial reasoning assistant. "
     "You MUST always respond in the following exact format:\n"
     "CATEGORY: <left_right|mcq|distance|count> | "
-    "ANSWER: <value> | "
-    "FREE_ANSWER: <natural language explanation>\n"
-    "For left_right: ANSWER is \"left\" or \"right\". "
-    "For mcq: ANSWER is a quoted integer e.g. \"1\". "
-    "For distance: ANSWER is a float e.g. 5.2. "
-    "For count: ANSWER is an integer e.g. 3. "
+    "ANSWER: <value>\n\n"
+    "Examples (follow exactly):\n"
+    'CATEGORY: left_right | ANSWER: "left"\n'
+    'CATEGORY: left_right | ANSWER: "right"\n'
+    'CATEGORY: mcq | ANSWER: "1"\n'
+    "CATEGORY: distance | ANSWER: 5.2\n"
+    "CATEGORY: count | ANSWER: 3\n\n"
+    "The quotes around left_right and mcq answers are mandatory. "
     "Do not add any text before or after this format."
 )
 
 # Regex for structured output parsing
-# Format: CATEGORY -> ANSWER -> FREE_ANSWER  (Approach 1: answer-first, explanation last)
+# Format: CATEGORY -> ANSWER
 # Flat regex: no lookbehind - cross-field type check done in parse_output() instead.
 # ANSWER alternatives ordered float-before-int so "5.2" always matches as float.
-# FREE_ANSWER uses .+ safely - it is the final field, nothing follows it.
 _OUTPUT_RE = re.compile(
     r'CATEGORY:\s*(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'ANSWER:\s*(?P<answer>"left"|"right"|"\d+"|\d+\.\d+|\d+)\s*\|\s*'
-    r'FREE_ANSWER:\s*(?P<free_answer>.+)',
+    r'ANSWER:\s*(?P<answer>"left"|"right"|"\d+"|\d+\.\d+|\d+)',
     re.IGNORECASE,
 )
 
@@ -434,17 +433,17 @@ class SpatialVLM(nn.Module):
 
     @staticmethod
     def parse_output(text: str) -> dict:
-        """Parse structured LM output -> {free_answer, category, answer, type_ok}.
+        """Parse structured LM output -> {category, answer, type_ok}.
 
-        Expected format (Approach 1 -- answer-first):
-            CATEGORY: <task> | ANSWER: <value> | FREE_ANSWER: <explanation>
+        Expected format:
+            CATEGORY: <task> | ANSWER: <value>
 
-        Approach 2 -- cross-field type validation after parse:
+        Cross-field type validation after parse:
             Checks that ANSWER type matches CATEGORY (e.g. distance must be float).
             'type_ok' = False signals a format-consistency failure.
 
         Returns:
-            dict with keys: 'free_answer', 'category', 'answer', 'type_ok'
+            dict with keys: 'category', 'answer', 'type_ok'
             On parse failure: category='unknown', answer=None, type_ok=False.
         """
         m = _OUTPUT_RE.search(text)
@@ -453,12 +452,11 @@ class SpatialVLM(nn.Module):
             answer   = m.group("answer").strip()
             type_ok  = _ANSWER_TYPE.get(category, lambda _: False)(answer)
             return {
-                "free_answer": m.group("free_answer").strip(),
                 "category":    category,
                 "answer":      answer,
-                "type_ok":     type_ok,   # Approach 2: CATEGORY<->ANSWER consistency flag
+                "type_ok":     type_ok,
             }
-        return {"free_answer": text.strip(), "category": "unknown", "answer": None, "type_ok": False}
+        return {"category": "unknown", "answer": None, "type_ok": False}
 
     # Full inference method
     @torch.no_grad()
@@ -470,7 +468,7 @@ class SpatialVLM(nn.Module):
         rle_list: list = None,
         max_new_tokens: int = 100,
     ) -> dict:
-        """End-to-end: image + question -> {free_answer, category, answer, type_ok, raw}.
+        """End-to-end: image + question -> {category, answer, type_ok, raw}.
 
         Auto-finds <mask> positions in tokenized input and matches with rle_list.
         Adds SYSTEM_PROMPT automatically.
