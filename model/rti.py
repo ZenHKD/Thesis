@@ -269,7 +269,7 @@ class RTE(nn.Module):
         # Basic depth stats (pixel-level masked values)
         vals       = depth_map[:, bool_mask].float()                         # [B, M]  (M = number of masked pixels)
         mean_d     = vals.mean(dim=1)                                        # [B]
-        std_d      = vals.std(dim=1).nan_to_num(0.0).clamp(min=0.0)          # [B]
+        std_d      = vals.std(dim=1, correction=0).clamp(min=0.0)            # [B]
 
         # 24-ray radial depth profile
         profile = _radial_depth_profile(
