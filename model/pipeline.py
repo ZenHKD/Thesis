@@ -27,6 +27,7 @@ Qwen 3.5 0.8B model hierarchy (verified from weights):
 """
 
 import re
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import sys
 import os
 import math
@@ -183,8 +184,9 @@ class SpatialVLM(nn.Module):
     ) -> torch.Tensor:
         """Run Qwen's Vision Encoder + Merger -> [B, N', 1024].
 
-        model.visual() returns 768-dim pre-merger hidden states.
-        Apply the merger (LN -> 2x2 merge -> MLP 3072->1024) manually.
+        model.visual() returns 768-dim pre-merger hidden states as a flat
+        [total_N, 768] tensor (patches from all images concatenated).
+        Split by image, apply the merger per-image, then stack.
         """
         visual = self.qwen.model.visual
         visual_out = visual(pixel_values, grid_thw=image_grid_thw)
@@ -199,31 +201,55 @@ class SpatialVLM(nn.Module):
         else:
             hidden = visual_out
 
+        B = image_grid_thw.shape[0]
+
+        # Compute per-image patch counts from grid
+        patches_per_image = [
+            int(image_grid_thw[i, 0] * image_grid_thw[i, 1] * image_grid_thw[i, 2])
+            for i in range(B)
+        ]
+
         if hidden.dim() == 2:
-            hidden = hidden.unsqueeze(0)
+            # [total_N, C] -> split per image
+            hidden_list = hidden.split(patches_per_image, dim=0)
+        else:
+            # [B, N, C] already batched (rare)
+            hidden_list = [hidden[i] for i in range(B)]
 
-        if hidden.shape[-1] == 1024:
-            return hidden
+        if hidden_list[0].shape[-1] == 1024:
+            # Already merged -- pad and stack
+            max_n = max(h.shape[0] for h in hidden_list)
+            stacked = torch.stack([
+                F.pad(h, (0, 0, 0, max_n - h.shape[0])) for h in hidden_list
+            ])
+            return stacked  # [B, max_N, 1024]
 
-        # Pre-merger: [B, N, 768] -> Apply merger manually
-        B, N, C = hidden.shape
-        t, h, w = [int(x) for x in image_grid_thw[0].tolist()]
-
-        # Step 1: LayerNorm
-        hidden = visual.merger.norm(hidden)
-
-        # Step 2: 2x2 spatial merge -> [B, N/4, 4xC=3072]
+        # Pre-merger: apply merger per-image (grids may differ)
         ms = 2
-        hidden = hidden.view(B, t, h, w, C)
-        hidden = hidden.view(B, t, h // ms, ms, w // ms, ms, C)
-        hidden = hidden.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
-        hidden = hidden.view(B, -1, ms * ms * C)   # [B, N/4, 3072]
+        merged = []
+        for i in range(B):
+            h_i = hidden_list[i].unsqueeze(0)  # [1, N_i, 768]
+            t, h, w = [int(x) for x in image_grid_thw[i].tolist()]
+            C = h_i.shape[-1]
 
-        # Step 3: MLP 3072 -> 1024
-        hidden = visual.merger.linear_fc1(hidden)
-        hidden = F.gelu(hidden)
-        hidden = visual.merger.linear_fc2(hidden)  # [B, N/4, 1024]
-        return hidden
+            # LayerNorm
+            h_i = visual.merger.norm(h_i)
+
+            # 2x2 spatial merge -> [1, N_i/4, 3072]
+            h_i = h_i.view(1, t, h, w, C)
+            h_i = h_i.view(1, t, h // ms, ms, w // ms, ms, C)
+            h_i = h_i.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
+            h_i = h_i.view(1, -1, ms * ms * C)
+
+            # MLP 3072 -> 1024
+            h_i = visual.merger.linear_fc1(h_i)
+            h_i = F.gelu(h_i)
+            h_i = visual.merger.linear_fc2(h_i)  # [1, N'/4, 1024]
+
+            merged.append(h_i)
+
+        # All FullHD images have the same grid, so shapes match
+        return torch.cat(merged, dim=0)  # [B, N', 1024]
 
     def _build_inputs_embeds(
         self,
@@ -279,12 +305,16 @@ class SpatialVLM(nn.Module):
         inputs_embeds: torch.Tensor,
         past_key_values=None,
         cache_position: torch.Tensor = None,
+        use_gradient_checkpointing: bool = False,
     ):
         """Run 24 Qwen backbone layers on inputs_embeds -> [B, T, 1024].
 
         Optionally supports KV-cache: pass a Qwen3_5DynamicCache as
         past_key_values and the corresponding cache_position.
         The cache is updated **in-place** by each layer.
+
+        If use_gradient_checkpointing=True, intermediate activations are
+        recomputed during backward instead of stored (~9GB -> ~1GB VRAM savings).
 
         Returns:
             hidden: [B, T, 1024]
@@ -310,12 +340,22 @@ class SpatialVLM(nn.Module):
             if past_key_values is not None:
                 kwargs["past_key_values"] = past_key_values
                 kwargs["cache_position"] = cache_position
-            try:
-                layer_out = layer(hidden, **kwargs)
-            except TypeError:
-                # Fallback: some layer types (e.g. DeltaNet) may not accept position kwargs
-                layer_out = layer(hidden)
-            hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+
+            if use_gradient_checkpointing and self.training and not torch.is_grad_enabled() is False:
+                # Recompute layer activations during backward to save VRAM
+                def _layer_fn(h, _layer=layer, _kwargs=kwargs):
+                    try:
+                        out = _layer(h, **_kwargs)
+                    except TypeError:
+                        out = _layer(h)
+                    return out[0] if isinstance(out, tuple) else out
+                hidden = grad_checkpoint(_layer_fn, hidden, use_reentrant=False)
+            else:
+                try:
+                    layer_out = layer(hidden, **kwargs)
+                except TypeError:
+                    layer_out = layer(hidden)
+                hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         return hidden
 
@@ -327,8 +367,9 @@ class SpatialVLM(nn.Module):
         input_ids:            torch.Tensor,
         rle_list:             list = None,
         mask_token_positions: list = None,
+        use_gradient_checkpointing: bool = False,
     ) -> dict:
-        """Inference forward pass.
+        """Training/inference forward pass.
 
         Args:
             pixel_values:         [B*patches, C*ph*pw] from Qwen processor
@@ -337,18 +378,26 @@ class SpatialVLM(nn.Module):
             input_ids:            [B, L] tokenized question
             rle_list:             list[dict] RLE per <mask>, or None
             mask_token_positions: sorted token indices of <mask> in input_ids, or None
+            use_gradient_checkpointing: recompute backbone activations during
+                                        backward to save VRAM (default: False)
         Returns:
-            dict with 'logits': [B, T, vocab_size]
+            dict with 'logits': [B, L, vocab_size] (text tokens only, aligned with labels)
         """
         inputs_embeds, n_visual = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions,
         )
 
-        # Backbone
-        hidden = self._backbone_forward(inputs_embeds)          # [B, T, 1024]
+        # Backbone -- full sequence (visual + text)
+        hidden = self._backbone_forward(
+            inputs_embeds,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        )  # [B, T, 1024]
         hidden = self.qwen.model.language_model.norm(hidden)    # [B, T, 1024]
-        logits = self.qwen.lm_head(hidden)                      # [B, T, vocab]
+
+        # LM Head -- only on text tokens (visual tokens have no labels)
+        text_hidden = hidden[:, n_visual:, :]                   # [B, L, 1024]
+        logits = self.qwen.lm_head(text_hidden)                 # [B, L, vocab]
 
         return {"logits": logits}
 
