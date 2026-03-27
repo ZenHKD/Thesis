@@ -115,7 +115,7 @@ python test/test_inference.py
 The model produces structured text output:
 
 ```
-CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value> | FREE_ANSWER: <explanation>
+CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value>
 ```
 
 ## Training Strategy
