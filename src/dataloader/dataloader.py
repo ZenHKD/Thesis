@@ -242,7 +242,7 @@ def collate_fn(batch: list[dict]) -> dict:
     """Custom collate for SpatialVLMDataset.
 
     Since all images are FullHD (1920x1080), pixel_values and image_grid_thw
-    have consistent shapes. input_ids/labels may vary slightly -- we pad them.
+    have consistent shapes. input_ids/labels may vary slightly, so pad them.
     """
     # Pad input_ids and labels to max length in batch
     max_len = max(d["input_ids"].shape[0] for d in batch)
