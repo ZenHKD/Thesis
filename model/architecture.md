@@ -68,7 +68,7 @@ Image [B, 3, H, W]  — Dataset: 1920×1080 FullHD
 | Input | ViT patches | Post-merger tokens | Grid layout |
 |-------|------------|-------------------|-------------|
 | 448×448 (square test) | 28×28 = 784 | 196 | 14×14 (square) |
-| 1920×1080 (FullHD dataset) | ~60×34 = ~2040 | ~510 | ~30×17 (rectangular) |
+| 1920×1080 (FullHD dataset) | 120×68 = 8160 | 2040 | 60×34 (rectangular) |
 
 > **Key**: Grid is **rectangular** for FullHD. `isqrt(N)` crashes — use `image_grid_thw` from processor. \
 > `model.visual()` returns **pre-merger** (768-dim). Merger is called manually.
@@ -90,7 +90,7 @@ flowchart TB
 
     subgraph QWEN_VE["Qwen 3.5 Vision Encoder"]
         VE["12 ViT Blocks\nhidden=768, GELU MLP"]
-        MG["Merger (VL Projector)\n2×2 merge → 3072→1024\n784→196 tokens"]
+        MG["Merger (VL Projector)\n2×2 merge → 3072→1024\n8160→2040 tokens (FullHD)"]
         VE --> MG
     end
 
@@ -126,7 +126,7 @@ flowchart TB
     end
 
     subgraph OUT["Output — LM Head (Qwen built-in)"]
-        ANS["Structured Text Output\nCATEGORY: distance | ANSWER: 5.2 | FREE_ANSWER: ...\n↓ regex parse → category + normalized_answer"]
+        ANS["Structured Text Output\nCATEGORY: distance | ANSWER: 5.2\n↓ regex parse → category + normalized_answer"]
     end
 
     RGB --> VE
@@ -181,7 +181,7 @@ Qwen 3.5 provides the full VLM pipeline out-of-the-box. We add only **2 custom m
 | **Per block** | **~8.457M** | |
 | **× 2 blocks** | **~16.91M** | Verified ✅ |
 
-> **FullHD example**: 1920×1080 → merger → h_vis=18, w_vis=30 → N=540 tokens (non-square ✅) \
+> **FullHD example**: 1920×1080 → ViT patches [120×68=8160] → merger 2×2 → h_vis=34, w_vis=60 → N=2040 tokens (non-square ✅) \
 > `image_grid_thw` always passed explicitly — never use `isqrt(N)` on non-square grids.
 
 ---
@@ -214,10 +214,10 @@ soft_mask = σ(K × (coverage − θ))  K=50, θ=0.3  [h_vis, w_vis] ∈(0,1)
      ↓                            pixel-level masked vals → [B, M]
  Gated Attention Pool (soft)                 ↓
    score_i = Linear(token_i)      mean_d, std_d, cx_soft, cy_soft → [B, 4]
-   log_soft_i = log(soft_mask_i)  8-bin soft histogram            → [B, 8]
-   weights = softmax(score+log_soft)  concat → stats [B, 12]
+   log_soft_i = log(soft_mask_i)  24-ray radial depth profile     → [B, 24]
+   weights = softmax(score+log_soft)  concat → stats [B, 28]
    mask_rgb = Σ wᵢ · tokenᵢ           ↓
-     ↓                        Linear(10→1024) + LayerNorm
+     ↓                        Linear(28→1024) + LayerNorm
  [B, 1024]                         [B, 1024]
  <mask_rgb>                        <mask_depth>
          ↘                         ↙
@@ -271,30 +271,28 @@ cx_soft = Σᵢ(col_i × soft_i) / Σᵢ(soft_i)  — soft-weighted centroid X
 Instead of separate custom heads, the **LM Head (Qwen built-in)** is fine-tuned to produce structured text output directly:
 
 ```
-CATEGORY: distance | ANSWER: 5.2 | FREE_ANSWER: The pallet on the left is closer to the camera.
+CATEGORY: distance | ANSWER: 5.2
 ```
 
 | Field | Meaning | Example |
 |-------|---------|---------|
-| `FREE_ANSWER` | Natural language explanation (free-form) | `"The pallet appears on the left side"` |
 | `CATEGORY` | Task type | `distance` / `count` / `left_right` / `mcq` |
-| `ANSWER` | Exact `normalized_answer` | `5.2`, `left`, `3`, `0` |
+| `ANSWER` | Exact `normalized_answer` | `5.2`, `"left"`, `3`, `"2"` |
 
 #### Target string during training (preprocessed from JSON):
 
 ```python
-target = f"CATEGORY: {category} | ANSWER: {normalized_answer} | FREE_ANSWER: {free_answer}"
+target = f"CATEGORY: {category} | ANSWER: {formatted_answer}"
 # Examples:
-# "CATEGORY: distance | ANSWER: 5.2 | FREE_ANSWER: The distance between the two pallets is about 5 meters."
-# "CATEGORY: left_right | ANSWER: \"left\" | FREE_ANSWER: The object on the left appears closer."
-# "CATEGORY: count | ANSWER: 3 | FREE_ANSWER: There are 3 objects in the buffer zone."
-# "CATEGORY: mcq | ANSWER: \"2\" | FREE_ANSWER: Pallet index 2 is optimal for the transporter."
+# "CATEGORY: distance | ANSWER: 5.2"
+# "CATEGORY: left_right | ANSWER: \"left\""
+# "CATEGORY: count | ANSWER: 3"
+# "CATEGORY: mcq | ANSWER: \"2\""
 ```
 
-> **Why this order?** (Approach 1)
-> Committing to `CATEGORY` and `ANSWER` **before** `FREE_ANSWER` forces the model to
-> reason: *"I know the answer is 5.2 — now I explain why."* This eliminates the coherence bug
-> where FREE_ANSWER says "right side" but ANSWER is forced to `"left"` by the FSM.
+> **Direct answer only** — no free-form explanation. The model is forced to commit
+> to a direct answer with no context, reducing hallucination and ensuring
+> the model focuses on spatial reasoning accuracy.
 
 #### Format Enforcement — System Prompt
 
@@ -305,12 +303,14 @@ SYSTEM_PROMPT = (
     "You are a spatial reasoning assistant. "
     "You MUST always respond in the following exact format:\n"
     "CATEGORY: <left_right|mcq|distance|count> | "
-    "ANSWER: <value> | "
-    "FREE_ANSWER: <natural language explanation>\n"
-    "For left_right: ANSWER is \"left\" or \"right\". "
-    "For mcq: ANSWER is a quoted integer e.g. \"1\". "
-    "For distance: ANSWER is a float e.g. 5.2. "
-    "For count: ANSWER is an integer e.g. 3. "
+    "ANSWER: <value>\n\n"
+    "Examples (follow exactly):\n"
+    'CATEGORY: left_right | ANSWER: "left"\n'
+    'CATEGORY: left_right | ANSWER: "right"\n'
+    'CATEGORY: mcq | ANSWER: "1"\n'
+    "CATEGORY: distance | ANSWER: 5.2\n"
+    "CATEGORY: count | ANSWER: 3\n\n"
+    "The quotes around left_right and mcq answers are mandatory. "
     "Do not add any text before or after this format."
 )
 ```
@@ -346,16 +346,13 @@ forced_prefix = tokenizer.encode("CATEGORY: ", add_special_tokens=False)
 ```python
 from outlines import models, generate  # or use lm-format-enforcer
 
-# Approach 1: CATEGORY first → type-committed ANSWER → FREE_ANSWER (coherent, unconstrained)
-# FREE_ANSWER uses .+ safely — it is the last field, nothing follows it.
 PATTERN = (
     r"CATEGORY: (left_right|mcq|distance|count) \| "
-    r'ANSWER: ("left"|"right"|"[0-9]+"|[0-9]+\.[0-9]+|[0-9]+) \| '
+    r'ANSWER: ("left"|"right"|"[0-9]+"|[0-9]+\.[0-9]+|[0-9]+)'
     #          ↑ float before int — order matters for FSM disambiguation
-    r"FREE_ANSWER: .+"
 )
 
-# Approach 2: post-parse cross-field type validation (in parse_output())
+# Post-parse cross-field type validation (in parse_output())
 # Regex alone cannot enforce CATEGORY↔ANSWER consistency; validate after match:
 _ANSWER_TYPE = {
     "left_right": lambda a: a.strip('"') in ("left", "right"),
@@ -386,11 +383,9 @@ output = model.generate(
 | **Regex FSM** | Blocks any token that violates the pattern at each decode step | `lm-format-enforcer` or `outlines` |
 | **Post-parse Type Check** | Catches CATEGORY↔ANSWER mismatch that FSM cannot prevent | `_ANSWER_TYPE` dict in `parse_output()` |
 
-> ✅ Approach 1: `CATEGORY → ANSWER → FREE_ANSWER` — model commits to answer before explaining; FREE_ANSWER is always coherent \
-> ✅ Approach 2 (inference): `_ANSWER_TYPE` post-parse validation catches residual type mismatches \
-> ✅ Approach 2 (training): `type_ok` flag logged per sample → used to monitor format consistency during training \
-> ✅ `lm-format-enforcer` is lightweight, requires no model changes \
-> ✅ FREE_ANSWER uses `.+` safely — it is the **last** field, no greedy `|` conflict
+> ✅ `_ANSWER_TYPE` post-parse validation catches residual type mismatches \
+> ✅ `type_ok` flag logged per sample → used to monitor format consistency during training \
+> ✅ `lm-format-enforcer` is lightweight, requires no model changes
 
 ---
 
@@ -427,7 +422,7 @@ L_total = L_lm + λ_fmt · L_fmt
 | RTI | ✅ Trainable | 1e-4 |
 
 **Loss**: `L = L_lm + λ_fmt · L_fmt` — CrossEntropy on structured target + format consistency penalty \
-**Goal**: Teach GSA/RTI to produce geometry-aware representations; LM Head learns CATEGORY→ANSWER→FREE_ANSWER format on frozen Qwen backbone. `L_fmt` starts applying from Phase 1 to encourage type-safe ANSWER generation early.
+**Goal**: Teach GSA/RTI to produce geometry-aware representations; LM Head learns `CATEGORY → ANSWER` format on frozen Qwen backbone. `L_fmt` starts applying from Phase 1 to encourage type-safe ANSWER generation early.
 
 ### Phase 2: Full Fine-tuning (5 epochs)
 
@@ -438,82 +433,3 @@ L_total = L_lm + λ_fmt · L_fmt
 | GSA + RTI | ✅ Trainable | 5e-5 |
 
 **Loss**: `L = L_lm + λ_fmt · L_fmt` — same formula as Phase 1; LoRA adapters receive both LM and format-consistency gradients → backbone fine-tunes toward type-safe spatial reasoning.
-
----
-
-## Parameter Budget (Simplified)
-
-| Component | Params | LoRA Rank | Trainable | QLoRA size (train) |
-|-----------|--------|-----------|-----------|---------------------|
-| Qwen 3.5 Vision Encoder (12 ViT blocks) | 100.59M | r=32 (Q,K,V,O) | ~2.4M | NF4 (~50MB) |
-| Qwen 3.5 Vision Merger | (in above) | r=32 | ~0.3M | NF4 (in above) |
-| Qwen 3.5 Token Embeddings (tied w/ LM Head) | 254.28M | frozen | 0 | NF4 (~63MB) |
-| Qwen 3.5 Text Decoder (24 layers) | 498.11M | r=64 (Q,K,V,O,Gate,Up,Down) | ~14.5M | NF4 (~125MB) |
-| GSA (2 blocks, Full_GSA DFormerv2) | **~16.9M** | — (full train) | 16.9M | bfloat16 (34MB) |
-| RTI (Region Token Injector) | **~0.032M** | — (full train) | 0.032M | bfloat16 (~0.06MB) |
-| **Total** | **~870M** | | **~34.1M** | **~272MB VRAM** |
-
-> **NF4** = 4-bit NormalFloat (QLoRA default) — `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")` \
-> Applied **uniformly to all linear layers** of Qwen (vision + backbone), without distinction. \
-> GSA + RTI are **not quantized** — trained at full precision bfloat16.
-
-> ✅ **~34M trainable** (LoRA ~17.2M + GSA ~16.9M + RTI ~0.009M) → RTX 3060 feasible \
-> ✅ **~271MB VRAM** during training with QLoRA (INT4 Qwen base + bfloat16 GSA/RTI/LoRA adapters) \
-> ✅ **2 custom modules only** (GSA + RTI) — LM Head handles all output, **zero mismatch**
-
----
-
-## Quantization Strategy
-
-### QLoRA (used during training — Phase 1 & 2)
-
-```
-Base Qwen loaded NF4 (BitsAndBytes)    ← saves VRAM during training
-LoRA adapters                          ← trained in bfloat16 (A, B matrices)
-GSA + RTI                              ← trained in bfloat16
-```
-
-**Output after Phase 2 — unmerged**, because they cannot be added directly:
-```
-W_merged = W_base(NF4) + B·A(bfloat16)   ← type mismatch, invalid
-```
-The runtime forward pass dequantizes temporarily (`NF4 → bfloat16`) on-the-fly — not saved back.
-Only disk storage: `adapter_model.bin` (LoRA A/B, bfloat16) + pointer to Qwen Hub.
-
-### Phase 3 (Post-Training Quantization)
-
-The base model must be reloaded at full precision before merging:
-
-```
-Phase 2 output:  NF4 base (Qwen Hub) + LoRA adapters (bfloat16, ~68MB)
-    ↓  reload base at bfloat16 + merge_and_unload()
-Merged bfloat16 model   (~1.7GB)
-    ↓  GPTQ / AWQ / GGUF (llama.cpp)
-Quantized for deploy  (~500MB INT4)
-```
-
-| Phase | Purpose | Tool |
-|-------|---------|------|
-| Phase 1–2 train | QLoRA — fit VRAM | `bitsandbytes` (NF4 base + bfloat16 adapters) |
-| Phase 3 (optional) | Merge + re-quantize for deployment | `AutoAWQ` / `GPTQ` / `llama.cpp` |
-
-> **Accuracy risk on small models (0.8B):** Quantizing to INT4 on a small model may reduce accuracy,
-> especially for the `distance` task (float output) and `count` task (requires precise counting) — fine weight details can be lost.
-> **Recommendation:** After merging, test the bfloat16 version (~1.7GB) first. Only go to INT4 if hardware strictly requires it.
-
-> **Custom module compatibility:** GPTQ/AWQ only scan standard `nn.Linear` — GSA has `DWConv2d`, `GeoPriorGen` (non-linear)
-> which may fail conversion. **Quantize only the Qwen backbone, exclude GSA + RTI:**
-> ```python
-> # AutoAWQ example — exclude custom module prefixes
-> quantize_config = {"modules_to_not_convert": ["gsa", "region_token_extractor"]}
-> ```
-> GSA + RTI remain in bfloat16 (~35MB) — negligible compared to the total ~500MB.
-
-> **Calibration data for AWQ/GPTQ:** Requires 128–512 samples to measure activation distribution.
-> Using plain text (C4/WikiText) will **not reflect** the activation distribution of GSA/RTI.
-> Must use samples from the **AI City Challenge dataset** (with images + depth maps):
-> ```python
-> # Calibration sample: forward pass with real image + depth + question
-> calib_samples = load_aicity_samples(n=256, split="train")  # RGB-D + question
-> ```
-> → AWQ/GPTQ will calibrate correctly to the activation distribution of the fine-tuned model.
