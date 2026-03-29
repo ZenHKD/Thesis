@@ -52,7 +52,7 @@
 #### Vision Encoder Flow (verified)
 
 ```
-Image [B, 3, H, W]  — Dataset: 1920×1080 FullHD
+Image [B, 3, H, W]  — Configurable: 1080p / 720p / 540p (16:9)
   → patch_embed (Conv3D) → [B, N, 768]        (N patches, 16px each)
   → pos_embed (learned)
   → 12 ViT blocks (Attn + GELU MLP, 768-dim)
@@ -68,10 +68,13 @@ Image [B, 3, H, W]  — Dataset: 1920×1080 FullHD
 | Input | ViT patches | Post-merger tokens | Grid layout |
 |-------|------------|-------------------|-------------|
 | 448×448 (square test) | 28×28 = 784 | 196 | 14×14 (square) |
-| 1920×1080 (FullHD dataset) | 120×68 = 8160 | 2040 | 60×34 (rectangular) |
+| 960×540 (540p) | 60×38 = 2280 | 570 | 30×19 |
+| 1280×720 (720p) | 80×52 = 4160 | 1040 | 40×26 |
+| 1920×1080 (1080p, original) | 120×68 = 8160 | 2040 | 60×34 |
 
-> **Key**: Grid is **rectangular** for FullHD. `isqrt(N)` crashes — use `image_grid_thw` from processor. \
-> `model.visual()` returns **pre-merger** (768-dim). Merger is called manually.
+> **Key**: Grid is **rectangular** for 16:9 images. `isqrt(N)` crashes — use `image_grid_thw` from processor. \
+> `model.visual()` returns **pre-merger** (768-dim). Merger is called manually. \
+> **Resolution** set via `--resolution` flag in training script (default: 1080p).
 
 ---
 

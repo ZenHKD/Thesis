@@ -5,6 +5,7 @@ Usage:
     python test/test_dataloader.py
     python test/test_dataloader.py --num-samples 10
     python test/test_dataloader.py --batch-size 4
+    python test/test_dataloader.py --resolution 540p
 """
 
 import sys
@@ -27,7 +28,11 @@ def main():
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--resolution", default="1080p", choices=["1080p", "720p", "540p"],
+                        help="Image resolution: 1080p (1920x1080), 720p (1280x720), 540p (960x540)")
     args = parser.parse_args()
+
+    target_size = {"1080p": None, "720p": (1280, 720), "540p": (960, 540)}[args.resolution]
 
     print("=" * 70)
     print("DATALOADER TEST")
@@ -39,9 +44,11 @@ def main():
     tokenizer = processor.tokenizer
 
     # Create dataset
-    print(f"\nCreating dataset ({args.split}, max {args.num_samples})...")
-    dataset = SpatialVLMDataset(args.split, processor=processor, max_samples=args.num_samples)
+    print(f"\nCreating dataset ({args.split}, max {args.num_samples}, {args.resolution})...")
+    dataset = SpatialVLMDataset(args.split, processor=processor,
+                                max_samples=args.num_samples, target_size=target_size)
     print(f"  Dataset size: {len(dataset)}")
+    print(f"  Resolution:   {args.resolution}" + (f" ({target_size[0]}x{target_size[1]})" if target_size else " (original)"))
 
     # Test one sample per category
     TARGET_CATS = ["mcq", "distance", "count", "left_right"]
