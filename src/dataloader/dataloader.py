@@ -89,6 +89,8 @@ class SpatialVLMDataset(Dataset):
         split:      "train", "val", "test", or "train_sample"
         processor:  Qwen AutoProcessor (for tokenization + image processing)
         max_samples: limit number of samples (None = use all)
+        target_size: (W, H) tuple to resize images, e.g. (1280, 720) for 720p.
+                     None = keep original resolution.
     """
 
     def __init__(
@@ -96,6 +98,7 @@ class SpatialVLMDataset(Dataset):
         split: str,
         processor,
         max_samples: int | None = None,
+        target_size: tuple[int, int] | None = None,
     ):
         assert split in _SPLIT_CONFIG, f"Unknown split: {split}. Use: {list(_SPLIT_CONFIG.keys())}"
         cfg = _SPLIT_CONFIG[split]
@@ -116,6 +119,8 @@ class SpatialVLMDataset(Dataset):
         if max_samples is not None:
             self.data = self.data[:max_samples]
 
+        self.target_size = target_size  # (W, H) or None
+
         # Pre-compute the assistant token boundary for label masking
         # We'll use a dummy to find the token offset
         self._assistant_marker = "<|im_start|>assistant\n"
@@ -130,10 +135,15 @@ class SpatialVLMDataset(Dataset):
         image_name = entry["image"]
         image_path = os.path.join(self.image_dir, image_name)
         image = Image.open(image_path).convert("RGB")
+        if self.target_size:
+            image = image.resize(self.target_size, Image.LANCZOS)
 
         # 2. Load depth map (8-bit grayscale, range 0-255)
         depth_path = os.path.join(self.depth_dir, image_name.replace(".png", "_depth.png"))
-        depth_np = np.array(Image.open(depth_path), dtype=np.float32)
+        depth_pil = Image.open(depth_path)
+        if self.target_size:
+            depth_pil = depth_pil.resize(self.target_size, Image.BILINEAR)
+        depth_np = np.array(depth_pil, dtype=np.float32)
         depth_map = torch.from_numpy(depth_np)  # [H, W]
 
         # 3. Parse question
@@ -196,7 +206,12 @@ class SpatialVLMDataset(Dataset):
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
         for rle_entry in rle_list:
-            binary = mask_utils.decode(rle_entry).astype(bool)           # [H, W]
+            binary = mask_utils.decode(rle_entry).astype(np.float32)     # [H_orig, W_orig]
+            if self.target_size:
+                binary = np.array(
+                    Image.fromarray(binary).resize(self.target_size, Image.NEAREST)
+                )
+            binary = binary.astype(bool)
             t = torch.from_numpy(binary.astype(np.float32))              # [H, W]
             coverage = torch.nn.functional.adaptive_avg_pool2d(
                 t.unsqueeze(0).unsqueeze(0), (h_vis, w_vis)
