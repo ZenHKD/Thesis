@@ -2,7 +2,7 @@
 Test SpatialVLM single backpropagation step.
 
 Loads 1 batch from the dataloader, runs forward through the pipeline,
-computes loss (L_lm + L_fmt), calls backward, and verifies gradients
+computes loss (L_lm), calls backward, and verifies gradients
 flow to GSA and RTI (the trainable custom modules).
 
 Usage:
@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--attn-impl",  default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lambda-fmt", type=float, default=0.2)
+
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -125,22 +125,11 @@ def main():
     print("LOSS COMPUTATION")
     print("=" * 70)
 
-    criterion = SpatialVLMLoss(lambda_fmt=args.lambda_fmt)
+    criterion = SpatialVLMLoss()
 
-    # Decode greedy predictions for L_fmt (detach to avoid graph)
-    with torch.no_grad():
-        pred_ids = logits.argmax(dim=-1)
-        decoded_preds = pipeline.processor.tokenizer.batch_decode(
-            pred_ids, skip_special_tokens=True
-        )
-    del pred_ids
+    loss = criterion(logits, labels)
 
-    result = criterion(logits, labels, decoded_outputs=decoded_preds)
-
-    print(f"  L_lm    = {result['l_lm'].item():.4f}")
-    print(f"  L_fmt   = {result['l_fmt'].item():.4f}")
-    print(f"  L_total = {result['loss'].item():.4f}")
-    print(f"  (lambda_fmt = {args.lambda_fmt})")
+    print(f"  Loss = {loss.item():.4f}")
 
     # ====================================================================
     # 5. BACKWARD PASS
@@ -149,7 +138,7 @@ def main():
     print("BACKWARD PASS")
     print("=" * 70)
 
-    result["loss"].backward()
+    loss.backward()
     print_vram_usage("after backward")
 
     # ====================================================================
@@ -245,7 +234,7 @@ def main():
         print("  [FAIL] Qwen backbone has gradient leaks")
         all_ok = False
 
-    loss_finite = torch.isfinite(result["loss"]).item()
+    loss_finite = torch.isfinite(loss).item()
     if loss_finite:
         print("  [OK] Loss is finite")
     else:

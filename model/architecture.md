@@ -392,22 +392,16 @@ output = model.generate(
 ### Training Loss
 
 ```
-L_total = L_lm + λ_fmt · L_fmt
+L = L_lm = CrossEntropy(lm_logits, target_tokens)
 ```
 
-**Two losses** — both are autoregressive CrossEntropy-based, no separate heads:
+Standard autoregressive CrossEntropy over the full structured target string. No separate heads, no auxiliary losses.
 
 | Loss | Formula | Notes |
 |------|---------|-------|
-| `L_lm` | CrossEntropy(lm_logits, target_tokens) | Target = full structured string over entire sequence |
-| `L_fmt` | `0` if `type_ok`, else `1` (binary format penalty) | Approach 2: penalizes CATEGORY↔ANSWER type mismatch |
+| `L_lm` | CrossEntropy(lm_logits, target_tokens) | Target = full structured string `CATEGORY: ... \| ANSWER: ...` |
 
-- `λ_fmt ≈ 0.1–0.3` — small auxiliary weight, does not distort main LM objective
-- **`type_ok`** evaluated by `_ANSWER_TYPE[category](answer)` after each forward pass
-- During **Phase 1** (Qwen frozen): `L_fmt` helps GSA+RTI produce representations that encourage correct ANSWER types
-- During **Phase 2** (LoRA): `L_fmt` signal propagates through LoRA adapters → backbone learns type-safe generation
-
-> No `L_classifier`, no MSE, no EDL — structure and type safety come from output format + soft penalty
+> No `L_classifier`, no MSE, no EDL — structure and type safety come from output format + system prompt + constrained decoding at inference.
 
 ---
 
@@ -421,8 +415,8 @@ L_total = L_lm + λ_fmt · L_fmt
 | GSA (2 blocks) | ✅ Trainable | 1e-4 |
 | RTI | ✅ Trainable | 1e-4 |
 
-**Loss**: `L = L_lm + λ_fmt · L_fmt` — CrossEntropy on structured target + format consistency penalty \
-**Goal**: Teach GSA/RTI to produce geometry-aware representations; LM Head learns `CATEGORY → ANSWER` format on frozen Qwen backbone. `L_fmt` starts applying from Phase 1 to encourage type-safe ANSWER generation early.
+**Loss**: `L = L_lm` — CrossEntropy on structured target \
+**Goal**: Teach GSA/RTI to produce geometry-aware representations; LM Head learns `CATEGORY -> ANSWER` format on frozen Qwen backbone.
 
 ### Phase 2: Full Fine-tuning (5 epochs)
 
@@ -432,4 +426,4 @@ L_total = L_lm + λ_fmt · L_fmt
 | Qwen 3.5 Backbone | LoRA (rank=64) | 2e-5 |
 | GSA + RTI | ✅ Trainable | 5e-5 |
 
-**Loss**: `L = L_lm + λ_fmt · L_fmt` — same formula as Phase 1; LoRA adapters receive both LM and format-consistency gradients → backbone fine-tunes toward type-safe spatial reasoning.
+**Loss**: `L = L_lm` — same as Phase 1; LoRA adapters fine-tune backbone toward spatial reasoning.

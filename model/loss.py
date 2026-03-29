@@ -1,64 +1,27 @@
 """
-SpatialVLM Training Losses
-==========================
+SpatialVLM Training Loss
+=========================
 
-L_total = L_lm + lambda_fmt * L_fmt
-
-    L_lm  : Standard autoregressive CrossEntropy over the full structured target.
-    L_fmt : Binary format-consistency penalty (0 if type_ok, 1 otherwise).
+L = L_lm (standard autoregressive CrossEntropy over the structured target)
 """
 
-import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Answer-type validators (mirrors pipeline._ANSWER_TYPE)
-_ANSWER_TYPE = {
-    "left_right": lambda a: a.strip('"') in ("left", "right"),
-    "mcq":        lambda a: a.startswith('"') and a.strip('"').isdigit(),
-    "distance":   lambda a: '.' in a and not a.startswith('"'),
-    "count":      lambda a: a.isdigit(),
-}
-
-# Output parsing regex (same as pipeline.py)
-_OUTPUT_RE = re.compile(
-    r"CATEGORY:\s*(?P<category>\S+)\s*\|\s*"
-    r"ANSWER:\s*(?P<answer>.+?)\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def check_format(decoded_text: str) -> bool:
-    """Check if decoded model output follows the structured format
-    AND has consistent CATEGORY <-> ANSWER types.
-
-    Returns True if format is valid, False otherwise.
-    """
-    m = _OUTPUT_RE.search(decoded_text)
-    if not m:
-        return False
-    category = m.group("category").strip().lower()
-    answer = m.group("answer").strip()
-    validator = _ANSWER_TYPE.get(category, lambda _: False)
-    return validator(answer)
-
-
 class SpatialVLMLoss(nn.Module):
-    """Combined loss: L_total = L_lm + lambda_fmt * L_fmt
+    """Autoregressive LM loss for SpatialVLM.
 
     Args:
-        lambda_fmt:  Weight for format-consistency loss (default: 0.1)
         ignore_index: Token index to ignore in CE loss (default: -100)
     """
 
-    def __init__(self, lambda_fmt: float = 0.1, ignore_index: int = -100):
+    def __init__(self, ignore_index: int = -100):
         super().__init__()
-        self.lambda_fmt = lambda_fmt
         self.ignore_index = ignore_index
 
-    def lm_loss(
+    def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
@@ -93,68 +56,6 @@ class SpatialVLMLoss(nn.Module):
             ignore_index=self.ignore_index,
         )
         return loss
-
-    def fmt_loss(
-        self,
-        decoded_outputs: list[str],
-    ) -> torch.Tensor:
-        """Binary format-consistency penalty.
-
-        For each sample in the batch, checks if the decoded output:
-        1. Matches the structured format: CATEGORY: ... | ANSWER: ...
-        2. Has consistent CATEGORY <-> ANSWER types (e.g. distance -> float)
-
-        Args:
-            decoded_outputs: list of decoded strings, one per batch element
-
-        Returns:
-            Scalar penalty in [0, 1] -- mean of binary penalties across batch.
-            Not differentiable -- acts as a scaling regularizer on L_lm.
-        """
-        penalties = []
-        for text in decoded_outputs:
-            ok = check_format(text)
-            penalties.append(0.0 if ok else 1.0)
-
-        return torch.tensor(
-            sum(penalties) / len(penalties),
-            dtype=torch.float32,
-        )
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        decoded_outputs: list[str] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Compute total loss.
-
-        Args:
-            logits:          [B, T, vocab_size] model output
-            labels:          [B, T] target token ids (-100 for masked positions)
-            decoded_outputs: list[str] decoded greedy outputs for L_fmt
-                             (None to skip format loss -- useful during warmup)
-
-        Returns:
-            dict with keys:
-                'loss':   L_total = L_lm + lambda_fmt * L_fmt  (for backward)
-                'l_lm':   L_lm scalar
-                'l_fmt':  L_fmt scalar (0 if skipped)
-        """
-        l_lm = self.lm_loss(logits, labels)
-
-        if decoded_outputs is not None and self.lambda_fmt > 0:
-            l_fmt = self.fmt_loss(decoded_outputs).to(l_lm.device)
-            loss = l_lm + self.lambda_fmt * l_fmt
-        else:
-            l_fmt = torch.tensor(0.0, device=l_lm.device)
-            loss = l_lm
-
-        return {
-            "loss":  loss,
-            "l_lm":  l_lm.detach(),
-            "l_fmt": l_fmt.detach(),
-        }
 
 
 # Build labels from input_ids
