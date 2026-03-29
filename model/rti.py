@@ -295,19 +295,27 @@ class RTE(nn.Module):
         depth_map:      torch.Tensor,                                        # [B, H, W]
         rle_list:       List[dict],                              
         image_grid_thw: torch.Tensor,                                        # [num_images, 3] 
+        decoded_masks:  List[dict] = None,                                   # pre-decoded from DataLoader
     )-> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Returns [(mask_rgb, mask_depth), ...] one tuple per RLE mask.
 
         mask_rgb   -> DB-style soft gated pool over all N visual tokens  [B, 1024]
         mask_depth -> [mean_d, std_d, cx_soft, cy_soft, r0..r23] projected [B, 1024]
+
+        If decoded_masks is provided, skips RLE decode + pool (already done
+        in DataLoader workers, overlapping with GPU compute).
         """
         _, h_patches, w_patches = [int(x) for x in image_grid_thw[0].tolist()]
         h_vis, w_vis = h_patches // 2, w_patches // 2
 
         result = []
         dev = visual_tokens.device
-        for rle in rle_list:
-            binary, soft2d = self._rle_to_soft_mask(rle, h_vis, w_vis, device=dev)
+        for i, rle in enumerate(rle_list):
+            if decoded_masks is not None and i < len(decoded_masks):
+                binary = decoded_masks[i]['binary']
+                soft2d = decoded_masks[i]['soft2d']
+            else:
+                binary, soft2d = self._rle_to_soft_mask(rle, h_vis, w_vis, device=dev)
             rgb = self._rgb_token(visual_tokens, soft2d)                     # [B, 1024]
             dep = self._depth_token(depth_map, binary, soft2d, h_vis, w_vis) # [B, 1024]
             result.append((rgb, dep))

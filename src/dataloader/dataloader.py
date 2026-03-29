@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+import pycocotools.mask as mask_utils
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -189,6 +190,20 @@ class SpatialVLMDataset(Dataset):
         else:
             answer_str = raw_answer
 
+        # 9. Pre-decode RLE binary masks + soft masks
+        #    Offloads pycocotools decode from GPU thread to DataLoader workers
+        _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
+        h_vis, w_vis = h_p // 2, w_p // 2
+        decoded_masks = []
+        for rle_entry in rle_list:
+            binary = mask_utils.decode(rle_entry).astype(bool)           # [H, W]
+            t = torch.from_numpy(binary.astype(np.float32))              # [H, W]
+            coverage = torch.nn.functional.adaptive_avg_pool2d(
+                t.unsqueeze(0).unsqueeze(0), (h_vis, w_vis)
+            ).squeeze()                                                  # [h_vis, w_vis]
+            soft2d = torch.sigmoid(50.0 * (coverage - 0.3))              # DB-style
+            decoded_masks.append({'binary': binary, 'soft2d': soft2d})
+
         return {
             "pixel_values":   pixel_values,
             "image_grid_thw": image_grid_thw,
@@ -198,6 +213,7 @@ class SpatialVLMDataset(Dataset):
             "attention_mask": attention_mask,
             "mask_positions": mask_positions,
             "rle_list":       rle_list,
+            "decoded_masks":  decoded_masks,
             "category":       category,
             "answer":         answer_str,
             "image_name":     image_name,
@@ -273,9 +289,9 @@ def collate_fn(batch: list[dict]) -> dict:
         "input_ids":      torch.stack(input_ids_padded),
         "labels":         torch.stack(labels_padded),
         "attention_mask": torch.stack(attention_masks),
-        # Lists (not tensorizable) - one per sample
         "mask_positions": [d["mask_positions"] for d in batch],
         "rle_list":       [d["rle_list"] for d in batch],
+        "decoded_masks":  [d["decoded_masks"] for d in batch],
         "categories":     [d["category"] for d in batch],
         "answers":        [d["answer"] for d in batch],
         "image_names":    [d["image_name"] for d in batch],
@@ -299,4 +315,6 @@ def get_dataloader(
         pin_memory=pin_memory,
         collate_fn=collate_fn,
         drop_last=False,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
