@@ -68,8 +68,8 @@ Image [B, 3, H, W]  — Configurable: 1080p / 720p / 540p (16:9)
 | Input | ViT patches | Post-merger tokens | Grid layout |
 |-------|------------|-------------------|-------------|
 | 448×448 (square test) | 28×28 = 784 | 196 | 14×14 (square) |
-| 960×540 (540p) | 60×38 = 2280 | 570 | 30×19 |
-| 1280×720 (720p) | 80×52 = 4160 | 1040 | 40×26 |
+| 960×540 (540p) | 60×34 = 2040 | 510 | 30×17 |
+| 1280×720 (720p) | 80×44 = 3520 | 880 | 40×22 |
 | 1920×1080 (1080p, original) | 120×68 = 8160 | 2040 | 60×34 |
 
 > **Key**: Grid is **rectangular** for 16:9 images. `isqrt(N)` crashes — use `image_grid_thw` from processor. \
