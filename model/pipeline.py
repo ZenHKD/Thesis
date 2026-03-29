@@ -84,20 +84,31 @@ _ANSWER_TYPE = {
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
     """Find token positions of <mask> in input_ids.
 
+    Optimized: uses cached token ID matching instead of per-token decode.
     Qwen BPE tokenizes <mask> as 3 subtokens:
       - isolated: ['<', 'mask', '>']  = [27, 10931, 29]
       - in context: [' <', 'mask', '>'] = [361, 10931, 29]
-    Matches by decoded text to handle both cases.
     """
-    ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
-    decoded = [tokenizer.decode([t]) for t in ids]
+    # Cache token IDs on first call (avoids repeated tokenizer lookups)
+    if not hasattr(find_mask_positions, '_cached'):
+        find_mask_positions._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
+        find_mask_positions._gt_id = tokenizer.encode(">", add_special_tokens=False)[0]
+        find_mask_positions._lt_ids = set()
+        for test in ["<", " <"]:
+            enc = tokenizer.encode(test, add_special_tokens=False)
+            if len(enc) == 1:
+                find_mask_positions._lt_ids.add(enc[0])
+        find_mask_positions._cached = True
 
+    mask_id = find_mask_positions._mask_id
+    gt_id = find_mask_positions._gt_id
+    lt_ids = find_mask_positions._lt_ids
+
+    ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
     positions = []
     i = 0
-    while i < len(decoded) - 2:
-        if (decoded[i].rstrip().endswith('<')
-                and decoded[i+1] == 'mask'
-                and decoded[i+2].lstrip().startswith('>')):
+    while i < len(ids) - 2:
+        if ids[i] in lt_ids and ids[i+1] == mask_id and ids[i+2] == gt_id:
             positions.append(i)
             i += 3
         else:
@@ -189,7 +200,9 @@ class SpatialVLM(nn.Module):
         Split by image, apply the merger per-image, then stack.
         """
         visual = self.qwen.model.visual
-        visual_out = visual(pixel_values, grid_thw=image_grid_thw)
+        # Frozen vision encoder -- skip autograd graph construction
+        with torch.no_grad():
+            visual_out = visual(pixel_values, grid_thw=image_grid_thw)
 
         # Unpack output
         if isinstance(visual_out, torch.Tensor):
@@ -259,6 +272,7 @@ class SpatialVLM(nn.Module):
         input_ids:            torch.Tensor,   # [B, L]
         rle_list:             list = None,    # list[dict] -- one per <mask>
         mask_token_positions: list = None,    # sorted token indices of <mask>
+        decoded_masks:        list = None,    # pre-decoded [{'binary','soft2d'},...]
     ) -> tuple:
         """Build [B, T, 1024] inputs_embeds for the backbone.
 
@@ -286,7 +300,8 @@ class SpatialVLM(nn.Module):
         # Step 4: RTI - inject region tokens at <mask> positions
         if rle_list is not None and mask_token_positions is not None and len(rle_list) > 0:
             region_tokens = self.region_token_extractor(
-                visual_tokens, depth_maps, rle_list, image_grid_thw
+                visual_tokens, depth_maps, rle_list, image_grid_thw,
+                decoded_masks=decoded_masks,
             )
             # <mask> may be multi-token (Qwen: '<','mask','>' = 3 tokens)
             mask_token_len = len(self.processor.tokenizer.encode("<mask>", add_special_tokens=False))
@@ -368,6 +383,7 @@ class SpatialVLM(nn.Module):
         rle_list:             list = None,
         mask_token_positions: list = None,
         use_gradient_checkpointing: bool = False,
+        decoded_masks:        list = None,
     ) -> dict:
         """Training/inference forward pass.
 
@@ -385,7 +401,7 @@ class SpatialVLM(nn.Module):
         """
         inputs_embeds, n_visual = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
-            rle_list, mask_token_positions,
+            rle_list, mask_token_positions, decoded_masks,
         )
 
         # Backbone -- full sequence (visual + text)
