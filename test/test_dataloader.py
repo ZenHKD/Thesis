@@ -28,11 +28,11 @@ def main():
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--resolution", default="1080p", choices=["1080p", "720p", "540p"],
-                        help="Image resolution: 1080p (1920x1080), 720p (1280x720), 540p (960x540)")
+    parser.add_argument("--resolution", default="1080p", choices=["1080p", "720p", "540p", "450p"],
+                        help="Image resolution: 1080p (1920x1080), 720p (1280x720), 540p (960x540), 450p (800x450)")
     args = parser.parse_args()
 
-    target_size = {"1080p": None, "720p": (1280, 720), "540p": (960, 540)}[args.resolution]
+    target_size = {"1080p": None, "720p": (1280, 720), "540p": (960, 540), "450p": (800, 450)}[args.resolution]
 
     print("=" * 70)
     print("DATALOADER TEST")
