@@ -129,6 +129,14 @@ class SpatialVLMDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> dict:
+        try:
+            return self._load_sample(idx)
+        except (OSError, Exception) as e:
+            # Skip corrupted/truncated images -- use next sample
+            print(f"  [!] Skipping sample {idx} ({self.data[idx].get('image', '?')}): {e}")
+            return self._load_sample((idx + 1) % len(self.data))
+
+    def _load_sample(self, idx: int) -> dict:
         entry = self.data[idx]
 
         # 1. Load image
