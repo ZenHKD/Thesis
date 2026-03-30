@@ -269,52 +269,61 @@ cx_soft = Σᵢ(col_i × soft_i) / Σᵢ(soft_i)  — soft-weighted centroid X
 | `cy_soft` | ✅ Non-zero | Centroid Y (soft-weighted from DB soft_mask) |
 | `r0..r23` (24 rays, k×15°) | ✅ Non-zero | Radial depth profile — distinguishes overlapping masks & complex shapes |
 
-### LM Head — Structured Output Format
+### LM Head -- Structured Output Format
 
 Instead of separate custom heads, the **LM Head (Qwen built-in)** is fine-tuned to produce structured text output directly:
 
 ```
-CATEGORY: distance | ANSWER: 5.2
+distance | 5.2
 ```
 
 | Field | Meaning | Example |
 |-------|---------|---------|
-| `CATEGORY` | Task type | `distance` / `count` / `left_right` / `mcq` |
-| `ANSWER` | Exact `normalized_answer` | `5.2`, `"left"`, `3`, `"2"` |
+| Category | Task type | `distance` / `count` / `left_right` / `mcq` |
+| `\|` | Separator | Always `\|` |
+| Answer | Exact `normalized_answer` | `5.2`, `"left"`, `3`, `"2"` |
 
 #### Target string during training (preprocessed from JSON):
 
 ```python
-target = f"CATEGORY: {category} | ANSWER: {formatted_answer}"
+target = f"{category} | {formatted_answer}"
 # Examples:
-# "CATEGORY: distance | ANSWER: 5.2"
-# "CATEGORY: left_right | ANSWER: \"left\""
-# "CATEGORY: count | ANSWER: 3"
-# "CATEGORY: mcq | ANSWER: \"2\""
+# "distance | 5.2"
+# "left_right | \"left\""
+# "count | 3"
+# "mcq | \"2\""
 ```
 
-> **Direct answer only** — no free-form explanation. The model is forced to commit
+> **Direct answer only** -- no free-form explanation. The model is forced to commit
 > to a direct answer with no context, reducing hallucination and ensuring
 > the model focuses on spatial reasoning accuracy.
 
-#### Format Enforcement — System Prompt
+#### Format Enforcement -- System Prompt
 
 A **fixed system prompt** is prepended to every input so that Qwen always follows the format:
 
 ```python
 SYSTEM_PROMPT = (
-    "You are a spatial reasoning assistant. "
-    "You MUST always respond in the following exact format:\n"
-    "CATEGORY: <left_right|mcq|distance|count> | "
-    "ANSWER: <value>\n\n"
-    "Examples (follow exactly):\n"
-    'CATEGORY: left_right | ANSWER: "left"\n'
-    'CATEGORY: left_right | ANSWER: "right"\n'
-    'CATEGORY: mcq | ANSWER: "1"\n'
-    "CATEGORY: distance | ANSWER: 5.2\n"
-    "CATEGORY: count | ANSWER: 3\n\n"
-    "The quotes around left_right and mcq answers are mandatory. "
-    "Do not add any text before or after this format."
+    "You are a spatial reasoning assistant.\n"
+    "Your response MUST be exactly one line in this format:\n"
+    "CATEGORY | VALUE\n\n"
+    "CATEGORY must be exactly one of these four words:\n"
+    "  left_right\n"
+    "  mcq\n"
+    "  distance\n"
+    "  count\n\n"
+    "The separator ' | ' (space pipe space) is mandatory.\n\n"
+    "VALUE rules:\n"
+    '- left_right: "left" or "right" (with double quotes)\n'
+    '- mcq: "0", "1", "2", etc. (with double quotes)\n'
+    "- distance: a decimal number like 5.2 (no quotes)\n"
+    "- count: an integer like 3 (no quotes)\n\n"
+    "Examples:\n"
+    'left_right | "left"\n'
+    'mcq | "1"\n'
+    "distance | 5.2\n"
+    "count | 3\n\n"
+    "Output ONLY the category, pipe, and value. Nothing else."
 )
 ```
 
@@ -329,82 +338,57 @@ messages = [
 input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt")
 ```
 
-> ✅ Same format at train and inference → model learns the correct distribution \
-> ✅ System prompt adds no parameters — it is only a prefix token sequence
+> Same format at train and inference -- model learns the correct distribution \
+> System prompt adds no parameters -- it is only a prefix token sequence
 
-#### Format Enforcement — Constrained Decoding
+#### Training -- Standard Prompt Masking
 
-At inference, use **prefix-forcing** to hard-constrain LM output to the correct format:
-
-**Step 1 — Force prefix `"CATEGORY: "`** immediately after `<|im_start|>assistant`:
+The entire answer string is trained on with CE loss. Only the prompt tokens (system + user) are masked with `-100`:
 
 ```python
-# Force output to begin with "CATEGORY: "
-forced_prefix = tokenizer.encode("CATEGORY: ", add_special_tokens=False)
-# Use `force_words_ids` or `prefix_allowed_tokens_fn` in model.generate()
+# Full answer string:  distance | 5.75
+# Labels:              active   active  active
+#                      (all answer tokens are trained)
 ```
 
-**Step 2 — Regex FSM (Finite State Machine)** constrains the entire output:
+The model learns to generate the complete `category | value` string, including the separator. This avoids BPE boundary issues that arise from trying to mask individual format tokens.
+
+#### Inference -- Single-shot Generation
+
+At inference, the model generates the entire answer in one `model.generate()` call, then the output is parsed via regex:
 
 ```python
-from outlines import models, generate  # or use lm-format-enforcer
-
-PATTERN = (
-    r"CATEGORY: (left_right|mcq|distance|count) \| "
-    r'ANSWER: ("left"|"right"|"[0-9]+"|[0-9]+\.[0-9]+|[0-9]+)'
-    #          ↑ float before int — order matters for FSM disambiguation
-)
-
-# Post-parse cross-field type validation (in parse_output())
-# Regex alone cannot enforce CATEGORY↔ANSWER consistency; validate after match:
-_ANSWER_TYPE = {
-    "left_right": lambda a: a.strip('"') in ("left", "right"),
-    "mcq":        lambda a: a.startswith('"') and a.strip('"').isdigit(),
-    "distance":   lambda a: '.' in a and not a.startswith('"'),
-    "count":      lambda a: a.isdigit(),
-}
-# type_ok = _ANSWER_TYPE[category](answer)  →  False = format inconsistency detected
-
-# With lm-format-enforcer (compatible with HuggingFace):
-from lm_format_enforcer import RegexParser
-from lm_format_enforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
-
-parser = RegexParser(PATTERN)
-prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
-output = model.generate(
-    input_ids,
-    prefix_allowed_tokens_fn=prefix_fn,
-    max_new_tokens=100,
-)
+# Model generates freely: "distance | 5.75"
+# Regex extracts: category="distance", answer="5.75"
 ```
 
-| Mechanism | Effect | Library |
-|-----------|--------|---------|
-| **System Prompt** | Model learns format during training → reduces hallucination | Qwen chat template |
-| **Prefix Forcing** | Forces `CATEGORY:` from the very first token | `force_words_ids` or manual logit masking |
-| **Regex FSM** | Blocks any token that violates the pattern at each decode step | `lm-format-enforcer` or `outlines` |
-| **Post-parse Type Check** | Catches CATEGORY↔ANSWER mismatch that FSM cannot prevent | `_ANSWER_TYPE` dict in `parse_output()` |
+| Mechanism | Training | Inference |
+|-----------|----------|-----------|
+| **System Prompt** | Prepended to every sample | Same prompt used |
+| **Answer string** | All tokens active (CE loss) | Generated freely |
+| **Parsing** | Not needed (labels are pre-built) | Regex extraction |
 
-> ✅ `_ANSWER_TYPE` post-parse validation catches residual type mismatches \
-> ✅ `type_ok` flag logged per sample → used to monitor format consistency during training \
-> ✅ `lm-format-enforcer` is lightweight, requires no model changes
+> Format learned from system prompt examples + training signal \
+> No fill-in-blank, no multi-stage generation, no BPE boundary issues
 
 ---
 
 ### Training Loss
 
 ```
-L = L_lm = CrossEntropy(lm_logits, target_tokens)
+L = L_lm = CrossEntropy(lm_logits, answer_tokens)
 ```
 
-Standard autoregressive CrossEntropy over the full structured target string. No separate heads, no auxiliary losses.
+CrossEntropy computed on **all answer tokens** (category + separator + value). Prompt tokens are masked with `-100` and contribute zero loss.
 
-| Loss | Formula | Notes |
-|------|---------|-------|
-| `L_lm` | CrossEntropy(lm_logits, target_tokens) | Target = full structured string `CATEGORY: ... \| ANSWER: ...` |
+```
+Target:  distance | 5 . 7 5
+Labels:  active   active  active
+         ^^^^^^^^^^^^^^^^^^
+         (full CE on all answer tokens)
+```
 
-> No `L_classifier`, no MSE, no EDL — structure and type safety come from output format + system prompt + constrained decoding at inference.
+> No format token masking needed -- the simplified format avoids BPE boundary issues entirely.
 
 ---
 
@@ -414,12 +398,12 @@ Standard autoregressive CrossEntropy over the full structured target string. No 
 
 | Component | Status | LR |
 |-----------|--------|-----|
-| Qwen 3.5 (vision + backbone) | ❄️ Frozen | — |
-| GSA (2 blocks) | ✅ Trainable | 1e-4 |
-| RTI | ✅ Trainable | 1e-4 |
+| Qwen 3.5 (vision + backbone) | Frozen | -- |
+| GSA (2 blocks) | Trainable | 1e-4 |
+| RTI | Trainable | 1e-4 |
 
-**Loss**: `L = L_lm` — CrossEntropy on structured target \
-**Goal**: Teach GSA/RTI to produce geometry-aware representations; LM Head learns `CATEGORY -> ANSWER` format on frozen Qwen backbone.
+**Loss**: `L = L_lm` -- CE on content tokens only (category + answer) \
+**Goal**: Teach GSA/RTI to produce geometry-aware representations; model learns to predict correct category and answer value.
 
 ### Phase 2: Full Fine-tuning (5 epochs)
 
@@ -427,6 +411,7 @@ Standard autoregressive CrossEntropy over the full structured target string. No 
 |-----------|--------|-----|
 | Qwen 3.5 Vision Encoder | LoRA (rank=32) | 5e-5 |
 | Qwen 3.5 Backbone | LoRA (rank=64) | 2e-5 |
-| GSA + RTI | ✅ Trainable | 5e-5 |
+| GSA + RTI | Trainable | 5e-5 |
 
-**Loss**: `L = L_lm` — same as Phase 1; LoRA adapters fine-tune backbone toward spatial reasoning.
+**Loss**: `L = L_lm` -- same as Phase 1; LoRA adapters fine-tune backbone toward spatial reasoning.
+

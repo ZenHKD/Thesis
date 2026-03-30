@@ -67,7 +67,7 @@ def build_labels(
     """Build training labels from input_ids by masking everything before the answer.
 
     The model should only be trained to predict the answer portion
-    (CATEGORY: ... | ANSWER: ...), not the prompt.
+    (category | value), not the prompt.
 
     Args:
         input_ids:        [B, T] full input sequence

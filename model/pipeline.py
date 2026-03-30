@@ -13,7 +13,7 @@ Architecture:
     6. Qwen LM Head (built-in, tied with embeddings) -> structured text
 
 Output format:
-    CATEGORY: <left_right|mcq|distance|count> | ANSWER: <value>
+    <left_right|mcq|distance|count> | <value>
 
 Qwen 3.5 0.8B model hierarchy (verified from weights):
     model.visual                          -> Vision Encoder (100.59M)
@@ -45,40 +45,37 @@ from model.rti import RTE
 MODEL_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen3.5-0.8b")
 
 # System Prompt (prepended to every input, train & inference)
-# Format: CATEGORY -> ANSWER (type-committed)
+# Format: category | answer
 SYSTEM_PROMPT = (
-    "You are a spatial reasoning assistant. "
-    "You MUST always respond in the following exact format:\n"
-    "CATEGORY: <left_right|mcq|distance|count> | "
-    "ANSWER: <value>\n\n"
-    "Examples (follow exactly):\n"
-    'CATEGORY: left_right | ANSWER: "left"\n'
-    'CATEGORY: left_right | ANSWER: "right"\n'
-    'CATEGORY: mcq | ANSWER: "1"\n'
-    "CATEGORY: distance | ANSWER: 5.2\n"
-    "CATEGORY: count | ANSWER: 3\n\n"
-    "The quotes around left_right and mcq answers are mandatory. "
-    "Do not add any text before or after this format."
+    "You are a spatial reasoning assistant.\n"
+    "Your response MUST be exactly one line in this format:\n"
+    "CATEGORY | VALUE\n\n"
+    "CATEGORY must be exactly one of these four words:\n"
+    "  left_right\n"
+    "  mcq\n"
+    "  distance\n"
+    "  count\n\n"
+    "The separator ' | ' (space pipe space) is mandatory.\n\n"
+    "VALUE rules:\n"
+    '- left_right: "left" or "right" (with double quotes)\n'
+    '- mcq: "0", "1", "2", etc. (with double quotes)\n'
+    "- distance: a decimal number like 5.2 (no quotes)\n"
+    "- count: an integer like 3 (no quotes)\n\n"
+    "Examples:\n"
+    'left_right | "left"\n'
+    'mcq | "1"\n'
+    "distance | 5.2\n"
+    "count | 3\n\n"
+    "Output ONLY the category, pipe, and value. Nothing else."
 )
 
 # Regex for structured output parsing
-# Format: CATEGORY -> ANSWER
-# Flat regex: no lookbehind - cross-field type check done in parse_output() instead.
-# ANSWER alternatives ordered float-before-int so "5.2" always matches as float.
+# Format: category | answer
 _OUTPUT_RE = re.compile(
-    r'CATEGORY:\s*(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'ANSWER:\s*(?P<answer>"left"|"right"|"\d+"|\d+\.\d+|\d+)',
+    r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
+    r'(?P<answer>"left"|"right"|"\d+"|\d+\.\d+|\d+)',
     re.IGNORECASE,
 )
-
-# Approach 2: category -> expected answer type (post-parse validation + coercion)
-# Enforces CATEGORY <-> ANSWER consistency that regex alone cannot guarantee.
-_ANSWER_TYPE = {
-    "left_right": lambda a: a.strip('"') in ("left", "right"),
-    "mcq":        lambda a: a.startswith('"') and a.strip('"').isdigit(),
-    "distance":   lambda a: '.' in a and not a.startswith('"'),
-    "count":      lambda a: a.isdigit(),
-}
 
 
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
@@ -498,32 +495,26 @@ class SpatialVLM(nn.Module):
 
     @staticmethod
     def parse_output(text: str) -> dict:
-        """Parse structured LM output -> {category, answer, type_ok}.
+        """Parse structured LM output -> {category, answer}.
 
         Expected format:
             CATEGORY: <task> | ANSWER: <value>
 
-        Cross-field type validation after parse:
-            Checks that ANSWER type matches CATEGORY (e.g. distance must be float).
-            'type_ok' = False signals a format-consistency failure.
-
         Returns:
-            dict with keys: 'category', 'answer', 'type_ok'
-            On parse failure: category='unknown', answer=None, type_ok=False.
+            dict with keys: 'category', 'answer'
+            On parse failure: category='unknown', answer=None.
         """
         m = _OUTPUT_RE.search(text)
         if m:
             category = m.group("category").strip().lower()
             answer   = m.group("answer").strip()
-            type_ok  = _ANSWER_TYPE.get(category, lambda _: False)(answer)
             return {
                 "category":    category,
                 "answer":      answer,
-                "type_ok":     type_ok,
             }
-        return {"category": "unknown", "answer": None, "type_ok": False}
+        return {"category": "unknown", "answer": None}
 
-    # Full inference method
+    # Full inference method -- single-shot generation
     @torch.no_grad()
     def predict(
         self,
@@ -531,12 +522,12 @@ class SpatialVLM(nn.Module):
         question: str,
         depth_map: torch.Tensor,        # [H, W] raw depth tensor
         rle_list: list = None,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 30,
     ) -> dict:
-        """End-to-end: image + question -> {category, answer, type_ok, raw}.
+        """Single-shot inference: image + question -> {category, answer, raw}.
 
-        Auto-finds <mask> positions in tokenized input and matches with rle_list.
-        Adds SYSTEM_PROMPT automatically.
+        Model generates the full answer string: 'category | value'
+        Then parsed via regex.
         """
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -569,19 +560,25 @@ class SpatialVLM(nn.Module):
             rle_list = None
             mask_positions = None
 
+        # Single-shot generation
         output_ids = self.generate(
             pixel_values, image_grid_thw, depth_batch, input_ids,
             rle_list=rle_list,
             mask_token_positions=mask_positions,
             max_new_tokens=max_new_tokens,
         )
-        decoded = self.processor.tokenizer.batch_decode(
-            output_ids, skip_special_tokens=True
-        )
-        raw_output = decoded[0]
-        result = self.parse_output(raw_output)
-        result["raw"] = raw_output
-        return result
+        raw_output = self.processor.tokenizer.decode(
+            output_ids[0], skip_special_tokens=True
+        ).strip()
+
+        # Parse via regex
+        parsed = self.parse_output(raw_output)
+
+        return {
+            "category": parsed["category"],
+            "answer":   parsed["answer"],
+            "raw":      raw_output,
+        }
 
 
 # Parameter counting util

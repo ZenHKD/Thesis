@@ -117,14 +117,13 @@ def main():
             max_new_tokens=args.max_new_tokens,
         )
 
-        type_flag = "[OK]" if result["type_ok"] else "[FAIL]"
         match = str(result.get("answer", "")).strip('"') == str(s["normalized_answer"]).strip('"')
         match_flag = "[OK]" if match else "[FAIL]"
         if match:
             correct += 1
 
         print(f"\n  Raw output:   {result['raw'][:150]}")
-        print(f"  Parsed:       category={result['category']!r}  answer={result['answer']!r}  type_ok={type_flag}")
+        print(f"  Parsed:       category={result['category']!r}  answer={result['answer']!r}")
         print(f"  Ground truth: category={s['category']!r}  answer={s['normalized_answer']!r}")
         print(f"  Match: {match_flag}")
         print_vram_usage(f"sample {i}")

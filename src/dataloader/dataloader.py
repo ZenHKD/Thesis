@@ -51,7 +51,7 @@ _SPLIT_CONFIG = {
 def format_answer(category: str, normalized_answer) -> str:
     """Build the structured target string for training.
 
-    Format: CATEGORY: <cat> | ANSWER: <value>
+    Format: <category> | <value>
 
     Answer formatting per architecture.md:
         mcq        -> "5"    (quoted integer)
@@ -65,7 +65,7 @@ def format_answer(category: str, normalized_answer) -> str:
     else:
         formatted = raw
 
-    return f"CATEGORY: {category} | ANSWER: {formatted}"
+    return f"{category} | {formatted}"
 
 
 # Dataset
@@ -198,8 +198,8 @@ class SpatialVLMDataset(Dataset):
         mask_positions = mask_positions[:n]
         rle_list = rle_list[:n]
 
-        # 7. Build labels (mask prompt, train only on answer)
-        labels = self._build_labels(input_ids, text)
+        # 7. Build labels (fill-in-blank: mask prompt + format tokens)
+        labels = self._build_labels(input_ids, text, category)
 
         # 8. Format answer for metadata
         raw_answer = str(entry["normalized_answer"])
@@ -242,20 +242,22 @@ class SpatialVLMDataset(Dataset):
             "image_name":     image_name,
         }
 
-    def _build_labels(self, input_ids: torch.Tensor, full_text: str) -> torch.Tensor:
-        """Mask prompt tokens with -100, keep only answer tokens as labels.
+    def _build_labels(self, input_ids: torch.Tensor, full_text: str,
+                       category: str) -> torch.Tensor:
+        """Build labels: mask prompt, keep entire answer active.
 
-        Searches for the last occurrence of '<|im_start|>assistant\n' token
-        sequence in input_ids to find where the answer begins.
+        Masks:
+          - All prompt tokens (before assistant answer)
+        Active (trained on):
+          - Entire answer: 'category | value' (e.g. 'distance | 5.75')
         """
         labels = input_ids.clone()
 
-        # Tokenize the assistant marker to get its token ID(s)
+        # Tokenize the assistant marker to find answer start
         marker_ids = self.tokenizer.encode(
             self._assistant_marker, add_special_tokens=False
         )
 
-        # Search for the last occurrence of marker_ids in input_ids
         ids_list = input_ids.tolist()
         marker_len = len(marker_ids)
         answer_start = -1
@@ -266,13 +268,13 @@ class SpatialVLMDataset(Dataset):
                 break
 
         if answer_start == -1:
-            # Fallback: can't find marker, mask everything
             labels[:] = -100
             return labels
 
-        # Mask everything up to (and including) the assistant marker
+        # Mask everything up to assistant marker (prompt)
         labels[:answer_start] = -100
 
+        # Everything after answer_start stays active (category | value)
         return labels
 
 
