@@ -4,7 +4,7 @@
 
 | Split | QA Pairs | RGB-D pairs |
 |-------|----------|-------------|
-| Train | **499k** | ~95k |
+| Train | **499k** | ~78k |
 | Test  | 19k | — |
 | Val   | 1.9k | — |
 
@@ -16,7 +16,7 @@
 | `distance` | `9.81` (float, meters) | Distance between 2 regions |
 | `count` | `2` (int) | Count of objects in buffer zone |
 
-> **Depth**: ~95k RGB-D pairs — real depth sensor data available \
+> **Depth**: ~78k RGB-D pairs — real depth sensor data available \
 > **Regions**: encoded as `<mask>` in question text, with per-region **RLE** in JSON
 
 ---
