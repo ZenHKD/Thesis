@@ -183,17 +183,6 @@ class SpatialVLM(nn.Module):
     def device(self):
         return next(self.qwen.parameters()).device
 
-    def _get_qwen(self):
-        """Resolve to the underlying Qwen model, works with or without PEFT wrapping.
-
-        Without PEFT: self.qwen is Qwen3_5ForConditionalGeneration -> return as-is
-        With PEFT:    self.qwen is PeftModel -> base_model (LoraModel) -> model -> Qwen3_5ForConditionalGeneration
-        """
-        if hasattr(self.qwen, 'peft_config'):
-            # PEFT wrapped: unwrap to the original model
-            return self.qwen.base_model.model
-        return self.qwen
-
     # Internal helpers
 
     def _get_visual_tokens(
@@ -213,7 +202,7 @@ class SpatialVLM(nn.Module):
                 (needed for Phase 2 LoRA fine-tuning). If False, wrap with
                 torch.no_grad() for efficiency (Phase 1).
         """
-        visual = self._get_qwen().model.visual
+        visual = self.qwen.model.visual
         # Phase 1: frozen vision encoder -- skip autograd graph
         # Phase 2: LoRA on vision encoder -- need gradients
         ctx = torch.enable_grad() if vision_requires_grad else torch.no_grad()
@@ -312,7 +301,7 @@ class SpatialVLM(nn.Module):
         )  # [B, N, 1024]
 
         # Step 3: Text embeddings
-        embed = self._get_qwen().model.language_model.embed_tokens
+        embed = self.qwen.model.language_model.embed_tokens
         text_embeds = embed(input_ids)  # [B, L, 1024]
 
         # Step 4: RTI - inject region tokens at <mask> positions
@@ -353,7 +342,7 @@ class SpatialVLM(nn.Module):
             hidden: [B, T, 1024]
         """
         B, seq_len, _ = inputs_embeds.shape
-        lm = self._get_qwen().model.language_model
+        lm = self.qwen.model.language_model
 
         # Position ids -- use cache_position if available (handles offset for decode steps)
         if cache_position is not None:
@@ -431,11 +420,11 @@ class SpatialVLM(nn.Module):
             inputs_embeds,
             use_gradient_checkpointing=use_gradient_checkpointing,
         )  # [B, T, 1024]
-        hidden = self._get_qwen().model.language_model.norm(hidden)    # [B, T, 1024]
+        hidden = self.qwen.model.language_model.norm(hidden)    # [B, T, 1024]
 
         # LM Head -- only on text tokens (visual tokens have no labels)
         text_hidden = hidden[:, n_visual:, :]                   # [B, L, 1024]
-        logits = self._get_qwen().lm_head(text_hidden)                 # [B, L, vocab]
+        logits = self.qwen.lm_head(text_hidden)                 # [B, L, vocab]
 
         return {"logits": logits}
 
@@ -471,7 +460,7 @@ class SpatialVLM(nn.Module):
             rle_list, mask_token_positions,
         )
 
-        lm = self._get_qwen().model.language_model
+        lm = self.qwen.model.language_model
         embed = lm.embed_tokens
         eos_id = self.processor.tokenizer.eos_token_id
         B, T, _ = inputs_embeds.shape
@@ -484,7 +473,7 @@ class SpatialVLM(nn.Module):
         cache_position = torch.arange(T, device=dev)
         hidden = self._backbone_forward(inputs_embeds, past_key_values=cache, cache_position=cache_position)
         hidden = lm.norm(hidden[:, -1:, :])                                # [B, 1, 1024]
-        logits = self._get_qwen().lm_head(hidden)                                 # [B, 1, vocab]
+        logits = self.qwen.lm_head(hidden)                                 # [B, 1, vocab]
 
         if do_sample and temperature > 0:
             probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
@@ -504,7 +493,7 @@ class SpatialVLM(nn.Module):
 
             hidden = self._backbone_forward(tok_embed, past_key_values=cache, cache_position=step_cache_pos)
             hidden = lm.norm(hidden)                                       # [B, 1, 1024]
-            logits = self._get_qwen().lm_head(hidden)                             # [B, 1, vocab]
+            logits = self.qwen.lm_head(hidden)                             # [B, 1, vocab]
 
             if do_sample and temperature > 0:
                 probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
