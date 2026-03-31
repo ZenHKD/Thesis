@@ -7,12 +7,12 @@ flow to GSA and RTI (the trainable custom modules).
 
 Usage:
     python test/test_backprop.py
-    python test/test_backprop.py --batch-size 2
+    python test/test_backprop.py --resolution 540p
     python test/test_backprop.py --attn-impl sdpa
 """
 
-import sys
 import os
+import sys
 import argparse
 import torch
 
@@ -35,10 +35,19 @@ def main():
     parser.add_argument("--attn-impl",  default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--resolution", default="450p",
+                        choices=["1080p", "720p", "540p", "450p"],
+                        help="Image resolution (default: 450p to fit in 12GB VRAM)")
 
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+    target_size = {
+        "1080p": None,
+        "720p":  (1280, 720),
+        "540p":  (960, 540),
+        "450p":  (800, 450),
+    }[args.resolution]
 
     # ====================================================================
     # 1. LOAD MODEL
@@ -76,11 +85,12 @@ def main():
 
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
     dataset = SpatialVLMDataset("train_sample", processor=processor,
-                                max_samples=args.batch_size)
+                                max_samples=args.batch_size, target_size=target_size)
     loader = get_dataloader(dataset, batch_size=args.batch_size,
-                            shuffle=False, num_workers=0)
+                            shuffle=False, num_workers=0, pin_memory=False)
     batch = next(iter(loader))
 
+    print(f"  Resolution: {args.resolution}")
     print(f"  Batch size: {args.batch_size}")
     for key, val in batch.items():
         if isinstance(val, torch.Tensor):
@@ -111,6 +121,7 @@ def main():
         input_ids=input_ids,
         rle_list=batch["rle_list"][0],
         mask_token_positions=batch["mask_positions"][0],
+        decoded_masks=batch["decoded_masks"][0],
         use_gradient_checkpointing=True,
     )
     logits = output["logits"]
@@ -195,10 +206,11 @@ def main():
     # Check Qwen is frozen (no grads)
     print("\n  Qwen (frozen) -- spot check:")
     qwen_leak = False
+    qwen = pipeline.qwen
     spot_checks = [
-        ("visual.blocks.0.attn.qkv.weight", pipeline.qwen.model.visual.blocks[0].attn.qkv.weight),
-        ("language_model.layers.0.feed_forward.gate_proj.weight",
-         pipeline.qwen.model.language_model.layers[0].mlp.gate_proj.weight),
+        ("visual.blocks.0.attn.qkv.weight", qwen.model.visual.blocks[0].attn.qkv.weight),
+        ("language_model.layers.0.mlp.gate_proj.weight",
+         qwen.model.language_model.layers[0].mlp.gate_proj.weight),
     ]
     for name, param in spot_checks:
         if param.grad is not None:
