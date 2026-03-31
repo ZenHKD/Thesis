@@ -405,7 +405,7 @@ Labels:  active   active  active
 **Loss**: `L = L_lm` -- CE on content tokens only (category + answer) \
 **Goal**: Teach GSA/RTI to produce geometry-aware representations; model learns to predict correct category and answer value.
 
-### Phase 2: Full Fine-tuning (5 epochs)
+### Phase 2: Full Fine-tuning (except text embeddings)(5 epochs)
 
 | Component | Status | LR |
 |-----------|--------|-----|

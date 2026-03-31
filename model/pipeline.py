@@ -183,22 +183,41 @@ class SpatialVLM(nn.Module):
     def device(self):
         return next(self.qwen.parameters()).device
 
+    def _get_qwen(self):
+        """Resolve to the underlying Qwen model, works with or without PEFT wrapping.
+
+        Without PEFT: self.qwen is Qwen3_5ForConditionalGeneration -> return as-is
+        With PEFT:    self.qwen is PeftModel -> base_model (LoraModel) -> model -> Qwen3_5ForConditionalGeneration
+        """
+        if hasattr(self.qwen, 'peft_config'):
+            # PEFT wrapped: unwrap to the original model
+            return self.qwen.base_model.model
+        return self.qwen
+
     # Internal helpers
 
     def _get_visual_tokens(
         self,
         pixel_values:   torch.Tensor,   # from Qwen processor
         image_grid_thw: torch.Tensor,   # [num_images, 3]
+        vision_requires_grad: bool = False,  # True for Phase 2 (LoRA on vision)
     ) -> torch.Tensor:
         """Run Qwen's Vision Encoder + Merger -> [B, N', 1024].
 
         model.visual() returns 768-dim pre-merger hidden states as a flat
         [total_N, 768] tensor (patches from all images concatenated).
         Split by image, apply the merger per-image, then stack.
+
+        Args:
+            vision_requires_grad: If True, allow gradients through vision encoder
+                (needed for Phase 2 LoRA fine-tuning). If False, wrap with
+                torch.no_grad() for efficiency (Phase 1).
         """
-        visual = self.qwen.model.visual
-        # Frozen vision encoder -- skip autograd graph construction
-        with torch.no_grad():
+        visual = self._get_qwen().model.visual
+        # Phase 1: frozen vision encoder -- skip autograd graph
+        # Phase 2: LoRA on vision encoder -- need gradients
+        ctx = torch.enable_grad() if vision_requires_grad else torch.no_grad()
+        with ctx:
             visual_out = visual(pixel_values, grid_thw=image_grid_thw)
 
         # Unpack output
@@ -270,6 +289,7 @@ class SpatialVLM(nn.Module):
         rle_list:             list = None,    # list[dict] -- one per <mask>
         mask_token_positions: list = None,    # sorted token indices of <mask>
         decoded_masks:        list = None,    # pre-decoded [{'binary','soft2d'},...]
+        vision_requires_grad: bool = False,   # True for Phase 2 (LoRA on vision)
     ) -> tuple:
         """Build [B, T, 1024] inputs_embeds for the backbone.
 
@@ -278,7 +298,8 @@ class SpatialVLM(nn.Module):
             n_visual:       int           (number of visual tokens)
         """
         # Step 1: Vision Encoder + Merger -> [B, N, 1024]
-        visual_tokens = self._get_visual_tokens(pixel_values, image_grid_thw)
+        visual_tokens = self._get_visual_tokens(pixel_values, image_grid_thw,
+                                                vision_requires_grad=vision_requires_grad)
         n_visual = visual_tokens.shape[1]
 
         # Patch grid from image_grid_thw (after 2x2 merger)
@@ -291,7 +312,7 @@ class SpatialVLM(nn.Module):
         )  # [B, N, 1024]
 
         # Step 3: Text embeddings
-        embed = self.qwen.model.language_model.embed_tokens
+        embed = self._get_qwen().model.language_model.embed_tokens
         text_embeds = embed(input_ids)  # [B, L, 1024]
 
         # Step 4: RTI - inject region tokens at <mask> positions
@@ -332,7 +353,7 @@ class SpatialVLM(nn.Module):
             hidden: [B, T, 1024]
         """
         B, seq_len, _ = inputs_embeds.shape
-        lm = self.qwen.model.language_model
+        lm = self._get_qwen().model.language_model
 
         # Position ids -- use cache_position if available (handles offset for decode steps)
         if cache_position is not None:
@@ -381,6 +402,7 @@ class SpatialVLM(nn.Module):
         mask_token_positions: list = None,
         use_gradient_checkpointing: bool = False,
         decoded_masks:        list = None,
+        vision_requires_grad: bool = False,
     ) -> dict:
         """Training/inference forward pass.
 
@@ -393,12 +415,15 @@ class SpatialVLM(nn.Module):
             mask_token_positions: sorted token indices of <mask> in input_ids, or None
             use_gradient_checkpointing: recompute backbone activations during
                                         backward to save VRAM (default: False)
+            vision_requires_grad: allow gradients through vision encoder for
+                                  Phase 2 LoRA fine-tuning (default: False)
         Returns:
             dict with 'logits': [B, L, vocab_size] (text tokens only, aligned with labels)
         """
         inputs_embeds, n_visual = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
+            vision_requires_grad=vision_requires_grad,
         )
 
         # Backbone -- full sequence (visual + text)
@@ -406,11 +431,11 @@ class SpatialVLM(nn.Module):
             inputs_embeds,
             use_gradient_checkpointing=use_gradient_checkpointing,
         )  # [B, T, 1024]
-        hidden = self.qwen.model.language_model.norm(hidden)    # [B, T, 1024]
+        hidden = self._get_qwen().model.language_model.norm(hidden)    # [B, T, 1024]
 
         # LM Head -- only on text tokens (visual tokens have no labels)
         text_hidden = hidden[:, n_visual:, :]                   # [B, L, 1024]
-        logits = self.qwen.lm_head(text_hidden)                 # [B, L, vocab]
+        logits = self._get_qwen().lm_head(text_hidden)                 # [B, L, vocab]
 
         return {"logits": logits}
 
@@ -446,7 +471,7 @@ class SpatialVLM(nn.Module):
             rle_list, mask_token_positions,
         )
 
-        lm = self.qwen.model.language_model
+        lm = self._get_qwen().model.language_model
         embed = lm.embed_tokens
         eos_id = self.processor.tokenizer.eos_token_id
         B, T, _ = inputs_embeds.shape
@@ -459,7 +484,7 @@ class SpatialVLM(nn.Module):
         cache_position = torch.arange(T, device=dev)
         hidden = self._backbone_forward(inputs_embeds, past_key_values=cache, cache_position=cache_position)
         hidden = lm.norm(hidden[:, -1:, :])                                # [B, 1, 1024]
-        logits = self.qwen.lm_head(hidden)                                 # [B, 1, vocab]
+        logits = self._get_qwen().lm_head(hidden)                                 # [B, 1, vocab]
 
         if do_sample and temperature > 0:
             probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
@@ -479,7 +504,7 @@ class SpatialVLM(nn.Module):
 
             hidden = self._backbone_forward(tok_embed, past_key_values=cache, cache_position=step_cache_pos)
             hidden = lm.norm(hidden)                                       # [B, 1, 1024]
-            logits = self.qwen.lm_head(hidden)                             # [B, 1, vocab]
+            logits = self._get_qwen().lm_head(hidden)                             # [B, 1, vocab]
 
             if do_sample and temperature > 0:
                 probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
