@@ -7,7 +7,7 @@ flow to GSA and RTI (the trainable custom modules).
 
 Usage:
     python test/test_backprop.py
-    python test/test_backprop.py --resolution 540p
+    python test/test_backprop.py --resolution 450p
     python test/test_backprop.py --attn-impl sdpa
 """
 

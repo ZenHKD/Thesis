@@ -5,7 +5,7 @@ Usage:
     python test/test_dataloader.py
     python test/test_dataloader.py --num-samples 10
     python test/test_dataloader.py --batch-size 4
-    python test/test_dataloader.py --resolution 540p
+    python test/test_dataloader.py --resolution 450p
 """
 
 import sys
