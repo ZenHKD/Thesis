@@ -6,9 +6,9 @@ computes loss (L_lm), calls backward, and verifies gradients
 flow to GSA and RTI (the trainable custom modules).
 
 Usage:
-    python test/test_backprop.py
-    python test/test_backprop.py --resolution 450p
-    python test/test_backprop.py --attn-impl sdpa
+    python test/test_backprop_1.py
+    python test/test_backprop_1.py --resolution 450p
+    python test/test_backprop_1.py --attn-impl sdpa
 """
 
 import os
