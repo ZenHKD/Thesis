@@ -18,7 +18,7 @@ Usage:
     python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_25000 --resume checkpoints/phase2/step_5000
     python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_25000 --split train_sample --epochs 1
 
-LoRA Targets (self-implemented, no PEFT dependency):
+LoRA Targets (self-implemented):
     Vision Encoder (12 ViT blocks, rank=32):
         attn.qkv, attn.proj, mlp.linear_fc1, mlp.linear_fc2
 
@@ -265,7 +265,7 @@ def main():
     load_phase1_checkpoint(pipeline, args.phase1_ckpt)
 
     # ====================================================================
-    # 3. APPLY LoRA (self-implemented, no PEFT)
+    # 3. APPLY LoRA
     # ====================================================================
     print(f"\n{'='*70}")
     print("APPLYING LoRA ADAPTERS")
