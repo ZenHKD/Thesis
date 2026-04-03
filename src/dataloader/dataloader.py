@@ -19,6 +19,7 @@ Usage:
             batch["depth_maps"],   batch["input_ids"],
             rle_list=batch["rle_list"][0],
             mask_token_positions=batch["mask_positions"][0],
+            decoded_masks=batch["decoded_masks"][0],
         )
 """
 
@@ -280,46 +281,29 @@ class SpatialVLMDataset(Dataset):
 
 # Collate function
 def collate_fn(batch: list[dict]) -> dict:
-    """Custom collate for SpatialVLMDataset.
+    """Collate for SpatialVLMDataset (batch_size=1 only).
 
-    Since all images are FullHD (1920x1080), pixel_values and image_grid_thw
-    have consistent shapes. input_ids/labels may vary slightly, so pad them.
+    RTI processes masks per-image, so batch_size > 1 is not supported.
+    Use --grad-accum in the training script for effective batching.
     """
-    # Pad input_ids and labels to max length in batch
-    max_len = max(d["input_ids"].shape[0] for d in batch)
-    pad_id = 0  # Qwen pad token
-
-    input_ids_padded = []
-    labels_padded = []
-    attention_masks = []
-
-    for d in batch:
-        T = d["input_ids"].shape[0]
-        pad_len = max_len - T
-
-        input_ids_padded.append(
-            torch.cat([d["input_ids"], torch.full((pad_len,), pad_id, dtype=torch.long)])
-        )
-        labels_padded.append(
-            torch.cat([d["labels"], torch.full((pad_len,), -100, dtype=torch.long)])
-        )
-        attention_masks.append(
-            torch.cat([d["attention_mask"], torch.zeros(pad_len, dtype=torch.long)])
-        )
-
+    assert len(batch) == 1, (
+        "batch_size > 1 not supported (RTI processes masks per-image). "
+        "Use --grad-accum for effective batching."
+    )
+    d = batch[0]
     return {
-        "pixel_values":   torch.cat([d["pixel_values"] for d in batch], dim=0),
-        "image_grid_thw": torch.cat([d["image_grid_thw"] for d in batch], dim=0),
-        "depth_maps":     torch.stack([d["depth_map"] for d in batch]),
-        "input_ids":      torch.stack(input_ids_padded),
-        "labels":         torch.stack(labels_padded),
-        "attention_mask": torch.stack(attention_masks),
-        "mask_positions": [d["mask_positions"] for d in batch],
-        "rle_list":       [d["rle_list"] for d in batch],
-        "decoded_masks":  [d["decoded_masks"] for d in batch],
-        "categories":     [d["category"] for d in batch],
-        "answers":        [d["answer"] for d in batch],
-        "image_names":    [d["image_name"] for d in batch],
+        "pixel_values":   d["pixel_values"],               # [num_patches, 1536]
+        "image_grid_thw": d["image_grid_thw"],             # [1, 3]
+        "depth_maps":     d["depth_map"].unsqueeze(0),     # [1, H, W]
+        "input_ids":      d["input_ids"].unsqueeze(0),     # [1, L]
+        "labels":         d["labels"].unsqueeze(0),        # [1, L]
+        "attention_mask": d["attention_mask"].unsqueeze(0),# [1, L]
+        "mask_positions": [d["mask_positions"]],
+        "rle_list":       [d["rle_list"]],
+        "decoded_masks":  [d["decoded_masks"]],
+        "categories":     [d["category"]],
+        "answers":        [d["answer"]],
+        "image_names":    [d["image_name"]],
     }
 
 
