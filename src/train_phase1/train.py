@@ -86,7 +86,7 @@ def main():
                         help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=500)
-    parser.add_argument("--resolution",  default="1080p", choices=["1080p", "720p", "540p", "450p"],
+    parser.add_argument("--resolution",  default="450p", choices=["1080p", "720p", "540p", "450p"],
                         help="Image resolution: 1080p (1920x1080), 720p (1280x720), 540p (960x540), 450p (800x450)")
     parser.add_argument("--no-grad-ckpt", action="store_true",
                         help="Disable gradient checkpointing (faster but uses more VRAM)")
@@ -95,7 +95,7 @@ def main():
                         help="Log training metrics every N optimizer steps")
     parser.add_argument("--resume",     type=str,   default=None,
                         help="Path to checkpoint directory to resume from")
-    parser.add_argument("--save-steps", type=int,   default=5000,
+    parser.add_argument("--save-steps", type=int,   default=10000,
                         help="Save checkpoint every N optimizer steps (0 = epoch-only)")
     parser.add_argument("--num-workers", type=int,  default=4)
     args = parser.parse_args()

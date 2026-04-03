@@ -13,10 +13,14 @@ Prerequisites:
     Phase 1 checkpoint with trained GSA + RTI weights.
 
 Usage:
+    # With Phase 1 pre-trained GSA + RTI weights (recommended):
     python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_25000
     python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_10000 --epochs 5
     python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_25000 --resume checkpoints/phase2/step_5000
-    python src/train_phase2/train.py --phase1-ckpt checkpoints/phase1/step_25000 --split train_sample --epochs 1
+
+    # Independent (no Phase 1 required -- GSA + RTI start from random init):
+    python src/train_phase2/train.py
+    python src/train_phase2/train.py --epochs 5 --split train_sample
 
 LoRA Targets (self-implemented):
     Vision Encoder (12 ViT blocks, rank=32):
@@ -202,9 +206,10 @@ def main():
     parser.add_argument("--dtype",      default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl",  default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
-    # Phase 1 checkpoint (required)
-    parser.add_argument("--phase1-ckpt", type=str, required=True,
-                        help="Path to Phase 1 checkpoint directory")
+    # Phase 1 checkpoint (optional)
+    parser.add_argument("--phase1-ckpt", type=str, default=None,
+                        help="Path to Phase 1 checkpoint directory. "
+                             "If omitted, GSA + RTI start from random init.")
     # LoRA
     parser.add_argument("--vision-lora-rank", type=int, default=32)
     parser.add_argument("--backbone-lora-rank", type=int, default=64)
@@ -221,13 +226,13 @@ def main():
     parser.add_argument("--grad-accum", type=int,   default=8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=500)
-    parser.add_argument("--resolution",  default="1080p",
+    parser.add_argument("--resolution",  default="450p",
                         choices=["1080p", "720p", "540p", "450p"])
     parser.add_argument("--no-grad-ckpt", action="store_true")
     # Logging & Checkpointing
     parser.add_argument("--log-steps",  type=int,   default=100)
     parser.add_argument("--resume",     type=str,   default=None)
-    parser.add_argument("--save-steps", type=int,   default=5000)
+    parser.add_argument("--save-steps", type=int,   default=10000)
     parser.add_argument("--num-workers", type=int,  default=4)
     args = parser.parse_args()
 
@@ -256,13 +261,18 @@ def main():
     print_vram_usage("after model load")
 
     # ====================================================================
-    # 2. LOAD PHASE 1 WEIGHTS (GSA + RTI)
+    # 2. LOAD PHASE 1 WEIGHTS (GSA + RTI)  [optional]
     # ====================================================================
     print(f"\n{'='*70}")
-    print("LOADING PHASE 1 CHECKPOINT")
-    print("=" * 70)
-
-    load_phase1_checkpoint(pipeline, args.phase1_ckpt)
+    if args.phase1_ckpt:
+        print("LOADING PHASE 1 CHECKPOINT")
+        print("=" * 70)
+        load_phase1_checkpoint(pipeline, args.phase1_ckpt)
+    else:
+        print("PHASE 1 CHECKPOINT: skipped (GSA + RTI start from random init)")
+        print("=" * 70)
+        print("  [!] No --phase1-ckpt provided. Training from scratch.")
+        print("      GSA and RTI weights are randomly initialized.")
 
     # ====================================================================
     # 3. APPLY LoRA
@@ -419,7 +429,8 @@ def main():
     print(f"\n{'='*70}")
     print("TRAINING")
     print("=" * 70)
-    print(f"  Phase 1 base:     {args.phase1_ckpt}")
+    phase1_label = args.phase1_ckpt if args.phase1_ckpt else "(none -- random init)"
+    print(f"  Phase 1 base:     {phase1_label}")
     print(f"  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  lr_custom={args.lr_custom}")
     print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}")
     print(f"  Vision LoRA rank={args.vision_lora_rank}  Backbone LoRA rank={args.backbone_lora_rank}")
@@ -559,7 +570,7 @@ def main():
                     save_checkpoint(
                         pipeline, optimizer, scheduler,
                         global_step, epoch, window_avg, ckpt_path,
-                        phase1_ckpt_path=args.phase1_ckpt,
+                        phase1_ckpt_path=args.phase1_ckpt or "",
                     )
 
         # End of epoch
@@ -575,7 +586,7 @@ def main():
         save_checkpoint(
             pipeline, optimizer, scheduler,
             global_step, epoch + 1, avg_epoch_loss, ckpt_path,
-            phase1_ckpt_path=args.phase1_ckpt,
+            phase1_ckpt_path=args.phase1_ckpt or "",
         )
         print_vram_usage(f"epoch {epoch + 1}")
 
@@ -585,7 +596,8 @@ def main():
     print(f"\n{'='*70}")
     print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"  Phase 1 base:     {args.phase1_ckpt}")
+    phase1_label = args.phase1_ckpt if args.phase1_ckpt else "(none -- random init)"
+    print(f"  Phase 1 base:     {phase1_label}")
     print(f"  Total steps:      {global_step}")
     print(f"  Vision LoRA:      rank={args.vision_lora_rank}")
     print(f"  Backbone LoRA:    rank={args.backbone_lora_rank}")
