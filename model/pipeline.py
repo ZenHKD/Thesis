@@ -440,6 +440,7 @@ class SpatialVLM(nn.Module):
         max_new_tokens:       int  = 80,
         do_sample:            bool = False,
         temperature:          float = 1.0,
+        decoded_masks:        list = None,
         **gen_kwargs,
     ) -> torch.Tensor:
         """Autoregressive generation with KV-cache.
@@ -453,11 +454,14 @@ class SpatialVLM(nn.Module):
         Returns:
             output_ids: [B, generated_len] newly generated token ids
         """
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        except ImportError:
+            from transformers import DynamicCache as Qwen3_5DynamicCache # For newer version of transformers
 
         inputs_embeds, _ = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
-            rle_list, mask_token_positions,
+            rle_list, mask_token_positions, decoded_masks,
         )
 
         lm = self.qwen.model.language_model
