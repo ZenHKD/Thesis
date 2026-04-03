@@ -32,17 +32,26 @@ class SpatialVLMLoss(nn.Module):
             logits: [1, L', vocab_size] -- text-only logits from pipeline.forward()
             labels: [1, L]              -- -100 for prompt, token ids for answer
 
-        L' may be shorter than L when RTI replaces each <mask> span (3 subtokens)
-        with 2 region tokens (-1 per mask). Trimmed from the END because the
-        shortening happens mid-sequence; trimming from the front would shift
-        answer tokens off-alignment.
+        Why L' < L and why trim from FRONT:
+            RTI replaces each <mask> (3 subtokens) with 2 region tokens.
+            All <mask> tokens are in the USER prompt, never in the answer.
+            This shortens the PROMPT portion of the embedding sequence by 1 per mask.
+
+            Original:  [prompt: L_p tokens | answer: L_a tokens]  (L = L_p + L_a)
+            After RTI: [prompt: L_p-n tokens | answer: L_a tokens] (L' = L - n)
+
+            The answer tokens shift LEFT by n positions in the embedding space.
+            Trimming n tokens from the FRONT of the label tensor matches that
+            shift -- so label[L_p - n] correctly aligns with logit[L_p - n - 1].
 
         Returns:
             Scalar CE loss
         """
-        # Align lengths: trim labels from the end to match logits
-        if logits.shape[1] < labels.shape[1]:
-            labels = labels[:, :logits.shape[1]]
+        # Align: trim labels from the FRONT to match the RTI-shortened logits.
+        # diff = n_masks (one per <mask> token in the prompt).
+        if labels.shape[1] > logits.shape[1]:
+            diff = labels.shape[1] - logits.shape[1]
+            labels = labels[:, diff:]
 
         # Shift: logits[t] predicts labels[t+1]
         shift_logits = logits[:, :-1, :].contiguous()
