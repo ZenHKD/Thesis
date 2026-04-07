@@ -134,7 +134,7 @@ Thesis/
 
 ```bash
 # Clone the repo
-git clone git@github.com:ZenHKD/Thesis.git
+git clone https://github.com/ZenHKD/Thesis.git
 cd Thesis
 
 # Download Qwen 3.5 0.8B locally
