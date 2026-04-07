@@ -1,7 +1,8 @@
 *__pycache__*
 
 data/
-
+checkpoints/
 .env
 
 model/qwen3.5-0.8b/
+model_micro/qwen3.5-micro/
