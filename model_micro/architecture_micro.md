@@ -11,7 +11,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Decoder layers | 24 (6 groups) | **8 (2 groups)** | 332M |
 | Vocab size | 248,320 | **319** | 253.7M |
 | Context length | 262,144 | **2,048** | VRAM only |
-| Number Head | — | **+0.26M** (NEW) | — |
+| Number Head | — | **+0.26M** (NEW, softplus) | — |
 | **Total** | **853M** | **~211M** | **~642M (75%)** |
 
 > **Key**: `hidden_dim = 1024` is **unchanged** — all tensor shapes between modules stay identical.
@@ -63,7 +63,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Vision Encoder | 44.10M | 20.9% | 4 ViT blocks (768-dim) + merger |
 | Token Embeddings (tied w/ LM Head) | 0.33M | 0.2% | 319 × 1024 |
 | Text Decoder (8 layers + Norm) | 166.04M | 78.6% | 6 DeltaNet + 2 GatedAttn |
-| Number Head | 0.26M | 0.1% | xVal-style distance regression |
+| Number Head | 0.26M | 0.1% | xVal-style regression (softplus) |
 | **Total (Qwen Micro)** | **~211M** | 100% | |
 | GSA (2 blocks, custom) | +16.91M | — | Unchanged from v1 |
 | RTI (region tokens, custom) | +0.032M | — | Unchanged from v1 |
@@ -277,9 +277,10 @@ Implementation: `model_micro/rti.py` + `src/dataloader/dataloader_new.py`
 
 Implementation: `model_micro/num_head.py`
 
-`LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()`
+`LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> softplus()`
 
 Params: ~262K. Takes hidden state at `[NUM]` position, outputs non-negative scalar.
+`softplus(x) = log(1 + exp(x))` — smooth everywhere, always positive (no gradient discontinuity).
 
 **Why this fixes the distance and count problems:**
 
@@ -287,9 +288,9 @@ Params: ~262K. Takes hidden state at `[NUM]` position, outputs non-negative scal
 |---|---|---|
 | `4.52` distance | 4 tokens: `"4"` `"."` `"5"` `"2"` | 1 token: `[NUM]` -> scalar 4.52 |
 | `3` count | 1 token: `"3"` | 1 token: `[NUM]` -> scalar 3.0 |
-| Loss for pred=4.50 | CE(2->0) ≈ same penalty | MSE = 0.0004 |
-| Loss for pred=9.52 | CE(4->9) ≈ same penalty | MSE = 25.0 |
-| Correct signal? | ✗ (magnitude blind) | ✓ (proportional to error) |
+| Loss for pred=4.50 | CE(2->0) ≈ same penalty | SmoothL1 = 0.0 (< β) |
+| Loss for pred=9.52 | CE(4->9) ≈ same penalty | SmoothL1 = 4.5 (linear) |
+| Correct signal? | ✗ (magnitude blind) | ✓ (proportional, bounded grad) |
 | Benchmark metric | RMSE (both tasks) | ✓ MSE training = RMSE eval |
 
 ---
@@ -318,10 +319,12 @@ hidden state to output a continuous scalar.
 
 Implementation: `model_micro/loss.py`
 
-`L = L_CE + α · L_MSE`
+`L = L_CE + α · L_SmoothL1`
 
 - **L_CE**: Autoregressive CrossEntropy on all tokens (ignores -100 prompt tokens)
-- **L_MSE**: MSE on Number Head output vs ground truth (distance + count samples only)
+- **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
+  - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
+  - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
 - Front-trims labels to align with RTI-modified logits
 
 ---
@@ -347,7 +350,7 @@ on a 12GB GPU from the very first epoch. All components train simultaneously.
 | RTI | **Trainable** | 5e-5 |
 | Number Head | **Trainable** | 5e-4 |
 
-**Loss**: `L = L_CE + α·L_MSE` (MSE active for distance + count samples)
+**Loss**: `L = L_CE + α·L_SmoothL1` (SmoothL1 active for distance + count samples)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
 

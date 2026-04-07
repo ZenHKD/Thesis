@@ -9,8 +9,8 @@ Used for:
     - distance tasks: predicts distance in meters (float)
     - count tasks:    predicts count (float, rounded to int at inference)
 
-Both tasks use MSE loss during training, which directly optimizes
-the RMSE metric used in the benchmark.
+Both tasks use SmoothL1 loss during training, which provides
+bounded gradients while still optimizing for the RMSE eval metric.
 
 Params: ~262K
     LayerNorm(1024):     2 × 1024 =    2,048
@@ -21,6 +21,7 @@ Params: ~262K
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class NumberHead(nn.Module):
@@ -50,10 +51,10 @@ class NumberHead(nn.Module):
                    May be 0 if no numeric samples in batch.
 
         Returns:
-            [B_num] — predicted values (non-negative via .abs())
+            [B_num] — predicted values (non-negative via .softplus())
                       distance: meters (e.g. 5.73)
                       count:    float to be rounded at inference (e.g. 3.0)
         """
         if h_num.shape[0] == 0:
             return torch.zeros(0, device=h_num.device, dtype=h_num.dtype)
-        return self.head(h_num).squeeze(-1).abs()
+        return F.softplus(self.head(h_num).squeeze(-1))

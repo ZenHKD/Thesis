@@ -10,9 +10,9 @@ All components trainable from epoch 1:
     - RTI (Region Token Injector)         lr=5e-5
     - Number Head (xVal regression)       lr=5e-4
 
-Loss:   L = L_CE + α · L_MSE
+Loss:   L = L_CE + α · L_SmoothL1
         CE on structured text targets (category | answer)
-        MSE on Number Head output for distance + count samples
+        SmoothL1 on Number Head output for distance + count samples
 
 Usage:
     python src/train_micro/train.py
@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--lr-custom",   type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-4)
     parser.add_argument("--alpha",       type=float, default=1.0,
-                        help="Weight for MSE loss (α in L = L_CE + α·L_MSE)")
+                        help="Weight for SmoothL1 loss (α in L = L_CE + α·L_SmoothL1)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--batch-size",  type=int,   default=8)
     parser.add_argument("--grad-accum",  type=int,   default=2)

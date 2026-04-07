@@ -1,16 +1,16 @@
 """
-SpatialVLM Micro — Combined Loss: CE (text) + MSE (numeric)
+SpatialVLM Micro — Combined Loss: CE (text) + SmoothL1 (numeric)
 =============================================================
 
-L = L_CE + α · L_MSE
+L = L_CE + α · L_SmoothL1
 
 L_CE:  Standard autoregressive CrossEntropy on structured text targets.
        Active on ALL samples (category tokens + answer tokens).
        Ignores prompt tokens (masked as -100).
 
-L_MSE: Mean Squared Error on Number Head predictions.
+L_SmoothL1: SmoothL1 (Huber) loss on Number Head predictions.
        Active only for numeric samples (distance + count).
-       Directly optimizes the RMSE benchmark metric.
+       Bounded gradients (max 1.0) — eliminates spikes from large targets.
 
 The RTI injection changes sequence length (each <mask> becomes 2 tokens
 instead of 3). Labels are front-trimmed to align with logits.
@@ -22,10 +22,10 @@ import torch.nn.functional as F
 
 
 class SpatialLoss(nn.Module):
-    """Combined CE (text) + MSE (numeric) loss for SpatialVLM Micro.
+    """Combined CE (text) + SmoothL1 (numeric) loss for SpatialVLM Micro.
 
     Args:
-        alpha:        Weight for MSE loss relative to CE loss.
+        alpha:        Weight for SmoothL1 loss relative to CE loss.
         ignore_index: Token index to ignore in CE loss (default: -100).
         remap_fn:     Optional callable to remap label IDs (old -> new vocab).
                       Pass pipeline.remap_to_new for pruned vocab models.
@@ -48,7 +48,7 @@ class SpatialLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Returns:
-            Scalar loss = L_CE + α · L_MSE
+            Scalar loss = L_CE + α · L_SmoothL1
         """
         # --- Remap labels: old Qwen IDs -> new pruned IDs [0..318] ---
         if self.remap_fn is not None:
@@ -74,11 +74,14 @@ class SpatialLoss(nn.Module):
                 ignore_index=self.ignore_index,
             )
 
-        # --- MSE Loss: only on numeric samples (distance + count) ---
+        # --- SmoothL1 Loss: only on numeric samples (distance + count) ---
+        # SmoothL1 (Huber) has bounded gradients unlike MSE, reducing
+        # gradient spikes from large distance/count targets.
         if is_numeric.any():
-            loss_mse = F.mse_loss(
+            loss_mse = F.smooth_l1_loss(
                 num_pred[is_numeric].float(),
                 num_gt[is_numeric].float(),
+                beta=1.0,
             )
         else:
             loss_mse = torch.tensor(0.0, device=lm_logits.device)
