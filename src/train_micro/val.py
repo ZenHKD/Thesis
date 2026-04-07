@@ -1,0 +1,173 @@
+"""
+SpatialVLM Micro — Validation
+==============================
+
+Runs the model on the val split and returns the average loss.
+Called from train.py at the end of each epoch.
+
+Usage (standalone):
+    python src/train_micro/val.py
+    python src/train_micro/val.py --resolution 450p --max-samples 100
+"""
+
+import os
+import sys
+import argparse
+import torch
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from src.dataloader.dataloader_new import SpatialVLMDataset, get_dataloader
+from model_micro.pipeline import SpatialVLM, print_vram_usage
+from model_micro.loss import SpatialLoss
+
+
+@torch.no_grad()
+def validate(pipeline, criterion, processor, resolution="450p",
+             batch_size=4, num_workers=2, max_samples=None, split="val"):
+    """Run validation and return average loss.
+
+    Args:
+        pipeline:    SpatialVLM model (already on GPU)
+        criterion:   SpatialLoss with remap_fn
+        processor:   Qwen processor
+        resolution:  image resolution
+        batch_size:  validation batch size
+        num_workers: dataloader workers
+        max_samples: limit number of samples (None = all)
+        split:       dataset split
+
+    Returns:
+        dict with 'val_loss', 'val_ce', 'val_mse', 'n_samples'
+    """
+    target_size = {"1080p": None, "720p": (1280, 720),
+                   "540p": (960, 540), "450p": (800, 450)}[resolution]
+
+    dataset = SpatialVLMDataset(
+        split, processor=processor,
+        max_samples=max_samples, target_size=target_size,
+    )
+    loader = get_dataloader(
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=False,
+    )
+
+    dev = pipeline.device
+    dtype = next(pipeline.parameters()).dtype
+
+    pipeline.eval()
+    total_loss = 0.0
+    total_ce = 0.0
+    total_mse = 0.0
+    n_batches = 0
+
+    pbar = tqdm(loader, desc="Validation", leave=False,
+                bar_format="{l_bar}{bar:20}{r_bar}")
+
+    for batch in pbar:
+        pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype)
+        image_grid_thw = batch["image_grid_thw"].to(device=dev)
+        depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype)
+        input_ids      = batch["input_ids"].to(device=dev)
+        labels         = batch["labels"].to(device=dev)
+
+        try:
+            output = pipeline(
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                depth_maps=depth_maps,
+                input_ids=input_ids,
+                rle_list=batch["rle_list"],
+                mask_token_positions=batch["mask_positions"],
+                decoded_masks=batch["decoded_masks"],
+                num_token_positions=batch.get("num_token_positions"),
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                tqdm.write(f"  [!] OOM during validation, skipping batch")
+                torch.cuda.empty_cache()
+                continue
+            raise
+
+        logits = output["logits"]
+        num_pred = output["num_pred"]
+
+        loss = criterion(
+            logits, labels,
+            num_pred, batch["target_num"].to(dev),
+            batch["is_numeric"].to(dev),
+        )
+
+        total_loss += loss.item()
+        n_batches += 1
+
+        pbar.set_postfix({"val_loss": f"{total_loss / n_batches:.4f}"})
+
+        del logits, output, loss, pixel_values, depth_maps
+
+    avg_loss = total_loss / max(n_batches, 1)
+    return {
+        "val_loss": avg_loss,
+        "n_samples": len(dataset),
+        "n_batches": n_batches,
+    }
+
+
+# =========================================================================
+# Standalone
+# =========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="SpatialVLM Micro Validation")
+    parser.add_argument("--device",      default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--dtype",       default="bfloat16", choices=["bfloat16", "float32"])
+    parser.add_argument("--attn-impl",   default="flash_attention_2",
+                        choices=["flash_attention_2", "sdpa", "eager"])
+    parser.add_argument("--resolution",  default="450p",
+                        choices=["1080p", "720p", "540p", "450p"])
+    parser.add_argument("--batch-size",  type=int, default=4)
+    parser.add_argument("--split",       default="val",
+                        choices=["val", "train_sample"])
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--checkpoint",  type=str, default=None,
+                        help="Path to checkpoint dir to load before validation")
+    args = parser.parse_args()
+
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+
+    print("=" * 70)
+    print("VALIDATION")
+    print("=" * 70)
+
+    pipeline = SpatialVLM(dtype=dtype, device_map=args.device,
+                          attn_implementation=args.attn_impl)
+    print_vram_usage("after model load")
+
+    # Load checkpoint if specified
+    if args.checkpoint:
+        ckpt_path = os.path.join(args.checkpoint, "checkpoint.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
+        print(f"  Loaded checkpoint: {args.checkpoint}")
+
+    criterion = SpatialLoss(alpha=1.0, remap_fn=pipeline.remap_to_new)
+
+    results = validate(
+        pipeline, criterion, pipeline.processor,
+        resolution=args.resolution,
+        batch_size=args.batch_size,
+        split=args.split,
+        max_samples=args.max_samples,
+    )
+
+    print(f"\n{'='*70}")
+    print(f"  val_loss = {results['val_loss']:.6f}")
+    print(f"  samples  = {results['n_samples']}")
+    print(f"  batches  = {results['n_batches']}")
+    print(f"{'='*70}")
+    print_vram_usage("final")
+
+
+if __name__ == "__main__":
+    main()
