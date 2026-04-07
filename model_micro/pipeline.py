@@ -1,0 +1,736 @@
+"""
+MODULE: Full Pipeline — SpatialVLM Micro (Training)
+
+Architecture (211M total):
+    1. Qwen 3.5 Vision Encoder (pruned: 4 ViT blocks, 44M)
+       4 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
+    2. GSA: Geometry Self-Attention — DFormerv2 Full_GSA CVPR 2025
+       Position: after merger, before concat fusion (~16.9M)
+    3. RTI: Region-Level Token Injection (batched) (~0.032M)
+       Each <mask> -> [mask_rgb | mask_depth] (2 tokens × 1024-dim)
+    4. Concat Fusion: [visual_tokens | text+region_tokens]
+    5. Qwen 3.5 Backbone (pruned: 8 layers, 166M) — full fine-tuning
+    6. Dual Heads:
+       - LM Head (tied w/ embed): category + text answer
+       - Number Head (xVal): distance/count regression (~0.26M)
+
+Output format:
+    left_right | "left"      → LM Head only
+    mcq | "2"                → LM Head only
+    distance | [NUM]         → LM Head (category) + Number Head (value)
+    count | [NUM]            → LM Head (category) + Number Head (value)
+"""
+
+import re
+import os
+import sys
+import json
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from model_micro.gsa import GSA
+from model_micro.rti import RTE
+from model_micro.num_head import NumberHead
+
+# Default model path — pruned Micro checkpoint (from prune.py)
+MODEL_NAME = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "qwen3.5-micro"
+)
+
+# System Prompt
+SYSTEM_PROMPT = (
+    "You are a spatial reasoning assistant.\n"
+    "Your response MUST be exactly one line in this format:\n"
+    "CATEGORY | VALUE\n\n"
+    "CATEGORY must be exactly one of these four words:\n"
+    "  left_right\n"
+    "  mcq\n"
+    "  distance\n"
+    "  count\n\n"
+    "The separator ' | ' (space pipe space) is mandatory.\n\n"
+    "VALUE rules:\n"
+    '- left_right: "left" or "right" (with double quotes)\n'
+    '- mcq: "0", "1", "2", etc. (with double quotes)\n'
+    "- distance: a decimal number like 5.2 (no quotes)\n"
+    "- count: an integer like 3 (no quotes)\n\n"
+    "Examples:\n"
+    'left_right | "left"\n'
+    'mcq | "1"\n'
+    "distance | 5.2\n"
+    "count | 3\n\n"
+    "Output ONLY the category, pipe, and value. Nothing else."
+)
+
+# Regex for structured output parsing
+# Format: category | answer
+_OUTPUT_RE = re.compile(
+    r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
+    r'(?P<answer>"left"|"right"|"\d+"|\[NUM\]|\d+\.\d+|\d+)',
+    re.IGNORECASE,
+)
+
+
+def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
+    """Find token positions of <mask> in input_ids.
+
+    Qwen BPE tokenizes <mask> as 3 subtokens:
+      - isolated: ['<', 'mask', '>']  = specific IDs
+      - in context: [' <', 'mask', '>'] = different first ID
+    """
+    if not hasattr(find_mask_positions, '_cached'):
+        find_mask_positions._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
+        find_mask_positions._gt_id = tokenizer.encode(">", add_special_tokens=False)[0]
+        find_mask_positions._lt_ids = set()
+        for test in ["<", " <"]:
+            enc = tokenizer.encode(test, add_special_tokens=False)
+            if len(enc) == 1:
+                find_mask_positions._lt_ids.add(enc[0])
+        find_mask_positions._cached = True
+
+    mask_id = find_mask_positions._mask_id
+    gt_id = find_mask_positions._gt_id
+    lt_ids = find_mask_positions._lt_ids
+
+    ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
+    positions = []
+    i = 0
+    while i < len(ids) - 2:
+        if ids[i] in lt_ids and ids[i+1] == mask_id and ids[i+2] == gt_id:
+            positions.append(i)
+            i += 3
+        else:
+            i += 1
+    return positions
+
+
+def print_vram_usage(label: str = ""):
+    """Print current VRAM usage."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  VRAM [{label}]: {alloc:.2f} / {total:.2f} GB ({100*alloc/total:.0f}%)")
+
+
+class SpatialVLM(nn.Module):
+    """Full Micro pipeline: Qwen 3.5 VLM (pruned) + GSA + RTI + Number Head.
+
+    Custom modules:
+        self.gsa                       - GeometrySelfAttention (~16.9M)
+        self.region_token_extractor    - RegionTokenExtractor  (~0.032M)
+        self.num_head                  - NumberHead (xVal)     (~0.26M)
+
+    Qwen built-in (pruned):
+        self.qwen.model.visual         - Vision Encoder + Merger (4 blocks)
+        self.qwen.model.language_model - 8-layer backbone
+        self.qwen.lm_head              - Tied vocab projection
+    """
+
+    def __init__(
+        self,
+        model_name:              str   = MODEL_NAME,
+        gsa_heads:               int   = 8,
+        gsa_ffn_dim:             int   = 2048,
+        dropout:                 float = 0.1,
+        dtype                          = torch.bfloat16,
+        device_map:              str   = "auto",
+        attn_implementation:     str   = "sdpa",
+    ):
+        super().__init__()
+
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+        print(f"Loading {model_name}...")
+        self.qwen = AutoModelForImageTextToText.from_pretrained(
+            model_name,
+            config=config,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        print(f"  attn_implementation: {attn_implementation}")
+
+        self.processor = AutoProcessor.from_pretrained(
+            model_name, trust_remote_code=True
+        )
+
+        # Custom Module 1: GSA
+        self.gsa = GSA(
+            hidden_dim=1024,
+            num_heads=gsa_heads,
+            ffn_dim=gsa_ffn_dim,
+            dropout=dropout,
+            num_blocks=2,
+        )
+
+        # Custom Module 2: RTI
+        self.region_token_extractor = RTE(hidden_dim=1024)
+
+        # Custom Module 3: Number Head (NEW for Micro)
+        self.num_head = NumberHead(hidden_dim=1024)
+
+        # Move custom modules to match Qwen device/dtype
+        qwen_device = next(self.qwen.parameters()).device
+        qwen_dtype  = next(self.qwen.parameters()).dtype
+        self.gsa = self.gsa.to(device=qwen_device, dtype=qwen_dtype)
+        self.region_token_extractor = self.region_token_extractor.to(
+            device=qwen_device, dtype=qwen_dtype
+        )
+        self.num_head = self.num_head.to(device=qwen_device, dtype=qwen_dtype)
+        print(f"  Custom modules (GSA + RTI + NumHead) -> {qwen_device} ({qwen_dtype})")
+
+        # --- Token ID remapping (old Qwen IDs <-> pruned new IDs) ---
+        mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "micro_token_mapping.json")
+        with open(mapping_path, "r") as f:
+            mapping = json.load(f)
+
+        kept_old_ids = mapping["kept_old_ids"]              # [318] original Qwen IDs
+        old_to_new   = mapping["old_to_new"]                # {"old_id_str": new_id}
+        total_vocab  = mapping["total_vocab"]                # 319
+
+        # Build lookup: old_id -> new_id (size = max_old_id + 1)
+        max_old_id = max(kept_old_ids)
+        remap_old_to_new = torch.full((max_old_id + 1,), fill_value=0, dtype=torch.long)
+        for old_str, new_id in old_to_new.items():
+            remap_old_to_new[int(old_str)] = new_id
+        self.register_buffer("remap_old_to_new", remap_old_to_new)
+
+        # Build reverse: new_id -> old_id (size = total_vocab)
+        remap_new_to_old = torch.zeros(total_vocab, dtype=torch.long)
+        for old_str, new_id in old_to_new.items():
+            remap_new_to_old[new_id] = int(old_str)
+        # [NUM] token (new_id = total_vocab - 1) has no old equiv — map to pad 0
+        self.register_buffer("remap_new_to_old", remap_new_to_old)
+
+        self.micro_vocab_size = total_vocab
+        print(f"  Token remapping: {len(kept_old_ids)} old IDs -> {total_vocab} new IDs")
+
+    @property
+    def device(self):
+        return next(self.qwen.parameters()).device
+
+    # ---- Token ID remapping ----
+
+    def remap_to_new(self, ids: torch.Tensor) -> torch.Tensor:
+        """Remap original Qwen token IDs -> pruned new IDs [0..318].
+
+        IDs beyond the remap table are mapped to 0 (safe fallback).
+        Labels with value -100 are preserved.
+        """
+        lut = self.remap_old_to_new.to(ids.device)
+        mask_ignore = ids == -100
+        safe_ids = ids.clamp(0, lut.shape[0] - 1)
+        new_ids = lut[safe_ids]
+        new_ids[mask_ignore] = -100
+        return new_ids
+
+    def remap_to_old(self, ids: torch.Tensor) -> torch.Tensor:
+        """Remap pruned new IDs [0..318] -> original Qwen IDs (for tokenizer decode)."""
+        lut = self.remap_new_to_old.to(ids.device)
+        safe_ids = ids.clamp(0, lut.shape[0] - 1)
+        return lut[safe_ids]
+
+    # ---- Vision Encoder ----
+
+    def _get_visual_tokens(
+        self,
+        pixel_values:   torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        vision_requires_grad: bool = False,
+    ) -> torch.Tensor:
+        """Run Qwen's Vision Encoder + Merger -> [B, N', 1024]."""
+        visual = self.qwen.model.visual
+        ctx = torch.enable_grad() if vision_requires_grad else torch.no_grad()
+        with ctx:
+            visual_out = visual(pixel_values, grid_thw=image_grid_thw)
+
+        if isinstance(visual_out, torch.Tensor):
+            hidden = visual_out
+        elif hasattr(visual_out, "last_hidden_state"):
+            hidden = visual_out.last_hidden_state
+        elif isinstance(visual_out, tuple):
+            hidden = visual_out[0]
+        else:
+            hidden = visual_out
+
+        B = image_grid_thw.shape[0]
+        patches_per_image = [
+            int(image_grid_thw[i, 0] * image_grid_thw[i, 1] * image_grid_thw[i, 2])
+            for i in range(B)
+        ]
+
+        if hidden.dim() == 2:
+            hidden_list = hidden.split(patches_per_image, dim=0)
+        else:
+            hidden_list = [hidden[i] for i in range(B)]
+
+        if hidden_list[0].shape[-1] == 1024:
+            max_n = max(h.shape[0] for h in hidden_list)
+            stacked = torch.stack([
+                F.pad(h, (0, 0, 0, max_n - h.shape[0])) for h in hidden_list
+            ])
+            return stacked
+
+        # Pre-merger: apply merger per-image
+        ms = 2
+        merged = []
+        for i in range(B):
+            h_i = hidden_list[i].unsqueeze(0)
+            t, h, w = [int(x) for x in image_grid_thw[i].tolist()]
+            C = h_i.shape[-1]
+
+            h_i = visual.merger.norm(h_i)
+            h_i = h_i.view(1, t, h, w, C)
+            h_i = h_i.view(1, t, h // ms, ms, w // ms, ms, C)
+            h_i = h_i.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
+            h_i = h_i.view(1, -1, ms * ms * C)
+
+            h_i = visual.merger.linear_fc1(h_i)
+            h_i = F.gelu(h_i)
+            h_i = visual.merger.linear_fc2(h_i)
+
+            merged.append(h_i)
+
+        return torch.cat(merged, dim=0)
+
+    # ---- Build inputs embeds ----
+
+    def _build_inputs_embeds(
+        self,
+        pixel_values:         torch.Tensor,
+        image_grid_thw:       torch.Tensor,
+        depth_maps:           torch.Tensor,
+        input_ids:            torch.Tensor,   # [B, L]
+        rle_list:             list = None,    # [B][num_masks]
+        mask_token_positions: list = None,    # [B][num_masks]
+        decoded_masks:        list = None,    # [B][num_masks]
+        vision_requires_grad: bool = False,
+    ) -> tuple:
+        """Build [B, T, 1024] inputs_embeds for the backbone.
+
+        Returns:
+            inputs_embeds: [B, T, 1024]
+            n_visual:      int (number of visual tokens)
+            text_lengths:  list[int] (actual text length per sample after RTI)
+        """
+        # Step 1: Vision Encoder + Merger -> [B, N, 1024]
+        visual_tokens = self._get_visual_tokens(
+            pixel_values, image_grid_thw,
+            vision_requires_grad=vision_requires_grad,
+        )
+        n_visual = visual_tokens.shape[1]
+
+        # Patch grid from image_grid_thw (after 2x2 merger)
+        t, h, w = [int(x) for x in image_grid_thw[0].tolist()]
+        h_vis, w_vis = h // 2, w // 2
+
+        # Step 2: GSA -- depth-aware attention on visual tokens
+        visual_tokens = self.gsa(
+            visual_tokens, depth_maps, h_patches=h_vis, w_patches=w_vis
+        )
+
+        # Step 3: Text embeddings (remap old IDs -> new IDs for pruned vocab)
+        embed = self.qwen.model.language_model.embed_tokens
+        new_ids = self.remap_to_new(input_ids)
+        text_embeds = embed(new_ids)  # [B, L, 1024]
+
+        # Step 4: RTI - inject region tokens at <mask> positions
+        text_lengths = [input_ids.shape[1]] * input_ids.shape[0]  # default
+
+        if (rle_list is not None and mask_token_positions is not None
+                and any(len(rl) > 0 for rl in rle_list)):
+            region_tokens = self.region_token_extractor(
+                visual_tokens, depth_maps, rle_list, image_grid_thw,
+                decoded_masks=decoded_masks,
+            )
+            mask_token_len = len(self.processor.tokenizer.encode(
+                "<mask>", add_special_tokens=False
+            ))
+            text_embeds, text_lengths = self.region_token_extractor.inject_into_text_embeds(
+                text_embeds, mask_token_positions, region_tokens,
+                mask_token_len=mask_token_len,
+            )
+
+        # Step 5: Concat Fusion -- [visual | text+region]
+        inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
+
+        return inputs_embeds, n_visual, text_lengths
+
+    # ---- Backbone forward ----
+
+    def _backbone_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values=None,
+        cache_position: torch.Tensor = None,
+        use_gradient_checkpointing: bool = False,
+    ):
+        """Run backbone layers on inputs_embeds -> [B, T, 1024].
+
+        Optionally supports KV-cache: pass a Qwen3_5DynamicCache as
+        past_key_values and the corresponding cache_position.
+        """
+        B, seq_len, _ = inputs_embeds.shape
+        lm = self.qwen.model.language_model
+
+        if cache_position is not None:
+            position_ids = cache_position.unsqueeze(0).expand(B, -1)
+        else:
+            position_ids = torch.arange(
+                seq_len, device=inputs_embeds.device
+            ).unsqueeze(0).expand(B, -1)
+
+        position_embeddings = None
+        if hasattr(lm, "rotary_emb"):
+            position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
+
+        hidden = inputs_embeds
+        for layer in lm.layers:
+            kwargs = {"position_ids": position_ids}
+            if position_embeddings is not None:
+                kwargs["position_embeddings"] = position_embeddings
+            if past_key_values is not None:
+                kwargs["past_key_values"] = past_key_values
+                kwargs["cache_position"] = cache_position
+
+            if use_gradient_checkpointing and self.training:
+                def _layer_fn(h, _layer=layer, _kwargs=kwargs):
+                    try:
+                        out = _layer(h, **_kwargs)
+                    except TypeError:
+                        out = _layer(h)
+                    return out[0] if isinstance(out, tuple) else out
+                hidden = grad_checkpoint(_layer_fn, hidden, use_reentrant=False)
+            else:
+                try:
+                    layer_out = layer(hidden, **kwargs)
+                except TypeError:
+                    layer_out = layer(hidden)
+                hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+
+        return hidden
+
+    # ---- Forward ----
+
+    def forward(
+        self,
+        pixel_values:         torch.Tensor,
+        image_grid_thw:       torch.Tensor,
+        depth_maps:           torch.Tensor,
+        input_ids:            torch.Tensor,   # [B, L]
+        rle_list:             list = None,    # [B][num_masks]
+        mask_token_positions: list = None,    # [B][num_masks]
+        decoded_masks:        list = None,    # [B][num_masks]
+        num_token_positions:  list = None,    # [B] position of [NUM] in input_ids
+        use_gradient_checkpointing: bool = False,
+        vision_requires_grad: bool = False,
+    ) -> dict:
+        """Training forward pass.
+
+        Returns:
+            dict with:
+                'logits':   [B, L', vocab_size] — text-only logits (aligned with labels)
+                'num_pred': [B] — Number Head predictions (0 for non-numeric samples)
+        """
+        inputs_embeds, n_visual, text_lengths = self._build_inputs_embeds(
+            pixel_values, image_grid_thw, depth_maps, input_ids,
+            rle_list, mask_token_positions, decoded_masks,
+            vision_requires_grad=vision_requires_grad,
+        )
+
+        # Backbone -- full sequence (visual + text)
+        hidden = self._backbone_forward(
+            inputs_embeds,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        )
+        hidden = self.qwen.model.language_model.norm(hidden)
+
+        # LM Head -- only on text tokens (visual tokens have no labels)
+        text_hidden = hidden[:, n_visual:, :]
+        logits = self.qwen.lm_head(text_hidden)
+
+        # Number Head -- extract hidden states at [NUM] positions
+        B = input_ids.shape[0]
+        num_pred = torch.zeros(B, device=hidden.device, dtype=hidden.dtype)
+
+        if num_token_positions is not None:
+            num_hidden_list = []
+            num_indices = []
+            for b, pos in enumerate(num_token_positions):
+                if pos is not None and pos >= 0:
+                    # Adjust position: account for RTI injection
+                    # The [NUM] token is in the answer, after all <mask> tokens
+                    # pos is relative to text_embeds, so offset by n_visual
+                    adjusted_pos = n_visual + pos
+                    if adjusted_pos < hidden.shape[1]:
+                        num_hidden_list.append(hidden[b, adjusted_pos, :])
+                        num_indices.append(b)
+
+            if num_hidden_list:
+                h_num = torch.stack(num_hidden_list, dim=0)  # [K, 1024]
+                preds = self.num_head(h_num)                  # [K]
+                for k, b in enumerate(num_indices):
+                    num_pred[b] = preds[k]
+
+        return {"logits": logits, "num_pred": num_pred}
+
+    # ---- Generate (inference) ----
+
+    @torch.no_grad()
+    def generate(
+        self,
+        pixel_values:         torch.Tensor,
+        image_grid_thw:       torch.Tensor,
+        depth_maps:           torch.Tensor,
+        input_ids:            torch.Tensor,
+        rle_list:             list = None,
+        mask_token_positions: list = None,
+        max_new_tokens:       int  = 80,
+        do_sample:            bool = False,
+        temperature:          float = 1.0,
+        decoded_masks:        list = None,
+        **gen_kwargs,
+    ) -> torch.Tensor:
+        """Autoregressive generation with KV-cache.
+
+        Returns:
+            output_ids: [B, generated_len] newly generated token ids
+        """
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        except ImportError:
+            from transformers import DynamicCache as Qwen3_5DynamicCache
+
+        inputs_embeds, n_visual, text_lengths = self._build_inputs_embeds(
+            pixel_values, image_grid_thw, depth_maps, input_ids,
+            rle_list, mask_token_positions, decoded_masks,
+        )
+
+        lm = self.qwen.model.language_model
+        embed = lm.embed_tokens
+        B, T, _ = inputs_embeds.shape
+        dev = inputs_embeds.device
+
+        # Remap eos_id to new vocab space
+        eos_id_old = self.processor.tokenizer.eos_token_id
+        if eos_id_old is not None and eos_id_old < self.remap_old_to_new.shape[0]:
+            eos_id_new = self.remap_old_to_new[eos_id_old].item()
+        else:
+            eos_id_new = None
+
+        cache = Qwen3_5DynamicCache(config=lm.config)
+
+        # Prefill
+        cache_position = torch.arange(T, device=dev)
+        hidden = self._backbone_forward(inputs_embeds, past_key_values=cache, cache_position=cache_position)
+        hidden = lm.norm(hidden[:, -1:, :])
+        logits = self.qwen.lm_head(hidden)
+
+        if do_sample and temperature > 0:
+            probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+        else:
+            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        generated = [next_tok]  # new IDs
+
+        # Decode
+        for step in range(max_new_tokens - 1):
+            if eos_id_new is not None and (next_tok == eos_id_new).all():
+                break
+
+            tok_embed = embed(next_tok)  # next_tok is already in new ID space
+            step_cache_pos = torch.tensor([T + step], device=dev)
+
+            hidden = self._backbone_forward(tok_embed, past_key_values=cache, cache_position=step_cache_pos)
+            hidden = lm.norm(hidden)
+            logits = self.qwen.lm_head(hidden)
+
+            if do_sample and temperature > 0:
+                probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+            else:
+                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            generated.append(next_tok)
+
+        # Remap generated tokens back to old IDs for tokenizer decode
+        output_new = torch.cat(generated, dim=1)  # [B, gen_len] in new ID space
+        output_old = self.remap_to_old(output_new) # [B, gen_len] in old ID space
+        return output_old
+
+    # ---- Output parsing ----
+
+    @staticmethod
+    def parse_output(text: str) -> dict:
+        """Parse structured LM output -> {category, answer}.
+
+        Expected format: category | value
+        """
+        m = _OUTPUT_RE.search(text)
+        if m:
+            category = m.group("category").strip().lower()
+            answer   = m.group("answer").strip()
+            return {"category": category, "answer": answer}
+        return {"category": "unknown", "answer": None}
+
+    # ---- Full inference ----
+
+    @torch.no_grad()
+    def predict(
+        self,
+        image,                          # PIL.Image
+        question: str,
+        depth_map: torch.Tensor,        # [H, W] raw depth tensor
+        rle_list: list = None,
+        max_new_tokens: int = 30,
+    ) -> dict:
+        """Single-shot inference: image + question -> {category, answer, raw}."""
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text": question},
+            ]},
+        ]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(text=[text], images=[image], return_tensors="pt")
+
+        dev   = self.device
+        dtype = next(self.qwen.parameters()).dtype
+        pixel_values   = inputs["pixel_values"].to(device=dev, dtype=dtype)
+        image_grid_thw = inputs["image_grid_thw"].to(device=dev)
+        input_ids      = inputs["input_ids"].to(device=dev)
+        depth_batch    = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
+
+        # Auto-find <mask> positions
+        mask_positions = find_mask_positions(input_ids, self.processor.tokenizer)
+
+        if rle_list is not None and len(rle_list) > 0:
+            n = min(len(mask_positions), len(rle_list))
+            mask_positions = mask_positions[:n]
+            rle_list = rle_list[:n]
+            # Wrap for batched API
+            rle_list_batched = [rle_list]
+            mask_positions_batched = [mask_positions]
+        else:
+            rle_list_batched = None
+            mask_positions_batched = None
+
+        output_ids = self.generate(
+            pixel_values, image_grid_thw, depth_batch, input_ids,
+            rle_list=rle_list_batched,
+            mask_token_positions=mask_positions_batched,
+            max_new_tokens=max_new_tokens,
+        )
+        raw_output = self.processor.tokenizer.decode(
+            output_ids[0], skip_special_tokens=True
+        ).strip()
+
+        parsed = self.parse_output(raw_output)
+
+        return {
+            "category": parsed["category"],
+            "answer":   parsed["answer"],
+            "raw":      raw_output,
+        }
+
+
+# Parameter counting util
+
+def count_parameters(model: nn.Module) -> dict:
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {"total": total, "trainable": trainable}
+
+
+# -----------------------------------------------------------------------------
+# Standalone demo:   python model_micro/pipeline.py
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device",   default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--dtype",    default="bfloat16", choices=["bfloat16", "float32"])
+    parser.add_argument("--attn-impl", default="flash_attention_2",
+                        choices=["flash_attention_2", "sdpa", "eager"],
+                        help="Attention implementation (default: sdpa)")
+    parser.add_argument("--model", default=None,
+                        help="Model path (default: model_micro/qwen3.5-micro)")
+    args = parser.parse_args()
+
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+
+    # Default to pruned Micro checkpoint
+    model_path = args.model or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "qwen3.5-micro"
+    )
+
+    print("=" * 70)
+    print("MODULE: SpatialVLM Micro")
+    print("=" * 70)
+
+    pipeline = SpatialVLM(
+        model_name=model_path,
+        dtype=dtype,
+        device_map=args.device,
+        attn_implementation=args.attn_impl,
+    )
+    print_vram_usage("after model load")
+
+    # Parameter Breakdown
+    print(f"\n{'='*70}")
+    print("PARAMETER BREAKDOWN")
+    print(f"{'='*70}")
+
+    components = {
+        "Qwen Visual (encoder+merger)":    pipeline.qwen.model.visual,
+        "Qwen Embeddings (tied->LM Head)": pipeline.qwen.model.language_model.embed_tokens,
+        "Qwen Backbone (8 layers)":        pipeline.qwen.model.language_model.layers,
+        "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
+        "Qwen LM Head (tied->Embeddings)": pipeline.qwen.lm_head,
+        "GSA (DFormerv2 Full_GSA x2)":     pipeline.gsa,
+        "RTI (Region Token Injector)":     pipeline.region_token_extractor,
+        "Number Head (xVal regression)":   pipeline.num_head,
+    }
+    custom_names = {
+        "GSA (DFormerv2 Full_GSA x2)",
+        "RTI (Region Token Injector)",
+        "Number Head (xVal regression)",
+    }
+    tied_names = {"Qwen LM Head (tied->Embeddings)"}
+
+    total_custom, total_qwen = 0, 0
+    for name, module in components.items():
+        p = count_parameters(module)
+        tag = "[*] CUSTOM" if name in custom_names else "    Qwen  "
+        tied_note = "  <- shared, not counted" if name in tied_names else ""
+        print(f"  {tag} {name:42s}: {p['total']:>12,} ({p['total']/1e6:.4f}M){tied_note}")
+        if name in tied_names:
+            continue
+        if name in custom_names:
+            total_custom += p["total"]
+        else:
+            total_qwen += p["total"]
+
+    print(f"\n  {'-'*70}")
+    print(f"  Qwen Micro:       {total_qwen:>12,} ({total_qwen/1e6:.4f}M)")
+    print(f"  Custom modules:   {total_custom:>12,} ({total_custom/1e6:.4f}M)")
+    print(f"  Total unique:     {total_qwen + total_custom:>12,} ({(total_qwen + total_custom)/1e6:.4f}M)")
+    print(f"\n  Micro vocab: {pipeline.micro_vocab_size} (embed: {pipeline.qwen.model.language_model.embed_tokens.weight.shape})")
+    print(f"  Tokenizer vocab: {pipeline.processor.tokenizer.vocab_size} (original Qwen, used for encode/decode)")
+    print(f"  Decoder layers: {len(list(pipeline.qwen.model.language_model.layers))}")
+    print(f"  ViT blocks: {len(list(pipeline.qwen.model.visual.blocks))}")
+
+    print_vram_usage("final")
+
