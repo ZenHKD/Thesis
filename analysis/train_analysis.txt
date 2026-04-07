@@ -1,0 +1,1399 @@
+FULL TRAIN.JSON ANALYSIS -- 499083 samples
+==============================================================================================================
+
+==============================================================================================================
+  CATEGORY DISTRIBUTION (499083 samples)
+==============================================================================================================
+  mcq         : 110055 samples (22.1%)
+  left_right  :  69336 samples (13.9%)
+  distance    : 245889 samples (49.3%)
+  count       :  73803 samples (14.8%)
+  TOTAL       : 499083
+
+==============================================================================================================
+  ANSWER STATISTICS
+==============================================================================================================
+
+  MCQ (110055 samples):
+    Masks per question: min=3, max=13, avg=3.8
+    Unique answers: 13
+    Top 20 answers:
+      2              : 34315 (31.2%)
+      0              : 34011 (30.9%)
+      1              : 33690 (30.6%)
+      3              :  2725 (2.5%)
+      4              :  2096 (1.9%)
+      5              :  1082 (1.0%)
+      6              :  1006 (0.9%)
+      7              :   638 (0.6%)
+      8              :   193 (0.2%)
+      9              :   183 (0.2%)
+      10             :    83 (0.1%)
+      12             :    18 (0.0%)
+      11             :    15 (0.0%)
+
+  LEFT_RIGHT (69336 samples):
+    Masks per question: min=2, max=2, avg=2.0
+    Unique answers: 2
+    Top 20 answers:
+      left           : 34802 (50.2%)
+      right          : 34534 (49.8%)
+
+  DISTANCE (245889 samples):
+    Masks per question: min=2, max=13, avg=4.3
+    Unique answers: 1529
+    Top 20 answers:
+      1.35           :  3091 (1.3%)
+      7.22           :  2538 (1.0%)
+      7.28           :  2469 (1.0%)
+      7.32           :  2415 (1.0%)
+      7.12           :  2303 (0.9%)
+      8.28           :  1794 (0.7%)
+      8.12           :  1750 (0.7%)
+      6.52           :  1646 (0.7%)
+      7.68           :  1632 (0.7%)
+      6.68           :  1617 (0.7%)
+      1.36           :  1540 (0.6%)
+      7.38           :  1485 (0.6%)
+      7.58           :  1442 (0.6%)
+      1.38           :  1274 (0.5%)
+      7.52           :  1210 (0.5%)
+      7.42           :  1197 (0.5%)
+      4.9            :  1179 (0.5%)
+      7.48           :  1159 (0.5%)
+      8.43           :  1100 (0.4%)
+      1.69           :  1028 (0.4%)
+
+  COUNT (73803 samples):
+    Masks per question: min=4, max=15, avg=10.6
+    Unique answers: 5
+    Top 20 answers:
+      3              : 34421 (46.6%)
+      1              : 19185 (26.0%)
+      2              : 15629 (21.2%)
+      4              :  4565 (6.2%)
+      0              :     3 (0.0%)
+
+==============================================================================================================
+  MCQ  (110055 samples, 73 unique templates)
+==============================================================================================================
+
+  Template 1 (4546x, 4.1%):
+    From the image's point of view, which of OBJ, OBJ, and OBJ is positioned the furthest to the right?
+
+  Template 2 (4540x, 4.1%):
+    From the current viewing position, which of OBJ, OBJ, and OBJ is the rightmost?
+
+  Template 3 (4452x, 4.0%):
+    Among OBJ, OBJ, and OBJ, which one appears on the rightmost side?
+
+  Template 4 (4442x, 4.0%):
+    Among OBJ, OBJ, and OBJ, which object appears closest to the right side?
+
+  Template 5 (4432x, 4.0%):
+    From the current viewing position, which of OBJ, OBJ, and OBJ is the leftmost?
+
+  Template 6 (4404x, 4.0%):
+    Observing from this viewpoint, which of OBJ, OBJ, and OBJ is located at the rightmost position?
+
+  Template 7 (4399x, 4.0%):
+    Looking from this perspective, which of OBJ, OBJ, and OBJ is the rightmost?
+
+  Template 8 (4399x, 4.0%):
+    From this angle, which of OBJ, OBJ, and OBJ is positioned the furthest to the right?
+
+  Template 9 (4397x, 4.0%):
+    Among OBJ, OBJ, and OBJ, which one is the rightmost object from the image's perspective?
+
+  Template 10 (4396x, 4.0%):
+    Observing from this viewpoint, which of OBJ, OBJ, and OBJ is located at the leftmost position?
+
+  Template 11 (4385x, 4.0%):
+    Looking from this perspective, which of OBJ, OBJ, and OBJ is the leftmost?
+
+  Template 12 (4366x, 4.0%):
+    Which object is the rightmost among OBJ, OBJ, and OBJ from this viewpoint?
+
+  Template 13 (4363x, 4.0%):
+    Which among OBJ, OBJ, and OBJ is situated on the extreme right from the observer's perspective?
+
+  Template 14 (4356x, 4.0%):
+    Among OBJ, OBJ, and OBJ, which one is the leftmost object from the image's perspective?
+
+  Template 15 (4352x, 4.0%):
+    Among OBJ, OBJ, and OBJ, which one appears on the leftmost side?
+
+  Template 16 (4343x, 3.9%):
+    Which object is the leftmost among OBJ, OBJ, and OBJ from this viewpoint?
+
+  Template 17 (4308x, 3.9%):
+    From this angle, which of OBJ, OBJ, and OBJ is positioned the furthest to the left?
+
+  Template 18 (4293x, 3.9%):
+    Among OBJ, OBJ, and OBJ, which object appears closest to the left side?
+
+  Template 19 (4250x, 3.9%):
+    Which among OBJ, OBJ, and OBJ is situated on the extreme left from the observer's perspective?
+
+  Template 20 (4244x, 3.9%):
+    From the image's point of view, which of OBJ, OBJ, and OBJ is positioned the furthest to the left?
+
+  Template 21 (900x, 0.8%):
+    From the pallets in [MASKS], which one should an empty transporter in [MASKS] pick up for optimal efficiency?
+
+  Template 22 (883x, 0.8%):
+    Which pallet from [MASKS] is the most accessible for pickup by the transporter in [MASKS]?
+
+  Template 23 (883x, 0.8%):
+    Which pallet within [MASKS] is the best candidate for retrieval by the transporter in [MASKS]?
+
+  Template 24 (881x, 0.8%):
+    Considering the position of pallets [MASKS], which one is the most suitable for OBJ to pick up?
+
+  Template 25 (865x, 0.8%):
+    Which pallet in [MASKS] is most suitable for an empty transporter in [MASKS] to retrieve autonomously?
+
+  Template 26 (860x, 0.8%):
+    Which pallet from [MASKS] should be selected for automated picking by an idle transporter in [MASKS]?
+
+  Template 27 (855x, 0.8%):
+    From the available pallets in [MASKS], which one should the transporter at [MASKS] pick up first?
+
+  Template 28 (852x, 0.8%):
+    Considering the locations of pallets [MASKS], which is the optimal choice for the transporter in [MASKS]?
+
+  Template 29 (851x, 0.8%):
+    Considering the placement of [MASKS], which pallet is the most convenient for [MASKS] to collect?
+
+  Template 30 (850x, 0.8%):
+    Which pallet in [MASKS] is the easiest for the transporter at [MASKS] to access?
+
+  Template 31 (846x, 0.8%):
+    Based on pallet positions in [MASKS], which one should the transporter at [MASKS] retrieve?
+
+  Template 32 (843x, 0.8%):
+    Which pallet from [MASKS] is the most suitable for the transporter at [MASKS] to pick up?
+
+  Template 33 (839x, 0.8%):
+    Which pallet in [MASKS] is the best candidate for automated retrieval by an available transporter in [MASKS]?
+
+  Template 34 (833x, 0.8%):
+    Among the pallets in [MASKS], which one is best positioned for pickup by the transporter in [MASKS]?
+
+  Template 35 (818x, 0.7%):
+    Which pallet in [MASKS] should be assigned to an idle transporter in [MASKS] for automated pickup?
+
+  Template 36 (809x, 0.7%):
+    Among the pallets in [MASKS], which one is most suitable for an empty transporter in [MASKS] to pick up automatically?
+
+  Template 37 (707x, 0.6%):
+    Given the current transporters [MASKS] and pallets [MASKS], which pallet is most accessible for automated picking by an empty transporter?
+
+  Template 38 (702x, 0.6%):
+    Considering the transporters [MASKS] and the pallets [MASKS], which pallet is the optimal choice for an empty transporter to pick up?
+
+  Template 39 (687x, 0.6%):
+    Given the available transporters [MASKS] and pallets [MASKS], which pallet is the best choice for automated pickup by an empty transporter?
+
+  Template 40 (670x, 0.6%):
+    Given the transporters [MASKS] and the pallets [MASKS], which pallet is best suited for automated picking by an empty transporter?
+
+  Template 41 (430x, 0.4%):
+    Which buffer region in [MASKS] is located closest to OBJ?
+
+  Template 42 (427x, 0.4%):
+    Which buffer zone in [MASKS] is nearest to OBJ?
+
+  Template 43 (426x, 0.4%):
+    Among the buffer zones [MASKS], Which buffer zone is closest to OBJ?
+
+  Template 44 (419x, 0.4%):
+    Among buffer regions [MASKS], which buffer zone is the shortest distance from OBJ?
+
+  Template 45 (408x, 0.4%):
+    Among the buffer zones [MASKS], which one is closest to [MASKS]?
+
+  Template 46 (402x, 0.4%):
+    Which buffer region from [MASKS] is positioned closest to OBJ?
+
+  Template 47 (401x, 0.4%):
+    From the buffer zones in [MASKS], which is the nearest to [MASKS]?
+
+  Template 48 (401x, 0.4%):
+    Which buffer area within [MASKS] is closest in proximity to OBJ?
+
+  Template 49 (383x, 0.3%):
+    In the given buffer zones [MASKS], which one is the nearest to [MASKS]?
+
+  Template 50 (378x, 0.3%):
+    Among the buffer regions [MASKS], which one is the nearest to OBJ?
+
+  Template 51 (374x, 0.3%):
+    Which buffer region from [MASKS] has the smallest distance to OBJ?
+
+  Template 52 (81x, 0.1%):
+    Which buffer region from [MASKS] is positioned closest to the shelves on the left among [MASKS]?
+
+  Template 53 (79x, 0.1%):
+    From the buffer zones in [MASKS], which is the nearest to the shelves on the right among [MASKS]?
+
+  Template 54 (77x, 0.1%):
+    Which buffer region from [MASKS] has the smallest distance to the shelves on the right among [MASKS]?
+
+  Template 55 (77x, 0.1%):
+    Which buffer area within [MASKS] is closest in proximity to the shelves on the left among [MASKS]?
+
+  Template 56 (76x, 0.1%):
+    From the buffer zones in [MASKS], which is the nearest to the shelves on the left among [MASKS]?
+
+  Template 57 (73x, 0.1%):
+    Which buffer region in [MASKS] is located closest to the shelves on the right among [MASKS]?
+
+  Template 58 (71x, 0.1%):
+    Which buffer region from [MASKS] is positioned closest to the shelves on the right among [MASKS]?
+
+  Template 59 (70x, 0.1%):
+    Which buffer zone in [MASKS] is nearest to the shelves on the right among [MASKS]?
+
+  Template 60 (70x, 0.1%):
+    Among buffer regions [MASKS], which buffer zone is the shortest distance from the shelves on the left among [MASKS]?
+
+  Template 61 (69x, 0.1%):
+    Which buffer area within [MASKS] is closest in proximity to the shelves on the right among [MASKS]?
+
+  Template 62 (68x, 0.1%):
+    Which buffer region from [MASKS] has the smallest distance to the shelves on the left among [MASKS]?
+
+  Template 63 (66x, 0.1%):
+    Which buffer region in [MASKS] is located closest to the shelves on the left among [MASKS]?
+
+  Template 64 (66x, 0.1%):
+    In the given buffer zones [MASKS], which one is the nearest to the shelves on the right among [MASKS]?
+
+  Template 65 (65x, 0.1%):
+    Among buffer regions [MASKS], which buffer zone is the shortest distance from the shelves on the right among [MASKS]?
+
+  Template 66 (65x, 0.1%):
+    In the given buffer zones [MASKS], which one is the nearest to the shelves on the left among [MASKS]?
+
+  Template 67 (64x, 0.1%):
+    Among the buffer regions [MASKS], which one is the nearest to the shelves on the left among [MASKS]?
+
+  Template 68 (64x, 0.1%):
+    Among the buffer zones [MASKS], which buffer zone is closest to the shelves on the left among [MASKS]?
+
+  Template 69 (63x, 0.1%):
+    Among the buffer zones [MASKS], which one is closest to the shelves on the left among [MASKS]?
+
+  Template 70 (62x, 0.1%):
+    Among the buffer zones [MASKS], which buffer zone is closest to the shelves on the right among [MASKS]?
+
+  Template 71 (60x, 0.1%):
+    Which buffer zone in [MASKS] is nearest to the shelves on the left among [MASKS]?
+
+  Template 72 (60x, 0.1%):
+    Among the buffer regions [MASKS], which one is the nearest to the shelves on the right among [MASKS]?
+
+  Template 73 (59x, 0.1%):
+    Among the buffer zones [MASKS], which one is closest to the shelves on the right among [MASKS]?
+
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Keyword frequency:
+    right                    :  45059 (40.9%)
+    left                     :  44113 (40.1%)
+    rightmost                :  26558 (24.1%)
+    leftmost                 :  26264 (23.9%)
+    buffer                   :  24032 (21.8%)
+    transporter              :  15583 (14.2%)
+    closest                  :  11487 (10.4%)
+    close                    :  11487 (10.4%)
+    empty transporter        :   5340 (4.9%)
+    pick up                  :   4990 (4.5%)
+    automated                :   4581 (4.2%)
+    suitable                 :   3398 (3.1%)
+    shelf                    :   3257 (3.0%)
+    optimal                  :   2454 (2.2%)
+    nearest                  :   2129 (1.9%)
+    retrieve                 :   1711 (1.6%)
+    idle                     :   1678 (1.5%)
+    accessible               :   1590 (1.4%)
+    shelves                  :   1505 (1.4%)
+    distance                 :   1073 (1.0%)
+    convenient               :    851 (0.8%)
+    assigned                 :    818 (0.7%)
+    smallest distance        :    519 (0.5%)
+
+==============================================================================================================
+  LEFT_RIGHT  (69336 samples, 27 unique templates)
+==============================================================================================================
+
+  Template 1 (4880x, 7.0%):
+    Is OBJ to the left of OBJ from the image's perspective?
+
+  Template 2 (2553x, 3.7%):
+    Does OBJ appear on the right side of OBJ?
+
+  Template 3 (2530x, 3.6%):
+    Can you confirm if OBJ is positioned to the left or right of OBJ?
+
+  Template 4 (2529x, 3.6%):
+    Can you determine if OBJ is to the left of OBJ based on the current viewing angle?
+
+  Template 5 (2517x, 3.6%):
+    Is OBJ placed to the left or right of OBJ when looking from this angle?
+
+  Template 6 (2517x, 3.6%):
+    Looking from this perspective, is OBJ to the right of OBJ?
+
+  Template 7 (2516x, 3.6%):
+    Can you confirm if OBJ is positioned to the right of OBJ?
+
+  Template 8 (2509x, 3.6%):
+    Does OBJ appear on the left side of OBJ?
+
+  Template 9 (2505x, 3.6%):
+    Looking from this perspective, is OBJ to the left of OBJ?
+
+  Template 10 (2500x, 3.6%):
+    From this viewpoint, does OBJ appear on the left-hand side of OBJ?
+
+  Template 11 (2495x, 3.6%):
+    From the image's perspective, is OBJ situated on the right of OBJ?
+
+  Template 12 (2486x, 3.6%):
+    From this viewpoint, does OBJ appear on the right-hand side of OBJ?
+
+  Template 13 (2483x, 3.6%):
+    Can you determine if OBJ is to the left or right of OBJ based on the current viewing angle?
+
+  Template 14 (2479x, 3.6%):
+    Is OBJ positioned on the left or right side of OBJ relative to the observer?
+
+  Template 15 (2474x, 3.6%):
+    Looking from this perspective, is OBJ to the left or right of OBJ?
+
+  Template 16 (2471x, 3.6%):
+    From this viewpoint, does OBJ appear on the left or right side of OBJ?
+
+  Template 17 (2471x, 3.6%):
+    From the image's perspective, is OBJ situated on the left or right of OBJ?
+
+  Template 18 (2467x, 3.6%):
+    Is OBJ placed to the left of OBJ when looking from this angle?
+
+  Template 19 (2464x, 3.6%):
+    Is OBJ positioned on the left side of OBJ relative to the observer?
+
+  Template 20 (2460x, 3.5%):
+    Is OBJ to the left or right of OBJ?
+
+  Template 21 (2459x, 3.5%):
+    Does OBJ appear on the left or right side of OBJ?
+
+  Template 22 (2454x, 3.5%):
+    Is OBJ to the right of OBJ from the image's perspective?
+
+  Template 23 (2440x, 3.5%):
+    Is OBJ positioned on the right side of OBJ relative to the observer?
+
+  Template 24 (2434x, 3.5%):
+    Can you confirm if OBJ is positioned to the left of OBJ?
+
+  Template 25 (2431x, 3.5%):
+    From the image's perspective, is OBJ situated on the left of OBJ?
+
+  Template 26 (2421x, 3.5%):
+    Is OBJ placed to the right of OBJ when looking from this angle?
+
+  Template 27 (2391x, 3.4%):
+    Can you determine if OBJ is to the right of OBJ based on the current viewing angle?
+
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Keyword frequency:
+    left                     :  47063 (67.9%)
+    right                    :  44617 (64.3%)
+    buffer                   :  17827 (25.7%)
+
+==============================================================================================================
+  DISTANCE  (245889 samples, 228 unique templates)
+==============================================================================================================
+
+  Template 1 (10113x, 4.1%):
+    Give me the distance from OBJ to OBJ.
+
+  Template 2 (10006x, 4.1%):
+    Tell me the distance between OBJ and OBJ.
+
+  Template 3 (10006x, 4.1%):
+    How close is OBJ from OBJ?
+
+  Template 4 (9992x, 4.1%):
+    How much distance is there between OBJ and OBJ?
+
+  Template 5 (9989x, 4.1%):
+    Can you give me an estimation of the distance between OBJ and OBJ?
+
+  Template 6 (9904x, 4.0%):
+    How far away is OBJ from OBJ?
+
+  Template 7 (9852x, 4.0%):
+    Can you tell me the distance of OBJ from OBJ?
+
+  Template 8 (9852x, 4.0%):
+    Measure the distance from OBJ to OBJ.
+
+  Template 9 (9795x, 4.0%):
+    Could you provide the distance between OBJ and OBJ?
+
+  Template 10 (9792x, 4.0%):
+    How distant is OBJ from OBJ?
+
+  Template 11 (9767x, 4.0%):
+    How far apart are OBJ and OBJ?
+
+  Template 12 (9764x, 4.0%):
+    How far is OBJ from OBJ?
+
+  Template 13 (9760x, 4.0%):
+    Can you provide the distance measurement between OBJ and OBJ?
+
+  Template 14 (9744x, 4.0%):
+    Could you measure the distance between OBJ and OBJ?
+
+  Template 15 (9695x, 3.9%):
+    Measure the distance between OBJ and OBJ.
+
+  Template 16 (9656x, 3.9%):
+    What is the distance between OBJ and OBJ?
+
+  Template 17 (1683x, 0.7%):
+    How far apart are the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 18 (1659x, 0.7%):
+    Can you provide the distance measurement between the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 19 (1658x, 0.7%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the leftmost pallet and the rightmost buffer region?
+
+  Template 20 (1653x, 0.7%):
+    Can you give me an estimation of the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 21 (1642x, 0.7%):
+    Could you measure the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 22 (1625x, 0.7%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the rightmost buffer region?
+
+  Template 23 (1625x, 0.7%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the leftmost pallet and the rightmost buffer region?
+
+  Template 24 (1623x, 0.7%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the leftmost pallet to the rightmost buffer region.
+
+  Template 25 (1622x, 0.7%):
+    Among the pallets [MASKS], can you tell me the distance of the leftmost pallet from the rightmost pallet?
+
+  Template 26 (1613x, 0.7%):
+    How close is the leftmost pallet to the rightmost pallet among the pallets [MASKS]?
+
+  Template 27 (1610x, 0.7%):
+    How far is the leftmost pallet from the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 28 (1608x, 0.7%):
+    What is the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 29 (1606x, 0.7%):
+    How far apart are the leftmost pallet and the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 30 (1602x, 0.7%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the rightmost buffer region?
+
+  Template 31 (1600x, 0.7%):
+    What is the distance between the leftmost pallet and the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 32 (1598x, 0.6%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the rightmost pallet to the leftmost buffer region.
+
+  Template 33 (1597x, 0.6%):
+    What is the distance between the rightmost pallet and the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 34 (1597x, 0.6%):
+    How close is the rightmost pallet to the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 35 (1594x, 0.6%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the leftmost buffer region?
+
+  Template 36 (1594x, 0.6%):
+    How far is the rightmost pallet from the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 37 (1587x, 0.6%):
+    How close is the leftmost pallet to the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 38 (1584x, 0.6%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the leftmost pallet and the rightmost buffer region.
+
+  Template 39 (1579x, 0.6%):
+    How far apart are the rightmost pallet and the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 40 (1571x, 0.6%):
+    How distant is the rightmost pallet from the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 41 (1569x, 0.6%):
+    Could you provide the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS]?
+
+  Template 42 (1569x, 0.6%):
+    Give me the distance from the leftmost pallet to the rightmost pallet among the pallets [MASKS].
+
+  Template 43 (1567x, 0.6%):
+    Among the pallets [MASKS], how much distance is there between the leftmost pallet and the rightmost pallet?
+
+  Template 44 (1566x, 0.6%):
+    How far is the leftmost pallet from the rightmost pallet among the pallets [MASKS]?
+
+  Template 45 (1562x, 0.6%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the leftmost buffer region?
+
+  Template 46 (1556x, 0.6%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the rightmost pallet and the leftmost buffer region?
+
+  Template 47 (1550x, 0.6%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the rightmost pallet and the leftmost buffer region?
+
+  Template 48 (1548x, 0.6%):
+    Measure the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS].
+
+  Template 49 (1540x, 0.6%):
+    How distant is the leftmost pallet from the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 50 (1534x, 0.6%):
+    How distant is the leftmost pallet from the rightmost pallet among the pallets [MASKS]?
+
+  Template 51 (1527x, 0.6%):
+    Measure the distance from the rightmost pallet to the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  Template 52 (1525x, 0.6%):
+    Measure the distance from the leftmost pallet to the rightmost pallet among the pallets [MASKS].
+
+  Template 53 (1520x, 0.6%):
+    Measure the distance from the leftmost pallet to the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  Template 54 (1518x, 0.6%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the leftmost pallet and the rightmost buffer region?
+
+  Template 55 (1517x, 0.6%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the rightmost pallet and the leftmost buffer region?
+
+  Template 56 (1503x, 0.6%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the rightmost pallet and the leftmost buffer region.
+
+  Template 57 (1491x, 0.6%):
+    How far away is the leftmost pallet from the rightmost pallet among the pallets [MASKS]?
+
+  Template 58 (1476x, 0.6%):
+    Tell me the distance between the leftmost pallet and the rightmost pallet among the pallets [MASKS].
+
+  Template 59 (485x, 0.2%):
+    What is the measured distance between OBJ and the leftmost buffer area among [MASKS]?
+
+  Template 60 (484x, 0.2%):
+    What is the spatial distance between OBJ and the leftmost buffer region in [MASKS]?
+
+  Template 61 (472x, 0.2%):
+    Can you determine the distance from OBJ to the leftmost buffer area in [MASKS]?
+
+  Template 62 (454x, 0.2%):
+    What is the distance between OBJ and the rightmost buffer area in [MASKS]?
+
+  Template 63 (454x, 0.2%):
+    What is the computed distance between OBJ and the rightmost buffer area in [MASKS]?
+
+  Template 64 (448x, 0.2%):
+    What is the exact distance from OBJ to the leftmost buffer region within [MASKS]?
+
+  Template 65 (447x, 0.2%):
+    How much distance is there between OBJ and the rightmost buffer region in [MASKS]?
+
+  Template 66 (447x, 0.2%):
+    What is the distance between OBJ and the leftmost buffer area in [MASKS]?
+
+  Template 67 (445x, 0.2%):
+    What is the measured distance between OBJ and the rightmost buffer area among [MASKS]?
+
+  Template 68 (441x, 0.2%):
+    Among the buffer zones [MASKS], how far is OBJ from the leftmost buffer zone?
+
+  Template 69 (440x, 0.2%):
+    How far is OBJ from the leftmost buffer region among [MASKS]?
+
+  Template 70 (439x, 0.2%):
+    What is the computed distance between OBJ and the leftmost buffer area in [MASKS]?
+
+  Template 71 (437x, 0.2%):
+    How much distance is there between OBJ and the leftmost buffer region in [MASKS]?
+
+  Template 72 (434x, 0.2%):
+    Among the buffer regions [MASKS], what is the distance between OBJ and the leftmost buffer region?
+
+  Template 73 (428x, 0.2%):
+    What is the spatial distance between OBJ and the rightmost buffer region in [MASKS]?
+
+  Template 74 (428x, 0.2%):
+    What is the exact distance from OBJ to the rightmost buffer region within [MASKS]?
+
+  Template 75 (426x, 0.2%):
+    Among the buffer zones [MASKS], how far is OBJ from the rightmost buffer zone?
+
+  Template 76 (420x, 0.2%):
+    Can you measure the distance between OBJ and the rightmost buffer area in [MASKS]?
+
+  Template 77 (415x, 0.2%):
+    How far is OBJ from the leftmost buffer region in [MASKS]?
+
+  Template 78 (411x, 0.2%):
+    Can you measure the distance between OBJ and the leftmost buffer area in [MASKS]?
+
+  Template 79 (408x, 0.2%):
+    How far is OBJ from the rightmost buffer region in [MASKS]?
+
+  Template 80 (397x, 0.2%):
+    Can you determine the distance from OBJ to the rightmost buffer area in [MASKS]?
+
+  Template 81 (358x, 0.1%):
+    Among the buffer zones [MASKS], what is the distance between OBJ and the rightmost buffer zone?
+
+  Template 82 (346x, 0.1%):
+    What is the distance of OBJ from the left most buffer region among [MASKS]?
+
+  Template 83 (321x, 0.1%):
+    What is the distance of OBJ from the right most buffer region among [MASKS]?
+
+  Template 84 (280x, 0.1%):
+    Considering the pallets [MASKS], how much distance is there between the leftmost pallet and OBJ?
+
+  Template 85 (280x, 0.1%):
+    Considering the pallets [MASKS], how far is the leftmost pallet from OBJ?
+
+  Template 86 (272x, 0.1%):
+    Considering the pallets [MASKS], how far is the rightmost pallet from OBJ?
+
+  Template 87 (271x, 0.1%):
+    Among the pallets [MASKS], how far is the rightmost pallet from OBJ?
+
+  Template 88 (271x, 0.1%):
+    Given the pallets [MASKS], how far is the rightmost pallet from OBJ?
+
+  Template 89 (261x, 0.1%):
+    Given the pallets [MASKS], what is the distance between the leftmost pallet and OBJ?
+
+  Template 90 (259x, 0.1%):
+    Measure the distance from the leftmost pallet to OBJ among the pallets [MASKS].
+
+  Template 91 (259x, 0.1%):
+    What is the distance of the rightmost pallet among the pallets [MASKS] from OBJ?
+
+  Template 92 (258x, 0.1%):
+    What is the distance between the leftmost pallet among the pallets [MASKS] and OBJ?
+
+  Template 93 (257x, 0.1%):
+    Considering the pallets [MASKS], can you measure the distance between the leftmost pallet and OBJ?
+
+  Template 94 (253x, 0.1%):
+    Given the pallets [MASKS], how far is the leftmost pallet from OBJ?
+
+  Template 95 (250x, 0.1%):
+    Measure the distance from the rightmost pallet to OBJ among the pallets [MASKS].
+
+  Template 96 (249x, 0.1%):
+    What is the distance of the leftmost pallet among the pallets [MASKS] from OBJ?
+
+  Template 97 (249x, 0.1%):
+    Given the pallets [MASKS], give me the distance from the rightmost pallet to OBJ.
+
+  Template 98 (247x, 0.1%):
+    Given the pallets [MASKS], what is the distance between the rightmost pallet and OBJ?
+
+  Template 99 (247x, 0.1%):
+    How far apart are the leftmost pallet among the pallets [MASKS] and OBJ?
+
+  Template 100 (242x, 0.1%):
+    How far apart are the rightmost pallet among the pallets [MASKS] and OBJ?
+
+  Template 101 (240x, 0.1%):
+    What is the distance between the rightmost pallet among the pallets [MASKS] and OBJ?
+
+  Template 102 (239x, 0.1%):
+    Given the pallets [MASKS], give me the distance from the leftmost pallet to OBJ.
+
+  Template 103 (234x, 0.1%):
+    Among the pallets [MASKS], tell me the distance between the leftmost pallet and OBJ.
+
+  Template 104 (231x, 0.1%):
+    Among the pallets [MASKS], tell me the distance between the rightmost pallet and OBJ.
+
+  Template 105 (229x, 0.1%):
+    Among the pallets [MASKS], how far is the leftmost pallet from OBJ?
+
+  Template 106 (228x, 0.1%):
+    Considering the pallets [MASKS], how much distance is there between the rightmost pallet and OBJ?
+
+  Template 107 (210x, 0.1%):
+    Considering the pallets [MASKS], can you measure the distance between the rightmost pallet and OBJ?
+
+  Template 108 (132x, 0.1%):
+    Can you measure the distance between OBJ and the middle buffer area in [MASKS]?
+
+  Template 109 (122x, 0.0%):
+    What is the spatial distance between OBJ and the middle buffer region in [MASKS]?
+
+  Template 110 (122x, 0.0%):
+    What is the computed distance between OBJ and the middle buffer area in [MASKS]?
+
+  Template 111 (119x, 0.0%):
+    How far is OBJ from the middle buffer region among [MASKS]?
+
+  Template 112 (118x, 0.0%):
+    Among the buffer regions [MASKS], what is the distance between OBJ and the middle buffer region?
+
+  Template 113 (118x, 0.0%):
+    How much distance is there between OBJ and the middle buffer region in [MASKS]?
+
+  Template 114 (116x, 0.0%):
+    Among the buffer zones [MASKS], how far is OBJ from the middle buffer zone?
+
+  Template 115 (116x, 0.0%):
+    How far is OBJ from the middle buffer region in [MASKS]?
+
+  Template 116 (116x, 0.0%):
+    What is the distance of OBJ from the middle buffer region among [MASKS]?
+
+  Template 117 (111x, 0.0%):
+    What is the exact distance from OBJ to the middle buffer region within [MASKS]?
+
+  Template 118 (107x, 0.0%):
+    How far is OBJ from the rightmost buffer region among [MASKS]?
+
+  Template 119 (105x, 0.0%):
+    What is the measured distance between OBJ and the middle buffer area among [MASKS]?
+
+  Template 120 (104x, 0.0%):
+    What is the distance between OBJ and the middle buffer area in [MASKS]?
+
+  Template 121 (100x, 0.0%):
+    Can you determine the distance from OBJ to the middle buffer area in [MASKS]?
+
+  Template 122 (99x, 0.0%):
+    What is the distance of OBJ from the leftmost buffer region among [MASKS]?
+
+  Template 123 (87x, 0.0%):
+    What is the distance of OBJ from the rightmost buffer region among [MASKS]?
+
+  Template 124 (77x, 0.0%):
+    Among the buffer regions [MASKS], what is the distance between OBJ and the rightmost buffer region?
+
+  Template 125 (76x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how far is the rightmost pallet from the shelf on the left?
+
+  Template 126 (68x, 0.0%):
+    Given the pallets [MASKS] and OBJ, what is the distance between the rightmost pallet and the shelf on the left?
+
+  Template 127 (65x, 0.0%):
+    How far apart are the rightmost pallet and the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 128 (65x, 0.0%):
+    Measure the distance from the rightmost pallet to the shelf on the left among the pallets [MASKS] and OBJ.
+
+  Template 129 (64x, 0.0%):
+    How far is the rightmost pallet from the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 130 (59x, 0.0%):
+    What is the distance between the rightmost pallet and the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 131 (59x, 0.0%):
+    Among the pallets [MASKS] and OBJ, tell me the distance between the rightmost pallet and the shelf on the left.
+
+  Template 132 (58x, 0.0%):
+    How distant is the rightmost pallet from the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 133 (57x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, can you measure the distance between the rightmost pallet and the shelf on the left?
+
+  Template 134 (56x, 0.0%):
+    Given the pallets [MASKS] and OBJ, how far is the rightmost pallet from the shelf on the left?
+
+  Template 135 (54x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how much distance is there between the rightmost pallet and the shelf on the left?
+
+  Template 136 (52x, 0.0%):
+    Among the pallets [MASKS] and OBJ, tell me the distance between the leftmost pallet and the shelf on the right.
+
+  Template 137 (51x, 0.0%):
+    Given the pallets [MASKS] and OBJ, give me the distance from the rightmost pallet to the shelf on the left.
+
+  Template 138 (49x, 0.0%):
+    Given the pallets [MASKS] and OBJ, what is the distance between the rightmost pallet and the shelf on the right?
+
+  Template 139 (49x, 0.0%):
+    How far is the leftmost pallet from the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 140 (48x, 0.0%):
+    Given the pallets [MASKS] and OBJ, give me the distance from the rightmost pallet to the shelf on the right.
+
+  Template 141 (48x, 0.0%):
+    How close is the rightmost pallet to the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 142 (48x, 0.0%):
+    How close is the leftmost pallet to the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 143 (47x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, can you measure the distance between the leftmost pallet and the shelf on the right?
+
+  Template 144 (44x, 0.0%):
+    Among the pallets [MASKS] and OBJ, tell me the distance between the rightmost pallet and the shelf on the right.
+
+  Template 145 (44x, 0.0%):
+    How far is the rightmost pallet from the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 146 (44x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, can you measure the distance between the rightmost pallet and the shelf on the right?
+
+  Template 147 (44x, 0.0%):
+    Measure the distance from the leftmost pallet to the shelf on the right among the pallets [MASKS] and OBJ.
+
+  Template 148 (44x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how much distance is there between the leftmost pallet and the shelf on the right?
+
+  Template 149 (41x, 0.0%):
+    How far apart are the leftmost pallet and the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 150 (40x, 0.0%):
+    Measure the distance from the rightmost pallet to the shelf on the right among the pallets [MASKS] and OBJ.
+
+  Template 151 (39x, 0.0%):
+    What is the distance between the rightmost pallet and the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 152 (39x, 0.0%):
+    Given the pallets [MASKS] and OBJ, give me the distance from the leftmost pallet to the shelf on the right.
+
+  Template 153 (38x, 0.0%):
+    How far apart are the rightmost pallet and the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 154 (38x, 0.0%):
+    How close is the leftmost pallet to the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 155 (37x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how far is the leftmost pallet from the shelf on the right?
+
+  Template 156 (37x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the rightmost pallet and the middle buffer region?
+
+  Template 157 (37x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the leftmost pallet and the middle buffer region?
+
+  Template 158 (37x, 0.0%):
+    Measure the distance from the rightmost pallet to the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  Template 159 (37x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how much distance is there between the rightmost pallet and the shelf on the right?
+
+  Template 160 (37x, 0.0%):
+    How close is the rightmost pallet to the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 161 (36x, 0.0%):
+    Given the pallets [MASKS] and OBJ, what is the distance between the leftmost pallet and the shelf on the right?
+
+  Template 162 (35x, 0.0%):
+    Given the pallets [MASKS] and OBJ, how far is the leftmost pallet from the shelf on the right?
+
+  Template 163 (34x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the leftmost pallet and the middle buffer region?
+
+  Template 164 (34x, 0.0%):
+    Given the pallets [MASKS] and OBJ, how far is the rightmost pallet from the shelf on the right?
+
+  Template 165 (33x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the middle buffer region?
+
+  Template 166 (32x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, can you measure the distance between the leftmost pallet and the shelf on the left?
+
+  Template 167 (32x, 0.0%):
+    What is the distance between the leftmost pallet and the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 168 (32x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the middle buffer region?
+
+  Template 169 (32x, 0.0%):
+    Given the pallets [MASKS] and OBJ, what is the distance between the leftmost pallet and the shelf on the left?
+
+  Template 170 (32x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how far is the rightmost pallet from the shelf on the right?
+
+  Template 171 (32x, 0.0%):
+    How far apart are the leftmost pallet and the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 172 (30x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the rightmost pallet to the middle buffer region.
+
+  Template 173 (30x, 0.0%):
+    What is the distance between the rightmost pallet and the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 174 (30x, 0.0%):
+    How distant is the rightmost pallet from the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 175 (29x, 0.0%):
+    How distant is the leftmost pallet from the shelf on the right among the pallets [MASKS] and OBJ?
+
+  Template 176 (29x, 0.0%):
+    What is the distance between the leftmost pallet and the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 177 (29x, 0.0%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the leftmost pallet and the middle buffer region.
+
+  Template 178 (29x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the rightmost pallet and the middle buffer region?
+
+  Template 179 (29x, 0.0%):
+    Measure the distance from the leftmost pallet to the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  Template 180 (28x, 0.0%):
+    How distant is the rightmost pallet from the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 181 (28x, 0.0%):
+    How far apart are the leftmost pallet and the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 182 (28x, 0.0%):
+    How far apart are the rightmost pallet and the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 183 (27x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the leftmost pallet and the leftmost buffer region?
+
+  Template 184 (27x, 0.0%):
+    How distant is the leftmost pallet from the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 185 (27x, 0.0%):
+    Among the pallets [MASKS] and OBJ, tell me the distance between the leftmost pallet and the shelf on the left.
+
+  Template 186 (26x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the leftmost pallet to the middle buffer region.
+
+  Template 187 (26x, 0.0%):
+    Measure the distance from the leftmost pallet to the shelf on the left among the pallets [MASKS] and OBJ.
+
+  Template 188 (26x, 0.0%):
+    What is the distance between the leftmost pallet and the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 189 (26x, 0.0%):
+    What is the distance between the leftmost pallet and the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 190 (25x, 0.0%):
+    How far is the leftmost pallet from the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 191 (25x, 0.0%):
+    Measure the distance from the leftmost pallet to the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  Template 192 (25x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how much distance is there between the leftmost pallet and the shelf on the left?
+
+  Template 193 (24x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the rightmost pallet and the middle buffer region?
+
+  Template 194 (24x, 0.0%):
+    How far is the rightmost pallet from the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 195 (23x, 0.0%):
+    How close is the leftmost pallet to the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 196 (23x, 0.0%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the rightmost pallet and the middle buffer region.
+
+  Template 197 (23x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the middle buffer region?
+
+  Template 198 (22x, 0.0%):
+    How distant is the leftmost pallet from the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 199 (22x, 0.0%):
+    How close is the leftmost pallet to the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 200 (21x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the leftmost buffer region?
+
+  Template 201 (21x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the middle buffer region?
+
+  Template 202 (20x, 0.0%):
+    How distant is the leftmost pallet from the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 203 (20x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the leftmost pallet and the leftmost buffer region?
+
+  Template 204 (19x, 0.0%):
+    How close is the rightmost pallet to the middle buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 205 (19x, 0.0%):
+    How far apart are the leftmost pallet and the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 206 (18x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the leftmost pallet from the leftmost buffer region?
+
+  Template 207 (17x, 0.0%):
+    How far is the leftmost pallet from the shelf on the left among the pallets [MASKS] and OBJ?
+
+  Template 208 (17x, 0.0%):
+    Given the pallets [MASKS] and OBJ, give me the distance from the leftmost pallet to the shelf on the left.
+
+  Template 209 (17x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the leftmost pallet to the leftmost buffer region.
+
+  Template 210 (16x, 0.0%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the leftmost pallet and the leftmost buffer region.
+
+  Template 211 (16x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the leftmost pallet and the leftmost buffer region?
+
+  Template 212 (15x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the leftmost pallet and the middle buffer region?
+
+  Template 213 (15x, 0.0%):
+    Considering the pallets [MASKS] and OBJ, how far is the leftmost pallet from the shelf on the left?
+
+  Template 214 (15x, 0.0%):
+    How far apart are the rightmost pallet and the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 215 (14x, 0.0%):
+    How far is the leftmost pallet from the leftmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 216 (14x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how much distance is there between the rightmost pallet and the rightmost buffer region?
+
+  Template 217 (13x, 0.0%):
+    Given the pallets [MASKS] and OBJ, how far is the leftmost pallet from the shelf on the left?
+
+  Template 218 (12x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the rightmost buffer region?
+
+  Template 219 (12x, 0.0%):
+    How far is the rightmost pallet from the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 220 (12x, 0.0%):
+    Among the buffer regions [MASKS] and pallet masks [MASKS], tell me the distance between the rightmost pallet and the rightmost buffer region.
+
+  Template 221 (11x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], can you measure the distance between the rightmost pallet and the rightmost buffer region?
+
+  Template 222 (11x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], what is the distance between the rightmost pallet and the rightmost buffer region?
+
+  Template 223 (10x, 0.0%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], how far is the rightmost pallet from the rightmost buffer region?
+
+  Template 224 (9x, 0.0%):
+    How close is the rightmost pallet to the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 225 (8x, 0.0%):
+    How distant is the rightmost pallet from the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 226 (8x, 0.0%):
+    What is the distance between the rightmost pallet and the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS]?
+
+  Template 227 (7x, 0.0%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], give me the distance from the rightmost pallet to the rightmost buffer region.
+
+  Template 228 (3x, 0.0%):
+    Measure the distance from the rightmost pallet to the rightmost buffer region among the buffer regions [MASKS] and pallet masks [MASKS].
+
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Keyword frequency:
+    distance                 : 163600 (66.5%)
+    left                     :  77463 (31.5%)
+    right                    :  76921 (31.3%)
+    leftmost                 :  76337 (31.0%)
+    rightmost                :  76067 (30.9%)
+    buffer                   :  54711 (22.3%)
+    far                      :  52583 (21.4%)
+    close                    :  15047 (6.1%)
+    distant                  :  14659 (6.0%)
+    transporter              :  12554 (5.1%)
+    shelf                    :   8166 (3.3%)
+    middle                   :   2220 (0.9%)
+    shelves                  :   2150 (0.9%)
+
+==============================================================================================================
+  COUNT  (73803 samples, 84 unique templates)
+==============================================================================================================
+
+  Template 1 (2993x, 4.1%):
+    How many pallets are present in the rightmost buffer region, given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 2 (2967x, 4.0%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the rightmost buffer area?
+
+  Template 3 (2864x, 3.9%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the right buffer zone?
+
+  Template 4 (2862x, 3.9%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the rightmost buffer?
+
+  Template 5 (2837x, 3.8%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the rightmost buffer region?
+
+  Template 6 (2833x, 3.8%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the rightmost buffer area?
+
+  Template 7 (2826x, 3.8%):
+    Considering the pallets [MASKS], what is the total number of pallets in the rightmost buffer region among [MASKS]?
+
+  Template 8 (2805x, 3.8%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the right buffer zone?
+
+  Template 9 (2796x, 3.8%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the leftmost buffer region?
+
+  Template 10 (2774x, 3.8%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the leftmost buffer area?
+
+  Template 11 (2772x, 3.8%):
+    How many pallets are present in the leftmost buffer region, given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 12 (2765x, 3.7%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the left buffer area?
+
+  Template 13 (2760x, 3.7%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the leftmost buffer?
+
+  Template 14 (2752x, 3.7%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the right buffer area?
+
+  Template 15 (2733x, 3.7%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the right buffer zone?
+
+  Template 16 (2733x, 3.7%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the buffer region on the right?
+
+  Template 17 (2730x, 3.7%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the leftmost buffer area?
+
+  Template 18 (2723x, 3.7%):
+    What is the count of pallets in the right buffer region according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 19 (2715x, 3.7%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the left buffer zone?
+
+  Template 20 (2714x, 3.7%):
+    What is the count of pallets in the left buffer region according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 21 (2712x, 3.7%):
+    Considering the pallets [MASKS], what is the total number of pallets in the leftmost buffer region among [MASKS]?
+
+  Template 22 (2687x, 3.6%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the buffer region on the left?
+
+  Template 23 (2683x, 3.6%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the left buffer zone?
+
+  Template 24 (2653x, 3.6%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the left buffer zone?
+
+  Template 25 (416x, 0.6%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the buffer region closest to OBJ?
+
+  Template 26 (414x, 0.6%):
+    What is the count of pallets in the buffer region closest to OBJ according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 27 (399x, 0.5%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to OBJ?
+
+  Template 28 (390x, 0.5%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the buffer region closest to OBJ?
+
+  Template 29 (387x, 0.5%):
+    Considering the pallets [MASKS], what is the total number of pallets in the buffer region closest to OBJ among [MASKS]?
+
+  Template 30 (380x, 0.5%):
+    How many pallets are present in the buffer region closest to OBJ, given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 31 (380x, 0.5%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to OBJ?
+
+  Template 32 (373x, 0.5%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the buffer region closest to OBJ?
+
+  Template 33 (367x, 0.5%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the buffer region closest to OBJ?
+
+  Template 34 (364x, 0.5%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to OBJ?
+
+  Template 35 (361x, 0.5%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the buffer region closest to OBJ?
+
+  Template 36 (346x, 0.5%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to OBJ?
+
+  Template 37 (66x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 38 (66x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 39 (64x, 0.1%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 40 (64x, 0.1%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the middle buffer area?
+
+  Template 41 (64x, 0.1%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the leftmost buffer region?
+
+  Template 42 (63x, 0.1%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 43 (62x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 44 (61x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 45 (61x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 46 (61x, 0.1%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the rightmost buffer area?
+
+  Template 47 (61x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the leftmost buffer zone?
+
+  Template 48 (59x, 0.1%):
+    What is the count of pallets in the buffer region closest to the shelf on the left among [MASKS] according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 49 (58x, 0.1%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the rightmost buffer region?
+
+  Template 50 (57x, 0.1%):
+    From leftmostthe given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the left buffer zone?
+
+  Template 51 (57x, 0.1%):
+    What is the count of pallets in the leftmost buffer region according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 52 (56x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the middle buffer zone?
+
+  Template 53 (56x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 54 (55x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 55 (54x, 0.1%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 56 (53x, 0.1%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 57 (53x, 0.1%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the leftmost buffer area?
+
+  Template 58 (53x, 0.1%):
+    Considering the pallets [MASKS], what is the total number of pallets in the middle buffer region among [MASKS]?
+
+  Template 59 (52x, 0.1%):
+    How many pallets are present in the middle buffer region, given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 60 (52x, 0.1%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 61 (52x, 0.1%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], what is the total number of pallets in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 62 (52x, 0.1%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 63 (52x, 0.1%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 64 (51x, 0.1%):
+    From middlethe given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the left buffer zone?
+
+  Template 65 (51x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 66 (51x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the leftmost buffer zone?
+
+  Template 67 (50x, 0.1%):
+    What is the count of pallets in the rightmost buffer region according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 68 (50x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the middle buffer zone?
+
+  Template 69 (50x, 0.1%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the buffer region closest to the shelf on the left among [MASKS]?
+
+  Template 70 (49x, 0.1%):
+    How many pallets are present in the buffer region closest to the shelf on the left among [MASKS], given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 71 (49x, 0.1%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 72 (48x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], how many pallets are situated in the rightmost buffer zone?
+
+  Template 73 (48x, 0.1%):
+    Among the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the middle buffer?
+
+  Template 74 (48x, 0.1%):
+    Considering the buffer regions [MASKS] and the pallets [MASKS], what is the total number of pallets in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 75 (48x, 0.1%):
+    From the given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are within the rightmost buffer zone?
+
+  Template 76 (47x, 0.1%):
+    How many pallets are present in the buffer region closest to the shelf on the right among [MASKS], given the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 77 (47x, 0.1%):
+    What is the count of pallets in the buffer region closest to the shelf on the right among [MASKS] according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 78 (47x, 0.1%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the middle buffer region?
+
+  Template 79 (46x, 0.1%):
+    From rightmostthe given buffer masks [MASKS] and pallet masks [MASKS], how many pallets are stored in the left buffer zone?
+
+  Template 80 (46x, 0.1%):
+    Given the buffer regions [MASKS] and the pallets [MASKS], how many pallets are there in the buffer region closest to the shelf on the right among [MASKS]?
+
+  Template 81 (45x, 0.1%):
+    Using the buffer masks [MASKS] and pallet masks [MASKS], can you determine how many pallets are inside the middle buffer area?
+
+  Template 82 (38x, 0.1%):
+    Based on the provided buffer masks [MASKS] and pallet masks [MASKS], what is the count of pallets in the middle buffer area?
+
+  Template 83 (38x, 0.1%):
+    What is the count of pallets in the middle buffer region according to the buffer masks [MASKS] and pallet masks [MASKS]?
+
+  Template 84 (26x, 0.0%):
+    Given the buffer masks [MASKS] and pallet masks [MASKS], how many pallets can be found in the middle buffer region?
+
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Keyword frequency:
+    buffer                   :  73803 (100.0%)
+    how many                 :  49247 (66.7%)
+    right                    :  34890 (47.3%)
+    left                     :  33865 (45.9%)
+    count                    :  18478 (25.0%)
+    rightmost                :  17629 (23.9%)
+    leftmost                 :  16887 (22.9%)
+    number                   :   6078 (8.2%)
+    closest                  :   5892 (8.0%)
+    close                    :   5892 (8.0%)
+    shelf                    :   5892 (8.0%)
+    middle                   :    568 (0.8%)
+
+==============================================================================================================
+  ANOMALY CHECK: Questions that DON'T match known keyword patterns
+==============================================================================================================
+  Total anomalies: 1269/499083 (0.25%)
+  Unique anomaly templates: 2
+
+  [mcq] (850x): Which pallet in [MASKS] is the easiest for the transporter at [MASKS] to access?
+  [mcq] (419x): Among buffer regions [MASKS], which buffer zone is the shortest distance from OBJ?
