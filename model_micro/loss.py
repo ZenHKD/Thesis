@@ -60,12 +60,13 @@ class SpatialLoss(nn.Module):
             lm_targets = lm_targets[:, diff:]
 
         # --- CE Loss: shift logits[t] predicts targets[t+1] ---
-        shift_logits = lm_logits[:, :-1, :].contiguous()
+        # Upcast to float32 for numerical stability (bfloat16 backward can fail)
+        shift_logits = lm_logits[:, :-1, :].contiguous().float()
         shift_labels = lm_targets[:, 1:].contiguous()
 
         # Guard: return zero if all tokens are ignored (avoids NaN)
         if (shift_labels != self.ignore_index).sum() == 0:
-            loss_ce = (lm_logits * 0.0).sum()
+            loss_ce = shift_logits.sum() * 0.0
         else:
             loss_ce = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -76,8 +77,8 @@ class SpatialLoss(nn.Module):
         # --- MSE Loss: only on numeric samples (distance + count) ---
         if is_numeric.any():
             loss_mse = F.mse_loss(
-                num_pred[is_numeric],
-                num_gt[is_numeric],
+                num_pred[is_numeric].float(),
+                num_gt[is_numeric].float(),
             )
         else:
             loss_mse = torch.tensor(0.0, device=lm_logits.device)
