@@ -30,7 +30,7 @@ class NumberHead(nn.Module):
     Instead, reads the hidden state at the [NUM] token and regresses a scalar.
 
     Architecture:
-        LayerNorm(1024) → Linear(1024, 256) → GELU → Linear(256, 1) → .abs()
+        LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()
     """
 
     def __init__(self, hidden_dim: int = 1024, intermediate_dim: int = 256):

@@ -6,14 +6,14 @@ new token ID maps directly to a Qwen embedding row.
 
 Output:
   model_micro/micro_vocab.json          — pruned vocab {token_str: new_id}
-  model_micro/micro_token_mapping.json  — old_id → new_id for weight slicing
+  model_micro/micro_token_mapping.json  — old_id -> new_id for weight slicing
 """
 import os
 import json
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# Project root: one level up from this script (model_micro/ → Thesis/)
+# Project root: one level up from this script (model_micro/ -> Thesis/)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -97,13 +97,13 @@ else:
     print(f"  ✓ All test tokens covered by train.")
 
 # ====================================================================
-# 3. Build compact vocab: old_id → new_id (0..N-1), then [NUM] = N
+# 3. Build compact vocab: old_id -> new_id (0..N-1), then [NUM] = N
 # ====================================================================
 kept_old_ids = sorted(all_ids)  # sorted for reproducibility
 NUM_TOKEN_NEW_ID = len(kept_old_ids)  # [NUM] gets the last slot
 total_vocab = NUM_TOKEN_NEW_ID + 1
 
-# old_id → new_id mapping
+# old_id -> new_id mapping
 old_to_new = {old_id: new_id for new_id, old_id in enumerate(kept_old_ids)}
 
 print(f"\n{'='*60}")
@@ -163,8 +163,8 @@ with open(mapping_path, 'w') as f:
 print(f"\nSaved:")
 print(f"  {vocab_path} ({len(pruned_vocab)} entries)")
 print(f"  {mapping_path}")
-print(f"  → Use: new_embed = old_embed[kept_old_ids]  # [{total_vocab-1}, 1024]")
-print(f"  → Then append random init for [NUM]: [{total_vocab}, 1024]")
+print(f"  -> Use: new_embed = old_embed[kept_old_ids]  # [{total_vocab-1}, 1024]")
+print(f"  -> Then append random init for [NUM]: [{total_vocab}, 1024]")
 
 # ====================================================================
 # 6. Display full vocabulary
@@ -180,7 +180,7 @@ for token_str, new_id in sorted(pruned_vocab.items(), key=lambda x: x[1]):
 # 7. Test: verify round-trip works
 # ====================================================================
 print(f"\n{'='*60}")
-print("Test: tokenize with Qwen → remap to new IDs")
+print("Test: tokenize with Qwen -> remap to new IDs")
 test_texts = [
     'distance | 5.73',
     'left_right | "left"',
@@ -207,7 +207,7 @@ for text in test_texts:
     print(f"    new_ids:  {new_ids}")
     print(f"    tokens:   {tokens}")
     if missing:
-        print(f"    ⚠ MISSING: {missing} → {[tok.decode([m]) for m in missing]}")
+        print(f"    ⚠ MISSING: {missing} -> {[tok.decode([m]) for m in missing]}")
 
 if all_covered:
     print(f"\n  ✓ All test tokens covered by pruned vocab!")

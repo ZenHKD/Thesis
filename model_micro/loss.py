@@ -27,7 +27,7 @@ class SpatialLoss(nn.Module):
     Args:
         alpha:        Weight for MSE loss relative to CE loss.
         ignore_index: Token index to ignore in CE loss (default: -100).
-        remap_fn:     Optional callable to remap label IDs (old → new vocab).
+        remap_fn:     Optional callable to remap label IDs (old -> new vocab).
                       Pass pipeline.remap_to_new for pruned vocab models.
     """
 
@@ -50,7 +50,7 @@ class SpatialLoss(nn.Module):
         Returns:
             Scalar loss = L_CE + α · L_MSE
         """
-        # --- Remap labels: old Qwen IDs → new pruned IDs [0..318] ---
+        # --- Remap labels: old Qwen IDs -> new pruned IDs [0..318] ---
         if self.remap_fn is not None:
             lm_targets = self.remap_fn(lm_targets)
 

@@ -2,8 +2,8 @@
 prune.py — Create Qwen 3.5 Micro (211M) from the original 0.8B checkpoint.
 
 Pruning strategy:
-    1. Vision: keep ViT blocks [8,9,10,11] → renumber [0,1,2,3]
-    2. Decoder: keep layers [0,1,2,3, 20,21,22,23] → renumber [0..7]
+    1. Vision: keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
+    2. Decoder: keep layers [0,1,2,3, 20,21,22,23] -> renumber [0..7]
     3. Vocabulary: slice embeddings to 318 kept tokens + 1 [NUM] = 319
     4. Config: update num_hidden_layers, layer_types, depth, vocab_size
 
@@ -51,7 +51,7 @@ MICRO_LAYER_TYPES = [
 
 def prune():
     print("=" * 60)
-    print("  Qwen 3.5 0.8B → Micro (211M) Pruning")
+    print("  Qwen 3.5 0.8B -> Micro (211M) Pruning")
     print("=" * 60)
 
     # --- Load token mapping ---
@@ -72,7 +72,7 @@ def prune():
     skipped_keys = set()
 
     # ------------------------------------------------------------------
-    # 1. VISION: keep blocks [8,9,10,11] → renumber [0,1,2,3]
+    # 1. VISION: keep blocks [8,9,10,11] -> renumber [0,1,2,3]
     # ------------------------------------------------------------------
     print(f"\n--- Vision: keeping blocks {KEEP_VISION_BLOCKS} ---")
     vision_kept = 0
@@ -105,7 +105,7 @@ def prune():
     print(f"  Kept: {vision_kept} keys, Skipped: {vision_skipped} keys")
 
     # ------------------------------------------------------------------
-    # 2. DECODER: keep layers [0,1,2,3, 20,21,22,23] → renumber [0..7]
+    # 2. DECODER: keep layers [0,1,2,3, 20,21,22,23] -> renumber [0..7]
     # ------------------------------------------------------------------
     print(f"\n--- Decoder: keeping layers {KEEP_DECODER_LAYERS} ---")
     decoder_kept = 0
@@ -133,7 +133,7 @@ def prune():
         elif "embed_tokens" in key:
             # --- Prune embedding to kept tokens ---
             old_embed = val  # [248320, 1024]
-            print(f"\n--- Vocabulary: {old_embed.shape[0]} → {total_vocab} ---")
+            print(f"\n--- Vocabulary: {old_embed.shape[0]} -> {total_vocab} ---")
 
             # Slice kept rows
             kept_ids_tensor = torch.tensor(kept_old_ids, dtype=torch.long)
@@ -142,7 +142,7 @@ def prune():
             # Append [NUM] token with random init (scaled like Qwen embeddings)
             num_embed = torch.randn(1, old_embed.shape[1]) * 0.02  # [1, 1024]
             final_embed = torch.cat([pruned_embed, num_embed], dim=0)  # [319, 1024]
-            print(f"  Embedding: [{old_embed.shape[0]}, {old_embed.shape[1]}] → [{final_embed.shape[0]}, {final_embed.shape[1]}]")
+            print(f"  Embedding: [{old_embed.shape[0]}, {old_embed.shape[1]}] -> [{final_embed.shape[0]}, {final_embed.shape[1]}]")
             print(f"  [NUM] token at new_id={len(kept_old_ids)} (random init)")
 
             new_state[key] = final_embed
@@ -168,7 +168,7 @@ def prune():
                 pruned_lm = val[kept_ids_tensor]
                 num_lm = torch.randn(1, val.shape[1]) * 0.02
                 new_state[key] = torch.cat([pruned_lm, num_lm], dim=0)
-                print(f"\n  lm_head: pruned [{val.shape[0]}] → [{new_state[key].shape[0]}]")
+                print(f"\n  lm_head: pruned [{val.shape[0]}] -> [{new_state[key].shape[0]}]")
             else:
                 new_state[key] = val
             kept_keys.add(key)
@@ -209,11 +209,11 @@ def prune():
     # Vision config
     new_config["vision_config"]["depth"] = len(KEEP_VISION_BLOCKS)
 
-    print(f"  num_hidden_layers: {config['text_config']['num_hidden_layers']} → {new_config['text_config']['num_hidden_layers']}")
-    print(f"  layer_types: {len(config['text_config']['layer_types'])} → {len(new_config['text_config']['layer_types'])}")
-    print(f"  vocab_size: {config['text_config']['vocab_size']} → {new_config['text_config']['vocab_size']}")
-    print(f"  vision depth: {config['vision_config']['depth']} → {new_config['vision_config']['depth']}")
-    print(f"  max_position_embeddings: {config['text_config']['max_position_embeddings']} → {new_config['text_config']['max_position_embeddings']}")
+    print(f"  num_hidden_layers: {config['text_config']['num_hidden_layers']} -> {new_config['text_config']['num_hidden_layers']}")
+    print(f"  layer_types: {len(config['text_config']['layer_types'])} -> {len(new_config['text_config']['layer_types'])}")
+    print(f"  vocab_size: {config['text_config']['vocab_size']} -> {new_config['text_config']['vocab_size']}")
+    print(f"  vision depth: {config['vision_config']['depth']} -> {new_config['vision_config']['depth']}")
+    print(f"  max_position_embeddings: {config['text_config']['max_position_embeddings']} -> {new_config['text_config']['max_position_embeddings']}")
 
     # ------------------------------------------------------------------
     # 6. SAVE

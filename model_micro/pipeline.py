@@ -15,10 +15,10 @@ Architecture (211M total):
        - Number Head (xVal): distance/count regression (~0.26M)
 
 Output format:
-    left_right | "left"      → LM Head only
-    mcq | "2"                → LM Head only
-    distance | [NUM]         → LM Head (category) + Number Head (value)
-    count | [NUM]            → LM Head (category) + Number Head (value)
+    left_right | "left"      -> LM Head only
+    mcq | "2"                -> LM Head only
+    distance | [NUM]         -> LM Head (category) + Number Head (value)
+    count | [NUM]            -> LM Head (category) + Number Head (value)
 """
 
 import re

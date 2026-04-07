@@ -14,8 +14,8 @@ Each <mask> in the question -> 2 tokens:
 
 Injection: replace each <mask> token with [mask_rgb, mask_depth]
 
-Batched RTI Strategy (Flatten → Parallel → Scatter):
-    1. FLATTEN: Collect all masks from all samples → total_masks
+Batched RTI Strategy (Flatten -> Parallel -> Scatter):
+    1. FLATTEN: Collect all masks from all samples -> total_masks
     2. PARALLEL: Process all masks in a single GPU kernel
     3. SCATTER: Inject back into pre-padded text embeddings
 
@@ -109,7 +109,7 @@ def _radial_depth_profile(
 class RTE(nn.Module):
     """Extract (mask_rgb, mask_depth) token pairs from RLE annotations.
 
-    Supports batch_size > 1 via flatten→process→scatter strategy.
+    Supports batch_size > 1 via flatten->process->scatter strategy.
 
     Learnable:
         rgb_gate    Linear(1024, 1, bias=False)

@@ -37,7 +37,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 > **Depth**: ~78K RGB-D pairs — real depth sensor data available \
 > **Regions**: encoded as `<mask>` in question text, with per-region **RLE** in JSON \
-> **Tokens used**: 318 unique (full dataset scan) + 1 `[NUM]` token → **319 vocab** (no buffer)
+> **Tokens used**: 318 unique (full dataset scan) + 1 `[NUM]` token -> **319 vocab** (no buffer)
 
 ---
 
@@ -54,7 +54,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | FFN (SwiGLU) dim | 3584 | **3584** (unchanged) |
 | Vocab / Embedding | 248,320 | **319** |
 | Context Length | 262,144 | **2,048** |
-| **Number Head** | — | **Linear(1024→256→1)** |
+| **Number Head** | — | **Linear(1024->256->1)** |
 
 ### Parameter Breakdown
 
@@ -83,9 +83,9 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 ## Pruning Strategy — Which Weights to Keep
 
-### Vision: 12 → 4 ViT Blocks
+### Vision: 12 -> 4 ViT Blocks
 
-**Keep the LAST 4 blocks: [8, 9, 10, 11] → renumber to [0, 1, 2, 3]**
+**Keep the LAST 4 blocks: [8, 9, 10, 11] -> renumber to [0, 1, 2, 3]**
 
 Later ViT blocks encode higher-level semantic features (object identity, spatial layout).
 Early blocks (0–7) do low-level edge/texture processing. With fine-tuning, the remaining
@@ -100,12 +100,12 @@ Micro:                                               [block.0  block.1  block.2 
 **Kept components:**
 - `patch_embed` (Conv3D): unchanged — 1.18M
 - `pos_embed`: unchanged — 1.77M
-- `blocks.8→0, 9→1, 10→2, 11→3`: 4 × 7.09M = 28.36M
+- `blocks.8->0, 9->1, 10->2, 11->3`: 4 × 7.09M = 28.36M
 - `merger`: unchanged — 12.59M
 
-### Decoder: 24 → 8 Layers (2 groups)
+### Decoder: 24 -> 8 Layers (2 groups)
 
-**Keep groups [0, 5] → renumber to [0, 1]**
+**Keep groups [0, 5] -> renumber to [0, 1]**
 
 - Group 0 (layers 0–3): **early** — question parsing, token-level understanding
 - Group 5 (layers 20–23): **late** — answer generation, cross-modal fusion
@@ -123,19 +123,19 @@ Micro:     [Group 0]                                      [Group 1]
 
 **Layer type pattern**: `[linear, linear, linear, full, linear, linear, linear, full]`
 
-### Vocabulary: 248,320 → 319
+### Vocabulary: 248,320 -> 319
 
 Full dataset scan (all fields across 499K train + 1.9K val + 19K test + system prompt):
-**318 unique Qwen token IDs**. Add 1 `[NUM]` token → **319 total**. No buffer padding.
+**318 unique Qwen token IDs**. Add 1 `[NUM]` token -> **319 total**. No buffer padding.
 
 We keep **Qwen's original tokenizer** and remap IDs. This preserves pretrained embedding
 knowledge — each new token ID maps directly to an existing Qwen embedding row.
 
-Implementation: `model_micro/train_tokenizer.py` → outputs `micro_vocab.json` + `micro_token_mapping.json`
+Implementation: `model_micro/train_tokenizer.py` -> outputs `micro_vocab.json` + `micro_token_mapping.json`
 
-1. Tokenize all data fields with Qwen tokenizer → collect 318 unique token IDs
-2. Build mapping: `old_id → new_id (0..317)`, `[NUM] = 318`
-3. Slice embedding: `new_embed = old_embed[kept_old_ids]` → `[318, 1024]`
+1. Tokenize all data fields with Qwen tokenizer -> collect 318 unique token IDs
+2. Build mapping: `old_id -> new_id (0..317)`, `[NUM] = 318`
+3. Slice embedding: `new_embed = old_embed[kept_old_ids]` -> `[318, 1024]`
 4. Append random init for `[NUM]`: final embed = `[319, 1024]`
 
 **Token ID Remapping** (runtime, in `model_micro/pipeline.py`):
@@ -145,12 +145,12 @@ remaps IDs using `micro_token_mapping.json`:
 
 | Direction | Method | Where |
 |-----------|--------|-------|
-| old → new | `pipeline.remap_to_new(ids)` | Before `embed_tokens()`, before CE labels |
-| new → old | `pipeline.remap_to_old(ids)` | After `generate()` for tokenizer decode |
+| old -> new | `pipeline.remap_to_new(ids)` | Before `embed_tokens()`, before CE labels |
+| new -> old | `pipeline.remap_to_old(ids)` | After `generate()` for tokenizer decode |
 
 The loss function accepts `remap_fn=pipeline.remap_to_new` to remap labels automatically.
 
-### Context: 262,144 → 2,048
+### Context: 262,144 -> 2,048
 
 Config-only change. RoPE is computed dynamically — no weight modification.
 
@@ -175,23 +175,23 @@ flowchart TB
     end
 
     subgraph VISION["Vision Encoder (44M)"]
-        PE["patch_embed (Conv3D)\n→ [B, N, 768]"]
+        PE["patch_embed (Conv3D)\n-> [B, N, 768]"]
         POS["pos_embed (learned)"]
         VIT["4 ViT Blocks\n(768-dim, blocks 8-11 from original)"]
-        MG["Merger (VL Projector)\n2×2 merge → MLP(3072→1024)\n→ visual tokens [B, N/4, 1024]"]
+        MG["Merger (VL Projector)\n2×2 merge -> MLP(3072->1024)\n-> visual tokens [B, N/4, 1024]"]
         PE --> POS --> VIT --> MG
     end
 
     subgraph GSA["GSA: Geometry Self-Attention ×2 (16.9M)"]
-        GP["GeoPriorGen\n(depth → RoPE + decay)"]
+        GP["GeoPriorGen\n(depth -> RoPE + decay)"]
         FGSA["Full_GSA + FFN\n(2 blocks)"]
         GP --> FGSA
     end
 
     subgraph RTI["RTI: Region Token Injection (0.032M)"]
-        SOFT["RLE → soft coverage mask"]
-        MRGB["mask_rgb: Gated Attn Pool\n→ [B, 1024]"]
-        MDEP["mask_depth: depth stats\n→ Linear(28→1024) → [B, 1024]"]
+        SOFT["RLE -> soft coverage mask"]
+        MRGB["mask_rgb: Gated Attn Pool\n-> [B, 1024]"]
+        MDEP["mask_depth: depth stats\n-> Linear(28->1024) -> [B, 1024]"]
         SOFT --> MRGB & MDEP
     end
 
@@ -202,8 +202,8 @@ flowchart TB
     end
 
     subgraph HEADS["Dual Output Heads"]
-        LM["LM Head (tied w/ embed)\n→ category + text answer\n(count, mcq, left_right)"]
-        NUM["Number Head (xVal)\nLinear(1024→256→1)\n→ continuous distance"]
+        LM["LM Head (tied w/ embed)\n-> category + text answer\n(count, mcq, left_right)"]
+        NUM["Number Head (xVal)\nLinear(1024->256->1)\n-> continuous distance"]
     end
 
     RGB --> PE
@@ -234,7 +234,7 @@ flowchart TB
 | Custom Module | File | Position | Function | Params |
 |--------------|------|----------|----------|--------|
 | **GSA** (2 blocks) | `gsa.py` | After Merger, before Decoder | Inject depth geometry into visual tokens | **~16.9M** |
-| **RTI** | `region_token.py` | After GSA, before Decoder | Decode RLE → `<mask_rgb><mask_depth>` injection | **~0.032M** |
+| **RTI** | `region_token.py` | After GSA, before Decoder | Decode RLE -> `<mask_rgb><mask_depth>` injection | **~0.032M** |
 | **Number Head** | `num_head.py` | After Decoder | xVal-style distance regression | **~0.26M** |
 
 ### GSA Detail — DFormerv2 Full_GSA (2 blocks × ~8.46M)
@@ -251,7 +251,7 @@ Unchanged from v1. Operates on visual tokens [B, N, 1024] with depth prior.
 
 ### RTI Detail — Region-Level Token Injection
 
-Each `<mask>` → `<mask_rgb><mask_depth>` (2 tokens).
+Each `<mask>` -> `<mask_rgb><mask_depth>` (2 tokens).
 
 | Sub-module | Params |
 |------------|--------|
@@ -277,7 +277,7 @@ Implementation: `model_micro/rti.py` + `src/dataloader/dataloader_new.py`
 
 Implementation: `model_micro/num_head.py`
 
-`LayerNorm(1024) → Linear(1024, 256) → GELU → Linear(256, 1) → .abs()`
+`LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()`
 
 Params: ~262K. Takes hidden state at `[NUM]` position, outputs non-negative scalar.
 
@@ -285,10 +285,10 @@ Params: ~262K. Takes hidden state at `[NUM]` position, outputs non-negative scal
 
 | | Old (CE on digits) | New (Number Head) |
 |---|---|---|
-| `4.52` distance | 4 tokens: `"4"` `"."` `"5"` `"2"` | 1 token: `[NUM]` → scalar 4.52 |
-| `3` count | 1 token: `"3"` | 1 token: `[NUM]` → scalar 3.0 |
-| Loss for pred=4.50 | CE(2→0) ≈ same penalty | MSE = 0.0004 |
-| Loss for pred=9.52 | CE(4→9) ≈ same penalty | MSE = 25.0 |
+| `4.52` distance | 4 tokens: `"4"` `"."` `"5"` `"2"` | 1 token: `[NUM]` -> scalar 4.52 |
+| `3` count | 1 token: `"3"` | 1 token: `[NUM]` -> scalar 3.0 |
+| Loss for pred=4.50 | CE(2->0) ≈ same penalty | MSE = 0.0004 |
+| Loss for pred=9.52 | CE(4->9) ≈ same penalty | MSE = 25.0 |
 | Correct signal? | ✗ (magnitude blind) | ✓ (proportional to error) |
 | Benchmark metric | RMSE (both tasks) | ✓ MSE training = RMSE eval |
 
@@ -332,7 +332,7 @@ Implementation: `model_micro/loss.py`
 on a 12GB GPU from the very first epoch. All components train simultaneously.
 
 **Why single-phase:**
-- Model weights: ~0.42 GB → ~1.7 GB total with gradients + Adam states
+- Model weights: ~0.42 GB -> ~1.7 GB total with gradients + Adam states
 - Leaves ~10 GB for batch data (batch size 8–16 with FP16)
 - Groups 1–4 were pruned, so the remaining early (group 0) and late (group 5)
   layers must re-learn to communicate directly — full fine-tuning is preferred
@@ -363,8 +363,8 @@ Implementation: `model_micro/prune.py`
 Usage: `python model_micro/prune.py`
 Steps:
 1. Load original Qwen 3.5 0.8B weights
-2. Prune vision encoder: blocks [8,9,10,11] → renumber [0,1,2,3]
-3. Prune decoder: layers [0,1,2,3,20,21,22,23] → renumber [0..7]
+2. Prune vision encoder: blocks [8,9,10,11] -> renumber [0,1,2,3]
+3. Prune decoder: layers [0,1,2,3,20,21,22,23] -> renumber [0..7]
 4. Prune vocabulary: use `micro_token_mapping.json` to slice embeddings [319, 1024]
 5. Add `[NUM]` token (random init)
 6. Save pruned checkpoint + updated config
