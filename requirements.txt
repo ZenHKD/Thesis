@@ -1,0 +1,31 @@
+# ============================================================
+# SpatialVLM -- Python 3.12 + CUDA 12.8
+# ============================================================
+# Install: uv pip install -r requirements.txt
+# ============================================================
+
+# --- PyTorch 2.10 (CUDA 12.8) ---
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+
+# --- Flash Attention 2 (prebuilt: cu12 + torch2.10 + cp312) ---
+flash_attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# --- Causal Conv1D: install separately (needs --no-build-isolation) ---
+# pip install causal-conv1d --no-build-isolation
+
+# --- HuggingFace stack ---
+transformers==5.3.0
+accelerate==1.12.0
+safetensors==0.7.0
+tokenizers==0.22.1
+
+# --- Numerical / Vision ---
+numpy>=2.0.0
+Pillow>=12.0.0
+pycocotools>=2.0.11
+
+# --- Training ---
+tqdm>=4.67.0
