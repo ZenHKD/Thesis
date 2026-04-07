@@ -6,7 +6,7 @@
 
 ## Architecture 
 
-### Original, in `model/`
+### Original model, see `model/`
 
 Built on **Qwen 3.5 0.8B** (native VLM) with 2 custom modules:
 
@@ -34,7 +34,7 @@ Question -----> [Tokenizer] --> text embeds ------> [Concat Fusion]
 
 ### New Micro model, see `model_micro/` 
 
-Pruned from Qwen 3.5 0.8B: Vision Encoder (12 -> 4 blocks), Backbone (24 -> 8 layers), Vocabulary (248K -> 319 tokens). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Full fine-tuning from scratch (~211M parameters) on a single 12GB GPU.
+Pruned from Qwen 3.5 0.8B: Vision Encoder (12 -> 4 blocks), Backbone (24 -> 8 layers), Vocabulary (248K -> 319 tokens). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Full fine-tuning from scratch (~211M parameters).
 
 ```
 RGB Image --> [Qwen Vision Encoder] --> [Merger] --> visual tokens [B, N, 1024]
