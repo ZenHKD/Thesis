@@ -5,7 +5,7 @@ Integration test that loads REAL data and verifies:
 
   1. TOKEN TABLE
      Prints every token with position, ID, decoded text, label, active status.
-     Shows where the answer starts and [NUM] token position.
+     Shows where the answer starts and NUM token position.
 
   2. TOKEN REMAPPING CHECK
      Verifies old -> new ID remapping produces valid indices for embed_tokens.
@@ -15,7 +15,7 @@ Integration test that loads REAL data and verifies:
      Shows label trimming, shift alignment, per-token CE breakdown.
 
   4. LOSS CHECK
-     Computes SpatialLoss (CE + MSE) on real logits and labels.
+     Computes SpatialLoss (CE + SmoothL1) on real logits and labels.
 
   5. INFERENCE
      Runs pipeline.generate() with dataloader tensors.
@@ -60,7 +60,7 @@ def decode_token(tokenizer, tok_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 def print_token_table(input_ids: torch.Tensor, labels: torch.Tensor,
-                      tokenizer, max_rows: int = 30):
+                      tokenizer):
     """Print per-token table: position | token_id | decoded | label | active."""
     ids  = input_ids[0].tolist()
     lbls = labels[0].tolist()
@@ -337,7 +337,7 @@ def main():
     # SECTION 4: Loss check
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
-    print("SECTION 4: LOSS CHECK (SpatialLoss: CE + MSE)")
+    print("SECTION 4: LOSS CHECK (SpatialLoss: CE + SmoothL1)")
     print("=" * 70)
 
     criterion = SpatialLoss(alpha=1.0, remap_fn=pipeline.remap_to_new)
@@ -351,9 +351,9 @@ def main():
     if per_token_losses:
         avg = sum(per_token_losses) / len(per_token_losses)
         diff_check = abs(avg - official_loss.item())
-        # CE won't exactly match if MSE is nonzero
+        # CE won't exactly match if SmoothL1 is nonzero
         if batch["is_numeric"][0].item():
-            print(f"  (Contains MSE component — diff expected)")
+            print(f"  (Contains SmoothL1 component — diff expected)")
         else:
             print(f"  Manual vs official diff: {diff_check:.8f}  "
                   f"{'[MATCH]' if diff_check < 0.001 else '[MISMATCH!]'}")
