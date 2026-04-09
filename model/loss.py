@@ -50,8 +50,12 @@ class SpatialVLMLoss(nn.Module):
         # Align: trim labels from the FRONT to match the RTI-shortened logits.
         # diff = n_masks (one per <mask> token in the prompt).
         if labels.shape[1] > logits.shape[1]:
-            diff = labels.shape[1] - logits.shape[1]
-            labels = labels[:, diff:]
+            labels = labels[:, -logits.shape[1]:]
+        elif labels.shape[1] < logits.shape[1]:
+            labels = torch.nn.functional.pad(
+                labels, (0, logits.shape[1] - labels.shape[1]), 
+                value=self.ignore_index
+            )
 
         # Shift: logits[t] predicts labels[t+1]
         shift_logits = logits[:, :-1, :].contiguous()

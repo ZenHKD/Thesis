@@ -80,36 +80,32 @@ _OUTPUT_RE = re.compile(
 
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
     """Find token positions of <mask> in input_ids.
-
-    Optimized: uses cached token ID matching instead of per-token decode.
-    Qwen BPE tokenizes <mask> as 3 subtokens:
-      - isolated: ['<', 'mask', '>']  = [27, 10931, 29]
-      - in context: [' <', 'mask', '>'] = [361, 10931, 29]
+    Handles BPE punctuation merging (e.g., '>' + ',' -> '>,').
     """
-    # Cache token IDs on first call (avoids repeated tokenizer lookups)
     if not hasattr(find_mask_positions, '_cached'):
         find_mask_positions._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
-        find_mask_positions._gt_id = tokenizer.encode(">", add_special_tokens=False)[0]
         find_mask_positions._lt_ids = set()
-        for test in ["<", " <"]:
+        for test in [" <", "  <"]:
             enc = tokenizer.encode(test, add_special_tokens=False)
             if len(enc) == 1:
                 find_mask_positions._lt_ids.add(enc[0])
         find_mask_positions._cached = True
 
     mask_id = find_mask_positions._mask_id
-    gt_id = find_mask_positions._gt_id
     lt_ids = find_mask_positions._lt_ids
 
     ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
     positions = []
     i = 0
     while i < len(ids) - 2:
-        if ids[i] in lt_ids and ids[i+1] == mask_id and ids[i+2] == gt_id:
-            positions.append(i)
-            i += 3
-        else:
-            i += 1
+        if ids[i] in lt_ids and ids[i+1] == mask_id:
+            # Robust check: BPE merges '>' with punctuation (e.g., '>,')
+            decoded_gt = tokenizer.decode([ids[i+2]])
+            if decoded_gt.startswith(">"):
+                positions.append(i)
+                i += 3
+                continue
+        i += 1
     return positions
 
 
