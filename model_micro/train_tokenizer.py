@@ -1,4 +1,4 @@
-"""Prune Qwen's tokenizer to keep ONLY tokens used in the dataset + [NUM].
+"""Prune Qwen's tokenizer to keep ONLY tokens used in the dataset + NUM.
 
 Strategy: Scan all splits, collect used token IDs, remap to a compact
 vocabulary. This preserves pretrained embedding knowledge since each
@@ -42,10 +42,10 @@ SYSTEM_PROMPT = (
     "VALUE rules:\n"
     '- left_right: "left" or "right" (with double quotes)\n'
     '- mcq: "0", "1", "2", etc. (with double quotes)\n'
-    "- distance: a decimal number like 5.2 (no quotes)\n"
-    "- count: an integer like 3 (no quotes)\n\n"
+    "- distance: NUM (the word NUM, Number Head predicts the value)\n"
+    "- count: NUM (the word NUM, Number Head predicts the value)\n\n"
     "Examples:\n"
-    'left_right | "left"\nmcq | "1"\ndistance | 5.2\ncount | 3\n\n'
+    'left_right | "left"\nmcq | "1"\ndistance | NUM\ncount | NUM\n\n'
     "Output ONLY the category, pipe, and value. Nothing else."
 )
 
@@ -90,25 +90,48 @@ print(f"Original vocab size:    {tok.vocab_size}")
 # Coverage check
 test_only = per_split['test'] - per_split['train']
 if test_only:
-    print(f"\n  ⚠ TOKENS IN TEST BUT NOT IN TRAIN: {len(test_only)}")
+    print(f"\n  [!] TOKENS IN TEST BUT NOT IN TRAIN: {len(test_only)}")
     for tid in sorted(test_only):
         print(f"    ID {tid:>6}: '{tok.decode([tid])}'")
 else:
-    print(f"  ✓ All test tokens covered by train.")
-
+    print(f"  [OK] All test tokens covered by train.")
 # ====================================================================
-# 3. Build compact vocab: old_id -> new_id (0..N-1), then [NUM] = N
+# 3. Build compact vocab: old_id -> new_id (0..N-1)
+#    ' NUM' (space-merged BPE) is naturally included from system prompt scan.
 # ====================================================================
 kept_old_ids = sorted(all_ids)  # sorted for reproducibility
-NUM_TOKEN_NEW_ID = len(kept_old_ids)  # [NUM] gets the last slot
-total_vocab = NUM_TOKEN_NEW_ID + 1
+total_vocab = len(kept_old_ids)
 
 # old_id -> new_id mapping
 old_to_new = {old_id: new_id for new_id, old_id in enumerate(kept_old_ids)}
 
+# Find where ' NUM' (the actual context-dependent token) landed in the mapping.
+# BPE is context-dependent: in 'distance | NUM', tokenizer produces ' NUM' (with space),
+# NOT bare 'NUM'. We encode in context to get the correct old_id.
+ctx_ids = tok.encode("| NUM", add_special_tokens=False)
+NUM_OLD_ID = ctx_ids[-1]  # ' NUM' with leading space
+bare_num_id = tok.encode("NUM", add_special_tokens=False)[0]  # bare 'NUM' (won't appear)
+
+if NUM_OLD_ID in old_to_new:
+    NUM_TOKEN_NEW_ID = old_to_new[NUM_OLD_ID]
+    print(f"\n  [OK] NUM token: old_id={NUM_OLD_ID} (' NUM') -> new_id={NUM_TOKEN_NEW_ID}")
+else:
+    print(f"\n  [!] NUM token (old_id={NUM_OLD_ID}) NOT found in scanned tokens!")
+    print(f"    Adding it manually...")
+    kept_old_ids.append(NUM_OLD_ID)
+    kept_old_ids.sort()
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(kept_old_ids)}
+    NUM_TOKEN_NEW_ID = old_to_new[NUM_OLD_ID]
+    total_vocab = len(kept_old_ids)
+
+# Note: bare 'NUM' (old={bare_num_id}) may also be in vocab from scan,
+# but it's unused during training — only ' NUM' appears in context.
+if bare_num_id in old_to_new:
+    print(f"  ℹ Bare 'NUM' (old_id={bare_num_id}) also in vocab -> new_id={old_to_new[bare_num_id]} (unused)")
+
 print(f"\n{'='*60}")
-print(f"Kept tokens:     {len(kept_old_ids)}")
-print(f"[NUM] token:     new_id = {NUM_TOKEN_NEW_ID}")
+print(f"Kept tokens:     {total_vocab}")
+print(f"NUM token:       new_id = {NUM_TOKEN_NEW_ID} (old_id = {NUM_OLD_ID}, context: ' NUM')")
 print(f"Total vocab:     {total_vocab}")
 print(f"Embedding size:  [{total_vocab}, 1024] = {total_vocab * 1024 / 1e6:.2f}M params")
 
@@ -139,9 +162,6 @@ for old_id, new_id in sorted(old_to_new.items(), key=lambda x: x[1]):
     token_str = id_to_token.get(old_id, tok.decode([old_id]))
     pruned_vocab[token_str] = new_id
 
-# Add [NUM]
-pruned_vocab["[NUM]"] = NUM_TOKEN_NEW_ID
-
 # ====================================================================
 # 5. Save outputs
 # ====================================================================
@@ -163,8 +183,8 @@ with open(mapping_path, 'w') as f:
 print(f"\nSaved:")
 print(f"  {vocab_path} ({len(pruned_vocab)} entries)")
 print(f"  {mapping_path}")
-print(f"  -> Use: new_embed = old_embed[kept_old_ids]  # [{total_vocab-1}, 1024]")
-print(f"  -> Then append random init for [NUM]: [{total_vocab}, 1024]")
+print(f"  -> Use: new_embed = old_embed[kept_old_ids]  # [{total_vocab}, 1024]")
+print(f"  -> NUM token uses pretrained Qwen embedding (no random init needed)")
 
 # ====================================================================
 # 6. Display full vocabulary
@@ -182,7 +202,7 @@ for token_str, new_id in sorted(pruned_vocab.items(), key=lambda x: x[1]):
 print(f"\n{'='*60}")
 print("Test: tokenize with Qwen -> remap to new IDs")
 test_texts = [
-    'distance | 5.73',
+    'distance | NUM',
     'left_right | "left"',
     'mcq | "2"',
     'count | 3',
@@ -207,7 +227,7 @@ for text in test_texts:
     print(f"    new_ids:  {new_ids}")
     print(f"    tokens:   {tokens}")
     if missing:
-        print(f"    ⚠ MISSING: {missing} -> {[tok.decode([m]) for m in missing]}")
+        print(f"    [!] MISSING: {missing} -> {[tok.decode([m]) for m in missing]}")
 
 if all_covered:
-    print(f"\n  ✓ All test tokens covered by pruned vocab!")
+    print(f"\n  [OK] All test tokens covered by pruned vocab!")
