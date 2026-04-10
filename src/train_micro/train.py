@@ -20,6 +20,8 @@ Usage:
     python src/train_micro/train.py --split train_sample --epochs 2
     python src/train_micro/train.py --resume checkpoints/micro/step_20000
 """
+import multiprocessing
+multiprocessing.set_start_method("spawn", force=True)
 
 import os
 import sys
@@ -57,7 +59,6 @@ def save_checkpoint(pipeline, optimizer, scheduler, step, epoch, loss, path):
         "step": step,
         "epoch": epoch,
         "loss": loss,
-        # Full model state (all trainable -- no LoRA)
         "model_state_dict": {
             k: v for k, v in pipeline.state_dict().items()
         },
@@ -121,11 +122,13 @@ def main():
     parser.add_argument("--val-batch-size", type=int, default=4)
     parser.add_argument("--val-max-samples", type=int, default=None,
                         help="Limit val samples (None = full val set)")
+    parser.add_argument("--val-steps", type=int, default=1000,
+                    help="Run validation every N steps (0 to disable)")
     # Logging & Checkpointing
     parser.add_argument("--log-steps",   type=int,   default=100)
     parser.add_argument("--save-steps",  type=int,   default=20000)
     parser.add_argument("--resume",      type=str,   default=None)
-    parser.add_argument("--num-workers", type=int,   default=4)
+    parser.add_argument("--num-workers", type=int,   default=2)
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -207,7 +210,7 @@ def main():
     )
     loader = get_dataloader(
         dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=False,
+        num_workers=args.num_workers, pin_memory=True,
     )
 
     total_samples = len(dataset)
@@ -326,11 +329,11 @@ def main():
                 continue
 
             # Move to device
-            pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype)
-            image_grid_thw = batch["image_grid_thw"].to(device=dev)
-            depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype)
-            input_ids      = batch["input_ids"].to(device=dev)
-            labels         = batch["labels"].to(device=dev)
+            pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
+            image_grid_thw = batch["image_grid_thw"].to(device=dev, non_blocking=True)
+            depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
+            input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
+            labels         = batch["labels"].to(device=dev, non_blocking=True)
 
             # Forward
             try:
@@ -442,57 +445,49 @@ def main():
                         global_step, epoch, window_avg, ckpt_path,
                     )
 
+                # Validation
+                if args.val_steps > 0 and global_step % args.val_steps == 0 and global_step > 0:
+                    print(f"\n  [{'='*70}]")
+                    print(f"  Running validation at step {global_step}...")
+
+                    val_results = validate(
+                        pipeline, criterion, pipeline.processor,
+                        resolution=args.resolution,
+                        batch_size=args.val_batch_size,
+                        num_workers=args.num_workers,
+                        max_samples=args.val_max_samples,
+                        split=args.val_split,
+                    )
+                    val_loss = val_results["val_loss"]
+                    val_ce = val_results.get("val_ce", 0.0)
+                    val_sl1 = val_results.get("val_sl1", 0.0)
+                    pipeline.train()  # Switch back to train mode
+
+                    current_epoch = (global_step * effective_batch) / total_samples
+                    lr_v = optimizer.param_groups[0]["lr"]
+                    lr_e = optimizer.param_groups[1]["lr"]
+                    lr_d = optimizer.param_groups[2]["lr"]
+                    lr_c = optimizer.param_groups[3]["lr"]
+                    lr_n = optimizer.param_groups[4]["lr"]
+
+                    # Log to CSV with val_loss filled
+                    with open(csv_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            global_step, f"{current_epoch:.4f}",
+                            f"{window_avg:.6f}", f"{val_loss:.6f}",
+                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
+                            f"{lr_c:.8f}", f"{lr_n:.8f}",
+                            " ", " ",
+                        ])
+                    print(f"Validation complete: val_loss={val_loss:.4f} "
+                          f"(CE={val_ce:.4f}, SL1={val_sl1:.4f})")
+
         # ==============================================================
-        # END OF EPOCH — Validation + Checkpoint
+        # END OF EPOCH 
         # ==============================================================
         epoch_elapsed = time.time() - epoch_start_time
-        epoch_steps = epoch_samples // effective_batch
-        avg_epoch_loss = total_loss_sum / max(epoch_samples // args.batch_size, 1)
-
-        # Run validation
-        print(f"\n  Running validation ({args.val_split})...")
-        val_results = validate(
-            pipeline, criterion, pipeline.processor,
-            resolution=args.resolution,
-            batch_size=args.val_batch_size,
-            num_workers=args.num_workers,
-            max_samples=args.val_max_samples,
-            split=args.val_split,
-        )
-        val_loss = val_results["val_loss"]
-        pipeline.train()  # Switch back to train mode
-
-        print(f"\n  Epoch {epoch + 1} done: "
-              f"train_loss={avg_epoch_loss:.4f}  "
-              f"val_loss={val_loss:.4f}  "
-              f"steps={epoch_steps}  "
-              f"time={epoch_elapsed/60:.1f}min")
-
-        # Write epoch summary row to CSV (with val_loss filled)
-        current_epoch_val = (global_step * effective_batch) / total_samples
-        lr_v = optimizer.param_groups[0]["lr"]
-        lr_e = optimizer.param_groups[1]["lr"]
-        lr_d = optimizer.param_groups[2]["lr"]
-        lr_c = optimizer.param_groups[3]["lr"]
-        lr_n = optimizer.param_groups[4]["lr"]
-
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                global_step, f"{current_epoch_val:.4f}",
-                f"{avg_epoch_loss:.6f}", f"{val_loss:.6f}",
-                f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
-                f"{lr_c:.8f}", f"{lr_n:.8f}",
-                "", "",  # grad_norm and samples/s not applicable
-            ])
-
-        # Save epoch checkpoint
-        ckpt_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch + 1}")
-        save_checkpoint(
-            pipeline, optimizer, scheduler,
-            global_step, epoch + 1, avg_epoch_loss, ckpt_path,
-        )
-        print_vram_usage(f"epoch {epoch + 1}")
+        print(f"\nEpoch {epoch + 1} completed in {epoch_elapsed/60:.1f}min")
 
     # ====================================================================
     # 8. FINAL SUMMARY

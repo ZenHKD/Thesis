@@ -9,6 +9,8 @@ Usage (standalone):
     python src/train_micro/val.py
     python src/train_micro/val.py --resolution 450p --max-samples 100
 """
+import multiprocessing
+multiprocessing.set_start_method("spawn", force=True)
 
 import os
 import sys
@@ -44,33 +46,27 @@ def validate(pipeline, criterion, processor, resolution="450p",
     target_size = {"1080p": None, "720p": (1280, 720),
                    "540p": (960, 540), "450p": (800, 450)}[resolution]
 
-    dataset = SpatialVLMDataset(
-        split, processor=processor,
-        max_samples=max_samples, target_size=target_size,
-    )
-    loader = get_dataloader(
-        dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=False,
-    )
+    dataset = SpatialVLMDataset(split, processor=processor,
+                                max_samples=max_samples, target_size=target_size)
+    loader = get_dataloader(dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=False)
 
     dev = pipeline.device
     dtype = next(pipeline.parameters()).dtype
-
     pipeline.eval()
-    total_loss = 0.0
-    total_ce = 0.0
-    total_mse = 0.0
+
+    total_loss_sum = 0.0
+    total_ce_sum = 0.0
+    total_sl1_sum = 0.0
     n_batches = 0
 
-    pbar = tqdm(loader, desc="Validation", leave=False,
-                bar_format="{l_bar}{bar:20}{r_bar}")
-
+    pbar = tqdm(loader, desc="Validation", leave=False)
     for batch in pbar:
-        pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype)
-        image_grid_thw = batch["image_grid_thw"].to(device=dev)
-        depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype)
-        input_ids      = batch["input_ids"].to(device=dev)
-        labels         = batch["labels"].to(device=dev)
+        pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
+        image_grid_thw = batch["image_grid_thw"].to(device=dev, non_blocking=True)
+        depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
+        input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
+        labels         = batch["labels"].to(device=dev, non_blocking=True)
 
         try:
             output = pipeline(
@@ -85,7 +81,6 @@ def validate(pipeline, criterion, processor, resolution="450p",
             )
         except RuntimeError as e:
             if "out of memory" in str(e):
-                tqdm.write(f"  [!] OOM during validation, skipping batch")
                 torch.cuda.empty_cache()
                 continue
             raise
@@ -93,26 +88,32 @@ def validate(pipeline, criterion, processor, resolution="450p",
         logits = output["logits"]
         num_pred = output["num_pred"]
 
-        loss = criterion(
+        loss, components = criterion(
             logits, labels,
             num_pred, batch["target_num"].to(dev),
             batch["is_numeric"].to(dev),
+            return_components=True,
         )
-
-        total_loss += loss.item()
+        total_loss_sum += loss.item()
+        total_ce_sum += components['ce']
+        total_sl1_sum += components['sl1']
         n_batches += 1
+        pbar.set_postfix({
+            "val_loss": f"{total_loss_sum / max(n_batches, 1):.4f}",
+            "ce": f"{total_ce_sum / max(n_batches, 1):.4f}",
+            "sl1": f"{total_sl1_sum / max(n_batches, 1):.4f}",
+        })
 
-        pbar.set_postfix({"val_loss": f"{total_loss / n_batches:.4f}"})
-
-        del logits, output, loss, pixel_values, depth_maps
-
-    avg_loss = total_loss / max(n_batches, 1)
+    avg_loss = total_loss_sum / max(n_batches, 1)
+    avg_ce = total_ce_sum / max(n_batches, 1)
+    avg_sl1 = total_sl1_sum / max(n_batches, 1)
     return {
         "val_loss": avg_loss,
+        "val_ce": avg_ce,
+        "val_sl1": avg_sl1,
         "n_samples": len(dataset),
         "n_batches": n_batches,
     }
-
 
 # =========================================================================
 # Standalone

@@ -6,7 +6,7 @@ PyTorch Dataset for the NVIDIA Warehouse dataset, adapted for the Micro
 architecture with batch_size > 1 support and Number Head fields.
 
 Key changes from v1 dataloader:
-    1. format_answer(): distance/count -> "category | [NUM]" (Number Head)
+    1. format_answer(): distance/count -> "category | NUM" (Number Head)
     2. __getitem__() adds: is_numeric, target_num fields
     3. collate_fn(): supports batch_size > 1 with padding
     4. No more `assert batch_size == 1`
@@ -62,7 +62,7 @@ _SPLIT_CONFIG = {
 
 
 # ===========================================================================
-# Answer formatting (Micro: [NUM] for numeric tasks)
+# Answer formatting (Micro: NUM for numeric tasks)
 # ===========================================================================
 
 def format_answer(category: str, normalized_answer) -> str:
@@ -71,13 +71,13 @@ def format_answer(category: str, normalized_answer) -> str:
     Format: <category> | <value>
 
     Micro architecture changes:
-        distance -> "distance | [NUM]"    (Number Head predicts the value)
-        count    -> "count | [NUM]"       (Number Head predicts the value)
+        distance -> "distance | NUM"    (Number Head predicts the value)
+        count    -> "count | NUM"       (Number Head predicts the value)
         mcq      -> 'mcq | "5"'          (LM Head, quoted integer)
         left_right-> 'left_right | "left"' (LM Head, quoted string)
     """
     if category in ("distance", "count"):
-        return f"{category} | [NUM]"
+        return f"{category} | NUM"
     else:
         raw = str(normalized_answer)
         formatted = f'"{raw}"'
@@ -106,7 +106,7 @@ class SpatialVLMDataset(Dataset):
         image_name       : str              — filename for debugging
         is_numeric       : bool             — True for distance/count
         target_num       : float            — ground truth number (0.0 if not numeric)
-        num_token_pos    : int              — position of [NUM] in input_ids (-1 if not numeric)
+        num_token_pos    : int              — position of NUM in input_ids (-1 if not numeric)
     """
 
     def __init__(
@@ -136,8 +136,8 @@ class SpatialVLMDataset(Dataset):
         self.target_size = target_size
         self._assistant_marker = "<|im_start|>assistant\n"
 
-        # Cache [NUM] token ID for position finding
-        self._num_token_str = "[NUM]"
+        # Cache NUM token ID for position finding
+        self._num_token_str = "NUM"
 
     def __len__(self) -> int:
         return len(self.data)
@@ -171,7 +171,7 @@ class SpatialVLMDataset(Dataset):
         question_raw = entry["conversations"][0]["value"]
         question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
 
-        # 4. Build target answer string (Micro: [NUM] for numeric)
+        # 4. Build target answer string (Micro: NUM for numeric)
         category = entry["category"]
         target_text = format_answer(category, entry["normalized_answer"])
 
@@ -213,7 +213,7 @@ class SpatialVLMDataset(Dataset):
         # 8. Build labels
         labels = self._build_labels(input_ids, text, category)
 
-        # 9. Find [NUM] token position (for Number Head)
+        # 9. Find NUM token position (for Number Head)
         num_token_pos = -1
         if is_numeric:
             num_token_pos = self._find_num_token_pos(input_ids)
@@ -223,7 +223,7 @@ class SpatialVLMDataset(Dataset):
         if category in ("mcq", "left_right"):
             answer_str = f'"{raw_answer}"'
         elif is_numeric:
-            answer_str = f"[NUM]={raw_answer}"
+            answer_str = f"NUM={raw_answer}"
         else:
             answer_str = raw_answer
 
@@ -289,32 +289,23 @@ class SpatialVLMDataset(Dataset):
         return labels
 
     def _find_num_token_pos(self, input_ids: torch.Tensor) -> int:
-        """Find position of [NUM] token in input_ids.
+        """Find position of NUM token in input_ids.
 
-        BPE tokenization is context-dependent:
-            - In context  '| [NUM]' -> [' [' (498), 'NUM' (16968), ']' (60)]
-            - Standalone  '[NUM]'   -> ['[NUM' (71379), ']' (60)]
+        BPE is context-dependent: in 'distance | NUM', the tokenizer produces
+        ' NUM' (with leading space, old_id=15473), NOT bare 'NUM' (old_id=16968).
 
-        We search for both patterns (from the end) and return the position
-        of the first subtoken.
+        We encode '| NUM' and take the last token to get the correct ID.
         """
         ids_list = input_ids.tolist()
 
-        # Pattern 1: in-context  ' [' + 'NUM' + ']'
-        ctx_ids = self.tokenizer.encode("| [NUM]", add_special_tokens=False)
-        # Strip the leading '|' token(s), keep only the [NUM] part
-        pipe_ids = self.tokenizer.encode("|", add_special_tokens=False)
-        num_ids_ctx = ctx_ids[len(pipe_ids):]  # e.g. [498, 16968, 60]
+        # Get the actual token ID as it appears in context "| NUM"
+        ctx_ids = self.tokenizer.encode("| NUM", add_special_tokens=False)
+        num_id = ctx_ids[-1]  # ' NUM' (with space) = old_id 15473
 
-        # Pattern 2: standalone  '[NUM' + ']'
-        num_ids_alone = self.tokenizer.encode("[NUM]", add_special_tokens=False)
-
-        # Search from end for pattern 1 first (more common in training data)
-        for pattern in [num_ids_ctx, num_ids_alone]:
-            plen = len(pattern)
-            for i in range(len(ids_list) - plen, -1, -1):
-                if ids_list[i:i + plen] == pattern:
-                    return i
+        # Search from end (NUM is in the answer portion)
+        for i in range(len(ids_list) - 1, -1, -1):
+            if ids_list[i] == num_id:
+                return i
 
         return -1
 
