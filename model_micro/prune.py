@@ -4,7 +4,7 @@ prune.py — Create Qwen 3.5 Micro (211M) from the original 0.8B checkpoint.
 Pruning strategy:
     1. Vision: keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
     2. Decoder: keep layers [0,1,2,3, 20,21,22,23] -> renumber [0..7]
-    3. Vocabulary: slice embeddings to 318 kept tokens + 1 [NUM] = 319
+    3. Vocabulary: slice embeddings to kept tokens (including NUM)
     4. Config: update num_hidden_layers, layer_types, depth, vocab_size
 
 Input:
@@ -57,9 +57,9 @@ def prune():
     # --- Load token mapping ---
     with open(MAPPING_PATH, "r") as f:
         mapping = json.load(f)
-    kept_old_ids = mapping["kept_old_ids"]          # 318 original Qwen token IDs
-    total_vocab  = mapping["total_vocab"]            # 319 (318 + [NUM])
-    print(f"\nToken mapping: {len(kept_old_ids)} kept tokens + [NUM] = {total_vocab} total")
+    kept_old_ids = mapping["kept_old_ids"]
+    total_vocab  = mapping["total_vocab"]
+    print(f"\nToken mapping: {len(kept_old_ids)} kept tokens (including NUM) = {total_vocab} total")
 
     # --- Load original weights (safetensors) ---
     st_file = os.path.join(SRC_DIR, "model.safetensors-00001-of-00001.safetensors")
@@ -135,15 +135,11 @@ def prune():
             old_embed = val  # [248320, 1024]
             print(f"\n--- Vocabulary: {old_embed.shape[0]} -> {total_vocab} ---")
 
-            # Slice kept rows
+            # Slice kept rows (NUM is included in kept_old_ids, uses pretrained embedding)
             kept_ids_tensor = torch.tensor(kept_old_ids, dtype=torch.long)
-            pruned_embed = old_embed[kept_ids_tensor]           # [318, 1024]
-
-            # Append [NUM] token with random init (scaled like Qwen embeddings)
-            num_embed = torch.randn(1, old_embed.shape[1]) * 0.02  # [1, 1024]
-            final_embed = torch.cat([pruned_embed, num_embed], dim=0)  # [319, 1024]
+            final_embed = old_embed[kept_ids_tensor]           # [N, 1024]
             print(f"  Embedding: [{old_embed.shape[0]}, {old_embed.shape[1]}] -> [{final_embed.shape[0]}, {final_embed.shape[1]}]")
-            print(f"  [NUM] token at new_id={len(kept_old_ids)} (random init)")
+            print(f"  NUM token uses pretrained Qwen embedding (no random init)")
 
             new_state[key] = final_embed
             kept_keys.add(key)
@@ -165,9 +161,7 @@ def prune():
             if val.shape[0] == state_dict["model.language_model.embed_tokens.weight"].shape[0]:
                 # It's tied — prune the same way
                 kept_ids_tensor = torch.tensor(kept_old_ids, dtype=torch.long)
-                pruned_lm = val[kept_ids_tensor]
-                num_lm = torch.randn(1, val.shape[1]) * 0.02
-                new_state[key] = torch.cat([pruned_lm, num_lm], dim=0)
+                new_state[key] = val[kept_ids_tensor]
                 print(f"\n  lm_head: pruned [{val.shape[0]}] -> [{new_state[key].shape[0]}]")
             else:
                 new_state[key] = val

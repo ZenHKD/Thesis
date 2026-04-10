@@ -17,8 +17,8 @@ Architecture (211M total):
 Output format:
     left_right | "left"      -> LM Head only
     mcq | "2"                -> LM Head only
-    distance | [NUM]         -> LM Head (category) + Number Head (value)
-    count | [NUM]            -> LM Head (category) + Number Head (value)
+    distance | NUM          -> LM Head (category) + Number Head (value)
+    count | NUM             -> LM Head (category) + Number Head (value)
 """
 
 import re
@@ -58,13 +58,13 @@ SYSTEM_PROMPT = (
     "VALUE rules:\n"
     '- left_right: "left" or "right" (with double quotes)\n'
     '- mcq: "0", "1", "2", etc. (with double quotes)\n'
-    "- distance: a decimal number like 5.2 (no quotes)\n"
-    "- count: an integer like 3 (no quotes)\n\n"
+    "- distance: NUM (the word NUM, Number Head predicts the value)\n"
+    "- count: NUM (the word NUM, Number Head predicts the value)\n\n"
     "Examples:\n"
     'left_right | "left"\n'
     'mcq | "1"\n'
-    "distance | 5.2\n"
-    "count | 3\n\n"
+    "distance | NUM\n"
+    "count | NUM\n\n"
     "Output ONLY the category, pipe, and value. Nothing else."
 )
 
@@ -72,41 +72,39 @@ SYSTEM_PROMPT = (
 # Format: category | answer
 _OUTPUT_RE = re.compile(
     r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'(?P<answer>"left"|"right"|"\d+"|\[NUM\]|\d+\.\d+|\d+)',
+    r'(?P<answer>"left"|"right"|"\d+"|NUM|\d+\.\d+|\d+)',
     re.IGNORECASE,
 )
 
 
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
     """Find token positions of <mask> in input_ids.
-
-    Qwen BPE tokenizes <mask> as 3 subtokens:
-      - isolated: ['<', 'mask', '>']  = specific IDs
-      - in context: [' <', 'mask', '>'] = different first ID
+    Handles BPE punctuation merging (e.g., '>' + ',' -> '>,').
     """
     if not hasattr(find_mask_positions, '_cached'):
         find_mask_positions._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
-        find_mask_positions._gt_id = tokenizer.encode(">", add_special_tokens=False)[0]
         find_mask_positions._lt_ids = set()
-        for test in ["<", " <"]:
+        for test in [" <", "  <"]:
             enc = tokenizer.encode(test, add_special_tokens=False)
             if len(enc) == 1:
                 find_mask_positions._lt_ids.add(enc[0])
         find_mask_positions._cached = True
 
     mask_id = find_mask_positions._mask_id
-    gt_id = find_mask_positions._gt_id
     lt_ids = find_mask_positions._lt_ids
 
     ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
     positions = []
     i = 0
     while i < len(ids) - 2:
-        if ids[i] in lt_ids and ids[i+1] == mask_id and ids[i+2] == gt_id:
-            positions.append(i)
-            i += 3
-        else:
-            i += 1
+        if ids[i] in lt_ids and ids[i+1] == mask_id:
+            # Robust check: BPE merges '>' with punctuation (e.g., '>,')
+            decoded_gt = tokenizer.decode([ids[i+2]])
+            if decoded_gt.startswith(">"):
+                positions.append(i)
+                i += 3
+                continue
+        i += 1
     return positions
 
 
@@ -191,9 +189,9 @@ class SpatialVLM(nn.Module):
         with open(mapping_path, "r") as f:
             mapping = json.load(f)
 
-        kept_old_ids = mapping["kept_old_ids"]              # [318] original Qwen IDs
+        kept_old_ids = mapping["kept_old_ids"]              # original Qwen IDs (including NUM=16968)
         old_to_new   = mapping["old_to_new"]                # {"old_id_str": new_id}
-        total_vocab  = mapping["total_vocab"]                # 319
+        total_vocab  = mapping["total_vocab"]                # N (all tokens including NUM)
 
         # Build lookup: old_id -> new_id (size = max_old_id + 1)
         max_old_id = max(kept_old_ids)
@@ -206,7 +204,6 @@ class SpatialVLM(nn.Module):
         remap_new_to_old = torch.zeros(total_vocab, dtype=torch.long)
         for old_str, new_id in old_to_new.items():
             remap_new_to_old[new_id] = int(old_str)
-        # [NUM] token (new_id = total_vocab - 1) has no old equiv — map to pad 0
         self.register_buffer("remap_new_to_old", remap_new_to_old)
 
         self.micro_vocab_size = total_vocab
@@ -343,6 +340,7 @@ class SpatialVLM(nn.Module):
 
         # Step 4: RTI - inject region tokens at <mask> positions
         text_lengths = [input_ids.shape[1]] * input_ids.shape[0]  # default
+        mask_token_len = 0  # 0 = no RTI happened
 
         if (rle_list is not None and mask_token_positions is not None
                 and any(len(rl) > 0 for rl in rle_list)):
@@ -361,7 +359,7 @@ class SpatialVLM(nn.Module):
         # Step 5: Concat Fusion -- [visual | text+region]
         inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
 
-        return inputs_embeds, n_visual, text_lengths
+        return inputs_embeds, n_visual, text_lengths, mask_token_len
 
     # ---- Backbone forward ----
 
@@ -428,7 +426,7 @@ class SpatialVLM(nn.Module):
         rle_list:             list = None,    # [B][num_masks]
         mask_token_positions: list = None,    # [B][num_masks]
         decoded_masks:        list = None,    # [B][num_masks]
-        num_token_positions:  list = None,    # [B] position of [NUM] in input_ids
+        num_token_positions:  list = None,    # [B] position of NUM in input_ids
         use_gradient_checkpointing: bool = False,
         vision_requires_grad: bool = False,
     ) -> dict:
@@ -439,7 +437,7 @@ class SpatialVLM(nn.Module):
                 'logits':   [B, L', vocab_size] — text-only logits (aligned with labels)
                 'num_pred': [B] — Number Head predictions (0 for non-numeric samples)
         """
-        inputs_embeds, n_visual, text_lengths = self._build_inputs_embeds(
+        inputs_embeds, n_visual, text_lengths, mask_token_len = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
             vision_requires_grad=vision_requires_grad,
@@ -456,7 +454,10 @@ class SpatialVLM(nn.Module):
         text_hidden = hidden[:, n_visual:, :]
         logits = self.qwen.lm_head(text_hidden)
 
-        # Number Head -- extract hidden states at [NUM] positions
+        # Number Head -- extract hidden states at NUM positions
+        # IMPORTANT: RTI changes sequence length. Each <mask> (mask_token_len
+        # tokens, typically 3) is replaced by 2 RTI tokens, shrinking the
+        # text by (mask_token_len - 2) per mask. We must adjust num positions.
         B = input_ids.shape[0]
         num_pred = torch.zeros(B, device=hidden.device, dtype=hidden.dtype)
 
@@ -465,11 +466,16 @@ class SpatialVLM(nn.Module):
             num_indices = []
             for b, pos in enumerate(num_token_positions):
                 if pos is not None and pos >= 0:
-                    # Adjust position: account for RTI injection
-                    # The [NUM] token is in the answer, after all <mask> tokens
-                    # pos is relative to text_embeds, so offset by n_visual
-                    adjusted_pos = n_visual + pos
-                    if adjusted_pos < hidden.shape[1]:
+                    # Count masks BEFORE this NUM position to compute offset
+                    if mask_token_len > 0 and mask_token_positions is not None and b < len(mask_token_positions):
+                        masks_before = sum(1 for mp in mask_token_positions[b] if mp < pos)
+                        # Each mask: mask_token_len -> 2 tokens (net: -(mask_token_len-2))
+                        rti_offset = masks_before * (mask_token_len - 2)
+                    else:
+                        rti_offset = 0
+
+                    adjusted_pos = n_visual + pos - rti_offset
+                    if 0 <= adjusted_pos < hidden.shape[1]:
                         num_hidden_list.append(hidden[b, adjusted_pos, :])
                         num_indices.append(b)
 
@@ -508,7 +514,7 @@ class SpatialVLM(nn.Module):
         except ImportError:
             from transformers import DynamicCache as Qwen3_5DynamicCache
 
-        inputs_embeds, n_visual, text_lengths = self._build_inputs_embeds(
+        inputs_embeds, n_visual, text_lengths, _ = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
         )

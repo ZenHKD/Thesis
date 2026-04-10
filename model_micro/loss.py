@@ -13,7 +13,7 @@ L_SmoothL1: SmoothL1 (Huber) loss on Number Head predictions.
        Bounded gradients (max 1.0) — eliminates spikes from large targets.
 
 The RTI injection changes sequence length (each <mask> becomes 2 tokens
-instead of 3). Labels are front-trimmed to align with logits.
+instead of 3).
 """
 
 import torch
@@ -45,10 +45,12 @@ class SpatialLoss(nn.Module):
         num_pred:   torch.Tensor,   # [B]       — Number Head output
         num_gt:     torch.Tensor,   # [B]       — ground truth number (distance or count)
         is_numeric: torch.Tensor,   # [B]       — boolean mask for numeric samples
+        return_components: bool = False,  # if True, return (total, dict of components)
     ) -> torch.Tensor:
         """
         Returns:
             Scalar loss = L_CE + α · L_SmoothL1
+            If return_components=True: (total_loss, {'ce': ..., 'sl1': ...})
         """
         # --- Remap labels: old Qwen IDs -> new pruned IDs [0..318] ---
         if self.remap_fn is not None:
@@ -56,8 +58,12 @@ class SpatialLoss(nn.Module):
 
         # --- Align labels with logits (RTI changes sequence length) ---
         if lm_targets.shape[1] > lm_logits.shape[1]:
-            diff = lm_targets.shape[1] - lm_logits.shape[1]
-            lm_targets = lm_targets[:, diff:]
+            lm_targets = lm_targets[:, -lm_logits.shape[1]:]
+        elif lm_targets.shape[1] < lm_logits.shape[1]:
+            lm_targets = torch.nn.functional.pad(
+                lm_targets, (0, lm_logits.shape[1] - lm_targets.shape[1]), 
+                value=self.ignore_index
+            )
 
         # --- CE Loss: shift logits[t] predicts targets[t+1] ---
         # Upcast to float32 for numerical stability (bfloat16 backward can fail)
@@ -75,16 +81,18 @@ class SpatialLoss(nn.Module):
             )
 
         # --- SmoothL1 Loss: only on numeric samples (distance + count) ---
-        # SmoothL1 (Huber) has bounded gradients unlike MSE, reducing
-        # gradient spikes from large distance/count targets.
         if is_numeric.any():
-            loss_mse = F.smooth_l1_loss(
+            loss_sl1 = F.smooth_l1_loss(
                 num_pred[is_numeric].float(),
                 num_gt[is_numeric].float(),
                 beta=1.0,
             )
         else:
-            loss_mse = torch.tensor(0.0, device=lm_logits.device)
+            loss_sl1 = torch.tensor(0.0, device=lm_logits.device)
 
-        return loss_ce + self.alpha * loss_mse
+        total = loss_ce + self.alpha * loss_sl1
+
+        if return_components:
+            return total, {'ce': loss_ce.item(), 'sl1': loss_sl1.item()}
+        return total
 
