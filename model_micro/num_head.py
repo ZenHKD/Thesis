@@ -34,12 +34,14 @@ class NumberHead(nn.Module):
         LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()
     """
 
-    def __init__(self, hidden_dim: int = 1024, intermediate_dim: int = 256):
+    def __init__(self, hidden_dim: int = 1024, intermediate_dim: int = 256,
+                 dropout: float = 0.1):
         super().__init__()
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, intermediate_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(intermediate_dim, 1),
         )
 

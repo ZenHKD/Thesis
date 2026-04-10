@@ -67,6 +67,7 @@ def validate(pipeline, criterion, processor, resolution="450p",
         depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
         input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
         labels         = batch["labels"].to(device=dev, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device=dev, non_blocking=True)
 
         try:
             output = pipeline(
@@ -78,6 +79,7 @@ def validate(pipeline, criterion, processor, resolution="450p",
                 mask_token_positions=batch["mask_positions"],
                 decoded_masks=batch["decoded_masks"],
                 num_token_positions=batch.get("num_token_positions"),
+                attention_mask=attention_mask,
             )
         except RuntimeError as e:
             if "out of memory" in str(e):

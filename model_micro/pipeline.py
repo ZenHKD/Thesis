@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
+from transformers.masking_utils import create_causal_mask
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -366,14 +367,18 @@ class SpatialVLM(nn.Module):
     def _backbone_forward(
         self,
         inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor = None,
         past_key_values=None,
         cache_position: torch.Tensor = None,
         use_gradient_checkpointing: bool = False,
     ):
         """Run backbone layers on inputs_embeds -> [B, T, 1024].
 
-        Optionally supports KV-cache: pass a Qwen3_5DynamicCache as
-        past_key_values and the corresponding cache_position.
+        Args:
+            attention_mask: [B, T] with 1 for real tokens, 0 for padding.
+                If None, all tokens are treated as real (no padding).
+            past_key_values: Qwen3_5DynamicCache for KV-cache.
+            cache_position: position indices for cache.
         """
         B, seq_len, _ = inputs_embeds.shape
         lm = self.qwen.model.language_model
@@ -389,9 +394,45 @@ class SpatialVLM(nn.Module):
         if hasattr(lm, "rotary_emb"):
             position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
 
+        # Build per-layer-type masks from the 2D attention_mask
+        # Mirrors Qwen3_5TextModel.forward() logic:
+        #   full_attention -> 4D causal mask (causal + padding)
+        #   linear_attention -> 2D mask (zeros out padding hidden states)
+        causal_mask = None
+        linear_mask = None
+
+        if attention_mask is not None:
+            # Full attention: 4D causal mask via transformers utility
+            causal_mask = create_causal_mask(
+                config=lm.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position if cache_position is not None
+                    else torch.arange(seq_len, device=inputs_embeds.device),
+                past_key_values=past_key_values,
+            )
+
+            # Linear attention: 2D boolean mask (used by apply_mask_to_padding_states)
+            # Not needed when: (1) cached decode step, or (2) no padding exists
+            if cache_position is not None and cache_position[0] > 0:
+                linear_mask = None  # cached decode step
+            elif torch.all(attention_mask == 1):
+                linear_mask = None  # no padding
+            else:
+                linear_mask = attention_mask
+
         hidden = inputs_embeds
         for layer in lm.layers:
-            kwargs = {"position_ids": position_ids}
+            # Pick mask type based on layer architecture
+            if hasattr(layer, 'layer_type'):
+                layer_mask = linear_mask if layer.layer_type == "linear_attention" else causal_mask
+            else:
+                layer_mask = causal_mask
+
+            kwargs = {
+                "position_ids": position_ids,
+                "attention_mask": layer_mask,
+            }
             if position_embeddings is not None:
                 kwargs["position_embeddings"] = position_embeddings
             if past_key_values is not None:
@@ -415,6 +456,7 @@ class SpatialVLM(nn.Module):
 
         return hidden
 
+
     # ---- Forward ----
 
     def forward(
@@ -427,6 +469,7 @@ class SpatialVLM(nn.Module):
         mask_token_positions: list = None,    # [B][num_masks]
         decoded_masks:        list = None,    # [B][num_masks]
         num_token_positions:  list = None,    # [B] position of NUM in input_ids
+        attention_mask:       torch.Tensor = None,  # [B, L]
         use_gradient_checkpointing: bool = False,
         vision_requires_grad: bool = False,
     ) -> dict:
@@ -443,9 +486,28 @@ class SpatialVLM(nn.Module):
             vision_requires_grad=vision_requires_grad,
         )
 
+        # Build full attention_mask: [B, n_visual + text_len]
+        # Visual tokens are always real (all 1s), text part uses the passed mask.
+        full_attention_mask = None
+        if attention_mask is not None:
+            B_mask = attention_mask.shape[0]
+            # RTI changes text length: each <mask> (mask_token_len tokens) -> 2 tokens
+            # Compute actual text length after RTI injection
+            actual_text_len = inputs_embeds.shape[1] - n_visual
+            # Visual tokens: always attend (all 1s)
+            vis_mask = torch.ones(B_mask, n_visual, dtype=attention_mask.dtype,
+                                  device=attention_mask.device)
+            # Text mask: trim or pad to match actual text length after RTI
+            if attention_mask.shape[1] >= actual_text_len:
+                text_mask = attention_mask[:, :actual_text_len]
+            else:
+                text_mask = F.pad(attention_mask, (0, actual_text_len - attention_mask.shape[1]), value=0)
+            full_attention_mask = torch.cat([vis_mask, text_mask], dim=1)
+
         # Backbone -- full sequence (visual + text)
         hidden = self._backbone_forward(
             inputs_embeds,
+            attention_mask=full_attention_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
         )
         hidden = self.qwen.model.language_model.norm(hidden)
@@ -455,9 +517,9 @@ class SpatialVLM(nn.Module):
         logits = self.qwen.lm_head(text_hidden)
 
         # Number Head -- extract hidden states at NUM positions
-        # IMPORTANT: RTI changes sequence length. Each <mask> (mask_token_len
-        # tokens, typically 3) is replaced by 2 RTI tokens, shrinking the
-        # text by (mask_token_len - 2) per mask. We must adjust num positions.
+        # IMPORTANT: RTI changes sequence length. Each <mask> (3 tokens)
+        # is replaced by 2 RTI tokens, shrinking the text by (3 - 2) = 1 per mask.
+        # Must adjust NUM positions.
         B = input_ids.shape[0]
         num_pred = torch.zeros(B, device=hidden.device, dtype=hidden.dtype)
 
@@ -509,10 +571,7 @@ class SpatialVLM(nn.Module):
         Returns:
             output_ids: [B, generated_len] newly generated token ids
         """
-        try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
-        except ImportError:
-            from transformers import DynamicCache as Qwen3_5DynamicCache
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
         inputs_embeds, n_visual, text_lengths, _ = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
@@ -533,9 +592,16 @@ class SpatialVLM(nn.Module):
 
         cache = Qwen3_5DynamicCache(config=lm.config)
 
+        # Build attention_mask for prefill (no padding in inference, batch_size=1)
+        # All tokens are real during generation
+        attn_mask = torch.ones(B, T, dtype=torch.long, device=dev)
+
         # Prefill
         cache_position = torch.arange(T, device=dev)
-        hidden = self._backbone_forward(inputs_embeds, past_key_values=cache, cache_position=cache_position)
+        hidden = self._backbone_forward(
+            inputs_embeds, attention_mask=attn_mask,
+            past_key_values=cache, cache_position=cache_position,
+        )
         hidden = lm.norm(hidden[:, -1:, :])
         logits = self.qwen.lm_head(hidden)
 
@@ -625,7 +691,6 @@ class SpatialVLM(nn.Module):
             n = min(len(mask_positions), len(rle_list))
             mask_positions = mask_positions[:n]
             rle_list = rle_list[:n]
-            # Wrap for batched API
             rle_list_batched = [rle_list]
             mask_positions_batched = [mask_positions]
         else:

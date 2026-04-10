@@ -1,5 +1,5 @@
 """
-SpatialVLM Micro Training — Full Fine-tuning from Scratch
+SpatialVLM Micro Training — Full Fine-tuning
 ==========================================================
 
 All components trainable from epoch 1:
@@ -145,7 +145,7 @@ def main():
     # 1. LOAD MODEL
     # ====================================================================
     print("=" * 70)
-    print("MICRO TRAINING: Full Fine-tuning from Scratch")
+    print("MICRO TRAINING: Full Fine-tuning")
     print("=" * 70)
 
     pipeline = SpatialVLM(
@@ -334,6 +334,7 @@ def main():
             depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
             input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
             labels         = batch["labels"].to(device=dev, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device=dev, non_blocking=True)
 
             # Forward
             try:
@@ -346,6 +347,7 @@ def main():
                     mask_token_positions=batch["mask_positions"],
                     decoded_masks=batch["decoded_masks"],
                     num_token_positions=batch.get("num_token_positions"),
+                    attention_mask=attention_mask,
                     use_gradient_checkpointing=args.grad_ckpt,
                     vision_requires_grad=True,
                 )
