@@ -418,7 +418,7 @@ def main():
     n = min(len(mask_positions), len(rle_list[0]))
     mask_positions = mask_positions[:n]
 
-    print(f"  Question: {question[:100]}...")
+    print(f"  Question: {question}")
     print(f"  GT answer: {batch['answers'][0]}")
     print(f"  n_masks:   {n}")
 
