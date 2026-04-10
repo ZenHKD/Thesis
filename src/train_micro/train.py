@@ -264,7 +264,7 @@ def main():
     # 6. CSV LOG (with val_loss column)
     # ====================================================================
     csv_fields = [
-        "step", "epoch", "avg_loss", "val_loss",
+        "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1",
         "lr_vision", "lr_embed", "lr_decoder", "lr_custom", "lr_numhead",
         "grad_norm", "samples_per_sec",
     ]
@@ -429,7 +429,7 @@ def main():
                         writer = csv.writer(f)
                         writer.writerow([
                             global_step, f"{current_epoch:.4f}",
-                            f"{window_avg:.6f}", "",  # val_loss empty
+                            f"{window_avg:.6f}", "", "", "",  # val_loss, val_ce, val_sl1 empty
                             f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
                             f"{lr_c:.8f}", f"{lr_n:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
@@ -475,7 +475,8 @@ def main():
                         writer = csv.writer(f)
                         writer.writerow([
                             global_step, f"{current_epoch:.4f}",
-                            f"{window_avg:.6f}", f"{val_loss:.6f}",
+                            f"{window_avg:.6f}",
+                            f"{val_loss:.6f}", f"{val_ce:.6f}", f"{val_sl1:.6f}",
                             f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
                             f"{lr_c:.8f}", f"{lr_n:.8f}",
                             " ", " ",
