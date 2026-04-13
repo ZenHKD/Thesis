@@ -1,13 +1,13 @@
 """
 Test SpatialVLM Micro full pipeline backpropagation.
 
-Full fine-tuning from scratch.
+Full fine-tuning — all components trainable including embeddings.
 Loads pruned Micro checkpoint, runs 1 forward + backward on real data,
-verifies gradient flow to ALL components.
+verifies gradient flow to all trainable components.
 
 Usage:
     python test_micro/test_backprop.py
-    python test_micro/test_backprop.py --resolution 450p
+    python test_micro/test_backprop.py --resolution 320p
 """
 
 import os
@@ -66,15 +66,16 @@ def main():
     parser.add_argument("--dtype",     default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl", default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--resolution", default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
-    parser.add_argument("--batch-size", type=int, default=2,
-                        help="Batch size for testing (default: 2)")
+    parser.add_argument("--resolution", default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for testing (default: 8)")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[args.resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     # ====================================================================
     # 1. LOAD MODEL
@@ -91,11 +92,12 @@ def main():
     # 2. CONFIGURE — ALL TRAINABLE (full fine-tuning)
     # ====================================================================
     print(f"\n{'='*70}")
-    print("PARAMETER SETUP (full fine-tuning — everything trainable)")
+    print("PARAMETER SETUP (all trainable, full fine-tuning)")
     print("=" * 70)
 
-    for param in pipeline.parameters():
-        param.requires_grad = True
+    # Embeddings are TRAINABLE
+    embed_trainable = pipeline.qwen.model.language_model.embed_tokens.weight.requires_grad
+    print(f"  Embeddings trainable: {embed_trainable}")
 
     # Count per component
     components = {
@@ -162,15 +164,15 @@ def main():
         vision_requires_grad=True,
     )
 
-    logits = output["logits"]
+    logits_per_step = output["logits_per_step"]
     num_pred = output["num_pred"]
-    print(f"  logits shape: {list(logits.shape)}")
-    print(f"  num_pred:     {num_pred.tolist()}")
+    print(f"  logits_per_step: {len(logits_per_step)} steps, each {list(logits_per_step[0].shape)}")
+    print(f"  num_pred:        {num_pred.tolist()}")
 
-    # Loss with label remapping
-    criterion = SpatialLoss(alpha=1.0, remap_fn=pipeline.remap_to_new)
+    # Loss (LoopLM: uniform CE + SmoothL1)
+    criterion = SpatialLoss(alpha=0.1)
     loss = criterion(
-        logits, labels,
+        logits_per_step, labels,
         num_pred, batch["target_num"].to(dev),
         batch["is_numeric"].to(dev),
     )
@@ -188,16 +190,17 @@ def main():
         pipeline.qwen.model.visual, "Vision Encoder")
 
     print(f"\n{'='*70}")
-    print("GRADIENT CHECK — Decoder (8 layers)")
+    print("GRADIENT CHECK — Decoder (8 layers × T_max=3)")
     print("=" * 70)
     decoder_ok, decoder_issues = check_gradients(
         pipeline.qwen.model.language_model.layers, "Decoder")
 
     print(f"\n{'='*70}")
-    print("GRADIENT CHECK — Embeddings")
+    print("GRADIENT CHECK — Embeddings (TRAINABLE — should have grad)")
     print("=" * 70)
-    embed_ok, embed_issues = check_gradients(
-        pipeline.qwen.model.language_model.embed_tokens, "Embeddings")
+    embed_weight = pipeline.qwen.model.language_model.embed_tokens.weight
+    embed_ok = embed_weight.grad is not None and embed_weight.grad.norm().item() > 0
+    print(f"    embed_tokens.weight: grad={'has grad (TRAINABLE, correct)' if embed_ok else 'NO GRAD (unexpected!)'}")
 
     print(f"\n{'='*70}")
     print("GRADIENT CHECK — GSA")
@@ -226,13 +229,14 @@ def main():
     checks = [
         (vision_ok, "Vision Encoder has non-zero gradients"),
         (decoder_ok, "Decoder layers have non-zero gradients"),
-        (embed_ok, "Embeddings have non-zero gradients"),
+        (embed_ok, "Embeddings are TRAINABLE (have gradients)"),
         (gsa_ok, "GSA has non-zero gradients"),
         (rti_ok, "RTI has non-zero gradients"),
         (numhead_ok or not has_numeric,
          f"Number Head has gradients (has_numeric={has_numeric})"),
-        (not (vision_issues or decoder_issues or embed_issues
-              or gsa_issues or rti_issues or (numhead_issues and has_numeric)),
+        (not (vision_issues or decoder_issues
+              or gsa_issues or rti_issues
+              or (numhead_issues and has_numeric)),
          "No NaN/Inf in any gradients"),
         (torch.isfinite(loss).item(), f"Loss is finite ({loss.item():.4f})"),
     ]

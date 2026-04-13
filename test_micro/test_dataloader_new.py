@@ -12,7 +12,7 @@ Verifies:
 Usage:
     python test_micro/test_dataloader_new.py
     python test_micro/test_dataloader_new.py --batch-size 4
-    python test_micro/test_dataloader_new.py --resolution 450p
+    python test_micro/test_dataloader_new.py --resolution 320p
 """
 
 import sys
@@ -35,12 +35,13 @@ def main():
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--resolution", default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
+    parser.add_argument("--resolution", default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
     args = parser.parse_args()
 
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[args.resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     print("=" * 70)
     print("DATALOADER TEST (Micro)")
@@ -99,8 +100,15 @@ def main():
 
         # Decode the active (answer) portion
         active_ids = sample["labels"][sample["labels"] != -100]
-        decoded_answer = tokenizer.decode(active_ids, skip_special_tokens=True)
-        print(f"  Decoded answer: {decoded_answer[:120]}")
+        decoded_answer = tokenizer.decode(active_ids, skip_special_tokens=False)
+        print(f"  Decoded answer: {decoded_answer}")
+
+        # Verify label boundary: answer should start with <think>
+        if decoded_answer.strip().startswith("<think>"):
+            print(f"  [OK] Label boundary correct (starts with <think>)")
+        else:
+            print(f"  [FAIL] Label boundary wrong: answer starts with '{decoded_answer[:30]}'")
+            all_ok = False
 
         # Check numeric fields
         is_num = sample["is_numeric"]
@@ -114,7 +122,7 @@ def main():
             else:
                 print(f"  [OK] is_numeric=True, target_num={target_num}, num_token_pos={num_pos}")
             if num_pos == -1:
-                print(f"  [WARN] [NUM] token not found in input_ids")
+                print(f"  [WARN] <num> token not found in input_ids")
         else:
             if is_num:
                 print(f"  [FAIL] is_numeric should be False for {cat}")
@@ -162,16 +170,7 @@ def main():
         decoded_masks = batch["decoded_masks"]
         rle_list = batch["rle_list"]
 
-        # Cache <mask> token IDs
-        if not hasattr(main, '_mask_id'):
-            main._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
-            main._gt_id = tokenizer.encode(">", add_special_tokens=False)[0]
-            main._lt_ids = set()
-            for test in ["<", " <"]:
-                enc = tokenizer.encode(test, add_special_tokens=False)
-                if len(enc) == 1:
-                    main._lt_ids.add(enc[0])
-
+        batch_mask_ok = True
         for b in range(B):
             n_masks = len(mask_positions[b])
             n_rle = len(rle_list[b])
@@ -182,26 +181,29 @@ def main():
                 print(f"    [FAIL] Sample {b}: mask_positions({n_masks}) != "
                       f"rle_list({n_rle}) != decoded_masks({n_decoded})")
                 all_ok = False
+                batch_mask_ok = False
                 continue
 
             if n_masks == 0:
                 continue  # No masks for this sample
 
             # Check each mask position points to <mask> token
+            # Use string-based check: decode the 3-token span and verify it contains '<mask>'
+            # Verify tokenizer can encode/decode correctly
             ids_list = batch["input_ids"][b].tolist()
             for m_idx, pos in enumerate(mask_positions[b]):
                 if pos + 2 >= L:
                     print(f"    [FAIL] Sample {b}, mask {m_idx}: pos={pos} out of bounds (L={L})")
                     all_ok = False
+                    batch_mask_ok = False
                     continue
 
-                if (ids_list[pos] not in main._lt_ids or
-                    ids_list[pos + 1] != main._mask_id or
-                    ids_list[pos + 2] != main._gt_id):
-                    decoded_tok = tokenizer.decode(ids_list[pos:pos+3])
+                decoded_tok = tokenizer.decode(ids_list[pos:pos+3])
+                if "<mask>" not in decoded_tok:
                     print(f"    [FAIL] Sample {b}, mask {m_idx}: pos={pos} -> "
-                          f"'{decoded_tok}' (not <mask>)")
+                          f"'{decoded_tok}' (no <mask>)")
                     all_ok = False
+                    batch_mask_ok = False
 
             # Check decoded_masks have correct shape (H, W)
             H, W = target_size[1], target_size[0]  # (W, H) -> (H, W)
@@ -211,11 +213,14 @@ def main():
                     print(f"    [FAIL] Sample {b}, mask {m_idx}: binary shape={binary.shape} "
                           f"expected ({H}, {W})")
                     all_ok = False
+                    batch_mask_ok = False
                 if "soft2d" not in mask_dict:
                     print(f"    [FAIL] Sample {b}, mask {m_idx}: missing 'soft2d' key")
                     all_ok = False
+                    batch_mask_ok = False
 
-        print(f"    Masks verified: positions -> <mask> tokens, shapes -> ({H},{W})  [OK]")
+        status = "[OK]" if batch_mask_ok else "[FAIL]"
+        print(f"    Masks verified: positions -> <mask> tokens, shapes -> ({H},{W})  {status}")
 
     # ------------------------------------------------------------------
     # Summary

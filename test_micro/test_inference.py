@@ -1,8 +1,7 @@
 """
-Test SpatialVLM Micro inference with real samples.
+Test SpatialVLM Micro inference (always T_max loops).
 
-Uses SpatialVLMDataset from dataloader_new.py for consistent data loading
-(image/depth/mask resizing all handled by the dataloader).
+Uses the pipeline's built-in generate() which always runs all 4 loops.
 
 Usage:
     # No checkpoint (untrained pruned model):
@@ -20,6 +19,7 @@ import sys
 import os
 import argparse
 import torch
+import re as _re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,6 +30,10 @@ from src.dataloader.dataloader_new import SpatialVLMDataset
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CKPT_DIR = os.path.join(ROOT, "checkpoints", "micro")
 
+
+# =========================================================================
+# Checkpoint Loading
+# =========================================================================
 
 def load_checkpoint_weights(pipeline, step: int):
     """Load only model weights from a training checkpoint (no optimizer)."""
@@ -44,24 +48,27 @@ def load_checkpoint_weights(pipeline, step: int):
         ckpt["model_state_dict"], strict=False
     )
     if missing:
-        print(f"  ⚠ Missing keys: {len(missing)}")
+        print(f"  Warning: Missing keys: {len(missing)}")
         for k in missing[:5]:
             print(f"    - {k}")
     if unexpected:
-        print(f"  ⚠ Unexpected keys: {len(unexpected)}")
+        print(f"  Warning: Unexpected keys: {len(unexpected)}")
         for k in unexpected[:5]:
             print(f"    - {k}")
 
     info = ckpt.get("step", "?"), ckpt.get("epoch", "?"), ckpt.get("loss", "?")
-    print(f"  ✓ Loaded: step={info[0]}, epoch={info[1]:.4f}, loss={info[2]:.6f}")
+    print(f"  Loaded: step={info[0]}, epoch={info[1]:.4f}, loss={info[2]:.6f}")
     return info
 
 
-def run_inference(pipeline, sample: dict) -> dict:
-    """Run inference on a single dataloader sample using pipeline.generate().
+# =========================================================================
+# Inference Runner
+# =========================================================================
 
-    Uses the pre-processed pixel_values, depth_map, input_ids, and
-    decoded_masks from SpatialVLMDataset (resizing already handled).
+def run_inference(pipeline, sample: dict) -> dict:
+    """Run inference on a single dataloader sample.
+
+    Uses pipeline.generate() which always runs T_max loops.
 
     For distance/count: also runs a forward pass to get num_pred from
     the Number Head.
@@ -69,27 +76,19 @@ def run_inference(pipeline, sample: dict) -> dict:
     dev   = pipeline.device
     dtype = next(pipeline.qwen.parameters()).dtype
 
-    pixel_values   = sample["pixel_values"].unsqueeze(0).to(device=dev, dtype=dtype)
+    # pixel_values: [num_patches, C] — do NOT unsqueeze (Qwen visual expects 2D)
+    # image_grid_thw: [1, 3] — already has image dim
+    # depth_map: [H, W] -> [1, H, W] — needs batch dim
+    pixel_values   = sample["pixel_values"].to(device=dev, dtype=dtype)
     image_grid_thw = sample["image_grid_thw"].to(device=dev)
     depth_map      = sample["depth_map"].unsqueeze(0).to(device=dev, dtype=dtype)
 
-    # Re-tokenize without the answer (prompt only + generation prompt)
-    from model_micro.pipeline import SYSTEM_PROMPT
+    # Re-tokenize without the answer (prompt only, direct tokenization)
     question = sample["_question"]
-    image    = sample["_image"]
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": [
-            {"type": "image", "image": image},
-            {"type": "text",  "text": question},
-        ]},
-    ]
-    text = pipeline.processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    inputs = pipeline.processor(text=[text], images=[image], return_tensors="pt")
-    input_ids = inputs["input_ids"].to(device=dev)
+    input_ids = pipeline.processor.tokenizer(
+        question, return_tensors="pt", padding=False
+    ).input_ids.to(device=dev)
 
     # Find <mask> positions in the inference prompt
     mask_positions = find_mask_positions(input_ids, pipeline.processor.tokenizer)
@@ -102,26 +101,34 @@ def run_inference(pipeline, sample: dict) -> dict:
     rle_list = rle_list[:n]
     decoded_masks = decoded_masks[:n]
 
-    # Step 1: Generate text tokens
+    # Step 1: Generate text tokens (always T_max loops)
     output_ids = pipeline.generate(
         pixel_values, image_grid_thw, depth_map, input_ids,
         rle_list=[rle_list],
         mask_token_positions=[mask_positions],
         decoded_masks=[decoded_masks],
-        max_new_tokens=40,
+        max_new_tokens=150,
     )
     raw_output = pipeline.processor.tokenizer.decode(
-        output_ids[0], skip_special_tokens=True
-    ).strip()
+        output_ids[0], skip_special_tokens=False
+    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
+    raw_output = _re.sub(r'<think>.*?</think>\s*', '', raw_output, flags=_re.DOTALL).strip()
     parsed = pipeline.parse_output(raw_output)
 
     # Step 2: For numeric categories, get num_pred via forward pass
-    # ONLY if the model actually generated a clean output format
     num_pred_val = None
-    raw_clean = raw_output.strip()
-    is_clean_format = raw_clean in ("distance | NUM", "count | NUM")
 
-    if is_clean_format and parsed["category"] in ("distance", "count"):
+    _clean_pattern = _re.compile(
+        r'^<think>.+?</think>\s*(distance|count)\s*\|\s*<num>$', _re.DOTALL
+    )
+
+    # Check raw output before stripping think tags
+    raw_full = pipeline.processor.tokenizer.decode(
+        output_ids[0], skip_special_tokens=False
+    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
+    is_clean = bool(_clean_pattern.match(raw_full))
+
+    if is_clean and parsed["category"] in ("distance", "count"):
         full_input_ids = sample["input_ids"].unsqueeze(0).to(device=dev)
         num_token_pos = sample.get("num_token_pos", -1)
 
@@ -139,12 +146,16 @@ def run_inference(pipeline, sample: dict) -> dict:
             num_pred_val = output["num_pred"][0].item()
 
     return {
-        "category": parsed["category"],
-        "answer":   parsed["answer"],
-        "num_pred": num_pred_val,
-        "raw":      raw_output,
+        "category":   parsed["category"],
+        "answer":     parsed["answer"],
+        "num_pred":   num_pred_val,
+        "raw":        raw_output,
     }
 
+
+# =========================================================================
+# Main
+# =========================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Test SpatialVLM Micro inference")
@@ -157,9 +168,9 @@ def main():
                         choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl",      default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--resolution",     default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
-    parser.add_argument("--max-new-tokens", type=int, default=40)
+    parser.add_argument("--resolution",     default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
+    parser.add_argument("--max-new-tokens", type=int, default=150)
     parser.add_argument("--num-samples",    type=int, default=5,
                         help="Number of samples to test (from start of split)")
     parser.add_argument("--sample-idx",     type=int, nargs="+", default=None,
@@ -171,10 +182,11 @@ def main():
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[args.resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     # ------------------------------------------------------------------ #
-    # Load model first (we need processor for the dataset)
+    # Load model
     # ------------------------------------------------------------------ #
     print(f"{'='*70}")
     print("LOADING MODEL")
@@ -194,8 +206,10 @@ def main():
         print("  Using untrained pruned model (no checkpoint)")
     pipeline.eval()
 
+    print(f"\n  T_max (loops): {pipeline.num_loops}")
+
     # ------------------------------------------------------------------ #
-    # Load dataset (uses same processor as model)
+    # Load dataset
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
     print(f"LOADING DATASET  (split={args.split}, resolution={args.resolution})")
@@ -225,12 +239,11 @@ def main():
     N = len(selected)
     print(f"  Selected {N} samples: {selected[:10]}{'...' if N > 10 else ''}")
 
-    # Load samples and show summary
+    # Load samples
     samples = []
     for idx in selected:
         try:
             s = dataset[idx]
-            # Stash raw image + question for inference re-tokenization
             entry = dataset.data[idx]
             from PIL import Image
             img = Image.open(
@@ -245,7 +258,7 @@ def main():
             s["idx"] = idx
             samples.append(s)
         except Exception as e:
-            print(f"  ⚠ Failed to load sample {idx}: {e}")
+            print(f"  Warning: Failed to load sample {idx}: {e}")
 
     for s in samples:
         print(f"  [{s['idx']:>5}] cat={s['category']:10s}  "
@@ -257,7 +270,7 @@ def main():
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
     ckpt_label = f"step={args.step}" if args.step else "untrained"
-    print(f"INFERENCE ({N} samples, {ckpt_label})")
+    print(f"INFERENCE  ({N} samples, {ckpt_label})")
     print(f"{'='*70}")
 
     results_by_category = {}
@@ -265,14 +278,13 @@ def main():
 
     for i, s in enumerate(samples):
         cat = s["category"]
-        gt = s["answer"]  # e.g. '"5"' or 'NUM=9.81'
-        # Extract raw GT for comparison
-        if gt.startswith("NUM="):
-            gt_clean = gt[4:]  # '9.81'
+        gt = s["answer"]
+        if gt.startswith("<num>="):
+            gt_clean = gt[6:]
         else:
-            gt_clean = gt.strip('"')  # '5' or 'left'
+            gt_clean = gt.strip('"')
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'--'*35}")
         print(f"  Sample [{s['idx']}]: {s['image_name']}  |  "
               f"{cat}  |  GT={gt}")
         print(f"  Q: {s['_question'][:120]}{'...' if len(s['_question']) > 120 else ''}")
@@ -284,7 +296,7 @@ def main():
             with torch.no_grad():
                 result = run_inference(pipeline, s)
         except Exception as e:
-            print(f"  ⚠ Inference failed: {e}")
+            print(f"  Warning: Inference failed: {e}")
             import traceback
             traceback.print_exc()
             result = {"category": "error", "answer": None, "raw": str(e)}
@@ -294,7 +306,6 @@ def main():
         num_pred = result.get("num_pred")
 
         if cat in ("distance", "count"):
-            # Use Number Head prediction (num_pred) for numeric comparison
             if num_pred is not None:
                 try:
                     gt_num = float(gt_clean)
@@ -307,7 +318,6 @@ def main():
                 match = False
                 match_detail = f"text_answer={pred_answer!r} (no num_pred)"
         elif cat == "mcq":
-            # MCQ answers are integer indices — normalize with round()
             try:
                 pred_int = round(float(pred_answer))
                 gt_int = round(float(gt_clean))
@@ -347,7 +357,7 @@ def main():
 
     if results_by_category:
         print(f"\n  {'Category':<12}  {'Correct':>8}  {'Total':>6}  {'Accuracy':>8}")
-        print(f"  {'─'*40}")
+        print(f"  {'--'*25}")
         for cat in sorted(results_by_category.keys()):
             r = results_by_category[cat]
             acc = r["correct"] / max(r["total"], 1) * 100

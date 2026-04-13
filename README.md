@@ -34,7 +34,7 @@ Question -----> [Tokenizer] --> text embeds ------> [Concat Fusion]
 
 ### New Micro model, see `model_micro/` 
 
-Pruned from Qwen 3.5 0.8B: Vision Encoder (12 -> 4 blocks), Backbone (24 -> 8 layers), Vocabulary (248K -> 319 tokens). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Full fine-tuning from scratch (~211M parameters).
+Pruned from Qwen 3.5 0.8B: Vision Encoder (12 -> 4 blocks), Backbone (24 -> 8 layers, looped T_max=3). Keeps full original Vocabulary (248K + `<num>`). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Full fine-tuning from scratch (~481M trainable parameters).
 
 ```
 RGB Image --> [Qwen Vision Encoder] --> [Merger] --> visual tokens [B, N, 1024]
@@ -49,27 +49,25 @@ Depth Map ------------------------------------------------+
 RLE Masks ----> [RTI] Region Token Injection -----> token injection (batched)
                   (mask_rgb + mask_depth)                  |
                                                           v
-Question -----> [Tokenizer] --> old IDs --> [Remap] --> new IDs [0..318]
-                                                          |
-                                                   [Embed] (319 × 1024)
+Question -----> [Tokenizer] -----> [Embed] (Full 248K Vocab + <num>)
                                                           |
                                                           v
-                                                  [Qwen Backbone] 8 layers
+                                        [Qwen Backbone] 8 layers x 3 loops
                                                    (DeltaNet + GatedAttn)
                                                           |
                                           +---------------+---------------+
                                           v                               v
-                                   [LM Head] (319)               [Number Head] (xVal)
+                                      [LM Head]                     [Number Head] (xVal)
                                           |                               |
                                           v                               v
                                    Structured Output              Numeric Prediction
                                   category | answer            distance (m) / count (n)
                                           |                               |
                                           v                               v
-                                   L_CE (CrossEntropy)             L_MSE (regression)
+                                   L_CE (CrossEntropy)             L_SmoothL1 (regression)
                                           |                               |
                                           +---------- L_total ------------+
-                                                   L = L_CE + α·L_MSE
+                                                   L = L_CE + α·L_SmoothL1
 ```
 
 
@@ -94,7 +92,7 @@ Thesis/
 │   ├── gsa.py                      # Geometry Self-Attention (same as in `model/`)
 │   ├── rti.py                      # Region Token Injection (new, can be batched)
 │   ├── num_head.py                 # Number Head for distance and count tasks
-|   ├── train_tokenizer.py          # Scan all dataset to create minimize vocabulary for new model
+|   ├── prune.py                    # Pruning Qwen3.5-0.8B
 │   ├── architecture.md             # Detailed architecture documentation
 │   └── qwen3.5-micro/              # Local model weights (gitignored)
 ├── notebooks/       

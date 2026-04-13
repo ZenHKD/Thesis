@@ -5,24 +5,25 @@ Integration test that loads REAL data and verifies:
 
   1. TOKEN TABLE
      Prints every token with position, ID, decoded text, label, active status.
-     Shows where the answer starts and NUM token position.
+     Shows where the answer starts and <num> token position.
 
-  2. TOKEN REMAPPING CHECK
-     Verifies old -> new ID remapping produces valid indices for embed_tokens.
+  2. VOCAB + EMBEDDING CHECK
+     Verifies input_ids are valid for the model vocab.
+     Checks embeddings are trainable.
 
   3. FORWARD PASS + LABEL ALIGNMENT
      Runs pipeline.forward() with real batch.
-     Shows label trimming, shift alignment, per-token CE breakdown.
+     Shows per-token CE breakdown (uses final loop step logits).
 
   4. LOSS CHECK
-     Computes SpatialLoss (CE + SmoothL1) on real logits and labels.
+     Computes SpatialLoss (LoopLM per-step CE + entropy + SmoothL1).
 
   5. INFERENCE
      Runs pipeline.generate() with dataloader tensors.
 
 Usage:
     python test_micro/test_pipeline_alignment.py
-    python test_micro/test_pipeline_alignment.py --resolution 450p
+    python test_micro/test_pipeline_alignment.py --resolution 320p
     python test_micro/test_pipeline_alignment.py --no-model
 """
 
@@ -106,34 +107,30 @@ def print_token_table(input_ids: torch.Tensor, labels: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Section 2: Token Remapping Check
+# Section 2: Vocab + Embedding Check (replaces old remapping check)
 # ---------------------------------------------------------------------------
 
-def check_remapping(pipeline, input_ids, labels):
-    """Verify old -> new remapping produces valid indices."""
-    print(f"\n  input_ids range: [{input_ids.min().item()}, {input_ids.max().item()}]")
-
-    new_ids = pipeline.remap_to_new(input_ids)
-    max_new = new_ids.max().item()
+def check_vocab_and_embedding(pipeline, input_ids, labels):
+    """Verify input IDs are valid for full vocab embed_tokens."""
     embed_size = pipeline.qwen.model.language_model.embed_tokens.weight.shape[0]
-    print(f"  new_ids range:   [{new_ids.min().item()}, {max_new}]")
+    max_id = input_ids.max().item()
+    min_id = input_ids.min().item()
+    print(f"\n  input_ids range: [{min_id}, {max_id}]")
     print(f"  embed_tokens rows: {embed_size}")
-    print(f"  All in range: {'[OK]' if max_new < embed_size else '[FAIL - INDEX OUT OF RANGE]'}")
+    print(f"  All in range: {'[OK]' if max_id < embed_size else '[FAIL - INDEX OUT OF RANGE]'}")
 
-    # Check labels remapping (preserves -100)
-    new_labels = pipeline.remap_to_new(labels)
-    n_ignore = (new_labels == -100).sum().item()
-    n_orig_ignore = (labels == -100).sum().item()
-    print(f"  Labels -100 preserved: {n_ignore == n_orig_ignore} "
-          f"({n_orig_ignore} -> {n_ignore})")
-
-    active_labels = new_labels[new_labels != -100]
+    # Check labels
+    active_labels = labels[labels != -100]
     if len(active_labels) > 0:
         max_label = active_labels.max().item()
         print(f"  Active labels range: [{active_labels.min().item()}, {max_label}]")
         print(f"  All labels in vocab: {'[OK]' if max_label < embed_size else '[FAIL]'}")
 
-    return max_new < embed_size
+    # Check embeddings are trainable (full fine-tuning)
+    embed_trainable = pipeline.qwen.model.language_model.embed_tokens.weight.requires_grad
+    print(f"  Embeddings trainable: {'[OK]' if embed_trainable else '[FAIL - should be trainable]'}")
+
+    return max_id < embed_size and embed_trainable
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +147,11 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
     print(f"  Logits text length      L' = {L_prime}")
     print(f"  RTI diff (n_masks)         = {diff}  (tokens dropped from FRONT of labels)")
 
-    # Remap labels to new vocab
-    new_labels = pipeline.remap_to_new(labels)
-
+    # Labels are already in native Qwen IDs (no remapping needed)
     if diff > 0:
-        trimmed_labels = new_labels[:, diff:]
+        trimmed_labels = labels[:, diff:]
     else:
-        trimmed_labels = new_labels
+        trimmed_labels = labels
 
     lbls_t = trimmed_labels[0].tolist()
     n_active = sum(1 for v in lbls_t[1:] if v != -100)
@@ -168,33 +163,31 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
     vocab_size = logits.shape[2]
     print(f"  Vocab size: {vocab_size}")
 
-    print(f"\n  {'Pos':>5}  {'NewID':>8}  {'OldID':>8}  {'Decoded':>14}  "
+    print(f"\n  {'Pos':>5}  {'TokenID':>8}  {'Decoded':>14}  "
           f"{'Pred':>8}  {'P(target)':>10}  {'CE Loss':>9}  Match?")
-    print(f"  {'─'*100}")
+    print(f"  {'─'*85}")
 
     logits_cpu = logits.cpu().float()
     per_token_losses = []
 
-    for t, new_id in active_positions:
+    for t, token_id in active_positions:
         logit_vec = logits_cpu[0, t]
         log_probs = torch.log_softmax(logit_vec, dim=0)
-        ce_loss = -log_probs[new_id].item()
+        ce_loss = -log_probs[token_id].item()
         per_token_losses.append(ce_loss)
         p_target = math.exp(-ce_loss) if math.isfinite(ce_loss) else 0.0
 
         pred_id = logit_vec.argmax().item()
-        # Remap back to old IDs for display
-        old_target = pipeline.remap_to_old(torch.tensor([new_id])).item()
-        old_pred = pipeline.remap_to_old(torch.tensor([pred_id])).item()
-        target_text = decode_token(tokenizer, old_target)
-        match = "[OK]" if pred_id == new_id else "[FAIL]"
+        # Decode directly (native Qwen IDs, no remapping)
+        target_text = decode_token(tokenizer, token_id)
+        match = "[OK]" if pred_id == token_id else "[FAIL]"
 
-        print(f"  {t:>5}  {new_id:>8}  {old_target:>8}  {target_text:>14}  "
+        print(f"  {t:>5}  {token_id:>8}  {target_text:>14}  "
               f"{pred_id:>8}  {p_target:>10.6f}  {ce_loss:>9.4f}  {match}")
 
     if per_token_losses:
         avg = sum(per_token_losses) / len(per_token_losses)
-        print(f"  {'─'*100}")
+        print(f"  {'─'*85}")
         print(f"  Average CE loss = {avg:.6f}")
         print(f"  Expected (untrained) ≈ log({vocab_size}) = {math.log(vocab_size):.2f}")
 
@@ -210,8 +203,8 @@ def main():
     parser.add_argument("--split",      default="train_sample",
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--sample-idx", type=int, default=0)
-    parser.add_argument("--resolution", default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
+    parser.add_argument("--resolution", default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--device",     default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",      default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl",  default="flash_attention_2",
@@ -222,7 +215,8 @@ def main():
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[args.resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     # ------------------------------------------------------------------ #
     # Load model or processor only
@@ -287,17 +281,182 @@ def main():
         return
 
     # ------------------------------------------------------------------ #
+    # SECTION 1b: Full Backbone Sequence Map
+    # ------------------------------------------------------------------ #
+    from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions
+
+    print(f"\n{'='*70}")
+    print("SECTION 1b: FULL BACKBONE SEQUENCE MAP")
+    print("=" * 70)
+
+    dev = pipeline.device
+    dtype_model = next(pipeline.qwen.parameters()).dtype
+
+    pixel_values_1b   = batch["pixel_values"].to(device=dev, dtype=dtype_model)
+    image_grid_thw_1b = batch["image_grid_thw"].to(device=dev)
+    depth_maps_1b     = batch["depth_maps"].to(device=dev, dtype=dtype_model)
+    input_ids_1b      = batch["input_ids"].to(device=dev)
+
+    # Build inputs_embeds (visual + text with RTI)
+    with torch.no_grad():
+        inputs_embeds, n_visual = pipeline._build_inputs_embeds(
+            pixel_values_1b, image_grid_thw_1b, depth_maps_1b, input_ids_1b,
+            rle_list=batch["rle_list"],
+            mask_token_positions=batch["mask_positions"],
+            decoded_masks=batch["decoded_masks"],
+        )
+
+    B, total_seq, D = inputs_embeds.shape
+    n_text = input_ids_1b.shape[1]
+    n_masks = len(batch["mask_positions"][0]) if batch["mask_positions"] else 0
+
+    # Get vision patch grid info
+    t_grid, h_grid, w_grid = [int(x) for x in image_grid_thw_1b[0].tolist()]
+    h_vis, w_vis = h_grid // 2, w_grid // 2  # after 2x2 merger
+
+    print(f"\n  ┌─────────────────────────────────────────────────────────────┐")
+    print(f"  │  BACKBONE INPUT:  inputs_embeds = [{B}, {total_seq}, {D}]")
+    print(f"  │")
+    print(f"  │  Vision Encoder + Merger + GSA:")
+    print(f"  │    pixel_values: {list(pixel_values_1b.shape)}")
+    print(f"  │    image_grid_thw: [{t_grid}, {h_grid}, {w_grid}]")
+    print(f"  │    after merger (2×2): [{t_grid}, {h_vis}, {w_vis}]")
+    print(f"  │    → visual_tokens: [{B}, {n_visual}, {D}]")
+    print(f"  │")
+    print(f"  │  Text Embeddings + RTI:")
+    print(f"  │    input_ids: [{B}, {n_text}]")
+    print(f"  │    n_masks (RTI 3→3 replace): {n_masks}")
+    print(f"  │    → text_embeds: [{B}, {n_text}, {D}]  (length unchanged by RTI)")
+    print(f"  │")
+    print(f"  │  Concat Fusion:")
+    print(f"  │    inputs_embeds = [visual_tokens | text_embeds]")
+    print(f"  │                  = [{B}, {n_visual}+{n_text}, {D}]")
+    print(f"  │                  = [{B}, {total_seq}, {D}]")
+    print(f"  └─────────────────────────────────────────────────────────────┘")
+
+    # Now print the full sequence map
+    ids  = input_ids_1b[0].tolist()
+    lbls = batch["labels"][0].tolist()
+    mask_positions_flat = batch["mask_positions"][0] if batch["mask_positions"] else []
+
+    # Identify which text positions are RTI-replaced <mask> tokens
+    # find_mask_positions returns start positions; each <mask> = 3 tokens: [<, mask, >]
+    mask_token_len = len(tokenizer.encode("<mask>", add_special_tokens=False))
+    rti_positions = set()
+    for mp in mask_positions_flat:
+        for offset in range(mask_token_len):
+            if mp + offset < n_text:
+                rti_positions.add(mp + offset)
+
+    print(f"\n  Full Sequence Map (backbone sees {total_seq} positions):")
+    print(f"  {'─'*80}")
+    print(f"  {'Backbone':>8}  {'Source':>8}  {'Type':<20}  {'Content':<25}  {'Label':>6}  Active?")
+    print(f"  {'Pos':>8}  {'Pos':>8}")
+    print(f"  {'─'*80}")
+
+    # Part 1: Visual tokens block (summarized)
+    print(f"  {0:>8}  {'─':>8}  {'VISUAL':<20}  {'[CLS/patch embed]':<25}  {'─':>6}")
+    print(f"  {'...':>8}  {'─':>8}  {'VISUAL':<20}  {f'({n_visual} patch tokens)':<25}  {'─':>6}  (no labels)")
+    print(f"  {n_visual-1:>8}  {'─':>8}  {'VISUAL':<20}  {'[last patch token]':<25}  {'─':>6}")
+    print(f"  {'─'*80}")
+
+    # Part 2: Text tokens (with RTI markers)
+    answer_start = next((i for i, v in enumerate(lbls) if v != -100), n_text)
+
+    # Show every text token with its backbone position
+    prev_pos = n_visual - 1
+    mask_region_idx = 0
+    i = 0
+    shown = 0
+    max_show = 80  # limit output
+
+    while i < n_text and shown < max_show:
+        backbone_pos = n_visual + i
+        tok_id  = ids[i]
+        lbl     = lbls[i]
+        decoded = decode_token(tokenizer, tok_id)
+
+        # Determine type
+        if i in rti_positions:
+            # This token was replaced by RTI
+            # Determine which of the 3 replacement tokens this is
+            is_first = (i in [mp for mp in mask_positions_flat])
+            if is_first:
+                mask_region_idx += 1
+
+            # Figure out position within the 3-token replacement
+            for mp in mask_positions_flat:
+                if mp <= i < mp + mask_token_len:
+                    offset = i - mp
+                    break
+            else:
+                offset = 0
+
+            rti_names = ["region_rgb", "region_depth", "space"]
+            if offset < len(rti_names):
+                rti_label = rti_names[offset]
+            else:
+                rti_label = f"rti_tok_{offset}"
+
+            src_type = f"[RTI] Region {mask_region_idx}"
+            content  = f"[{rti_label}] (was: {decoded})"
+        elif i == answer_start:
+            src_type = ">> ANSWER START"
+            content  = decoded
+        elif i < answer_start:
+            src_type = "TEXT (prompt)"
+            content  = decoded
+        else:
+            src_type = "TEXT (answer)"
+            content  = decoded
+
+        lbl_str = str(lbl) if lbl != -100 else "─"
+        active  = "  YES  ←" if lbl != -100 else ""
+
+        # Condense consecutive prompt tokens
+        if src_type == "TEXT (prompt)" and i > 4 and i < answer_start - 3:
+            if prev_pos == backbone_pos - 1 and shown > 5:
+                if i == 5:
+                    print(f"  {'...':>8}  {'...':>8}  {'TEXT (prompt)':<20}  {'...':<25}  {'─':>6}")
+                    shown += 1
+                i += 1
+                prev_pos = backbone_pos
+                continue
+
+        print(f"  {backbone_pos:>8}  {i:>8}  {src_type:<20}  {content:<25}  {lbl_str:>6}  {active}")
+        prev_pos = backbone_pos
+        shown += 1
+        i += 1
+
+    if i < n_text:
+        print(f"  {'...':>8}  {'...':>8}  {'...':<20}  {'(truncated)':<25}")
+
+    print(f"  {'─'*80}")
+
+    # Summary
+    print(f"\n  Summary:")
+    print(f"    Visual tokens:     positions [0 .. {n_visual-1}]  ({n_visual} tokens)")
+    print(f"    Text tokens:       positions [{n_visual} .. {n_visual+n_text-1}]  ({n_text} tokens)")
+    print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*3} positions replaced")
+    print(f"      Original:  [<] [mask] [>]  → 3 text tokens")
+    print(f"      Replaced:  [region_rgb] [region_depth] [space]  → 3 RTI embeddings")
+    print(f"    Total backbone:    {total_seq} positions = {n_visual} visual + {n_text} text")
+    print(f"    Labels:            offset by n_visual={n_visual} (logits[:, n_visual:, :] aligns with labels)")
+    print(f"    Depth map:         {list(depth_maps_1b.shape)}")
+    print()
+
+    # ------------------------------------------------------------------ #
     # SECTION 2: Token Remapping Check
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
-    print("SECTION 2: TOKEN ID REMAPPING CHECK")
+    print("SECTION 2: VOCAB + EMBEDDING CHECK")
     print("=" * 70)
 
     dev = pipeline.device
     input_ids = batch["input_ids"].to(device=dev)
     labels    = batch["labels"].to(device=dev)
 
-    remap_ok = check_remapping(pipeline, input_ids, labels)
+    vocab_ok = check_vocab_and_embedding(pipeline, input_ids, labels)
 
     # ------------------------------------------------------------------ #
     # SECTION 3: Forward pass + alignment
@@ -325,10 +484,13 @@ def main():
             num_token_positions=batch.get("num_token_positions"),
         )
 
-    logits   = output["logits"]
+    logits_per_step = output["logits_per_step"]
     num_pred = output["num_pred"]
 
-    print(f"  logits shape: {list(logits.shape)}")
+    # Use final step logits for alignment analysis
+    logits = logits_per_step[-1]  # Last step = deepest
+
+    print(f"  logits_per_step: {len(logits_per_step)} steps, each {list(logits_per_step[0].shape)}")
     print(f"  num_pred: {num_pred.tolist()}")
 
     per_token_losses = print_forward_alignment(logits, labels.cpu(), tokenizer, pipeline)
@@ -337,17 +499,22 @@ def main():
     # SECTION 4: Loss check
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
-    print("SECTION 4: LOSS CHECK (SpatialLoss: CE + SmoothL1)")
+    print("SECTION 4: LOSS CHECK (LoopLM: uniform CE + SmoothL1)")
     print("=" * 70)
 
-    criterion = SpatialLoss(alpha=1.0, remap_fn=pipeline.remap_to_new)
-    official_loss = criterion(
-        logits.cpu().float(), labels.cpu(),
-        num_pred.cpu().float(), batch["target_num"],
-        batch["is_numeric"],
+    criterion = SpatialLoss(alpha=0.1)
+    device = logits_per_step[0].device
+    official_loss, components = criterion(
+        logits_per_step,
+        labels.to(device),
+        num_pred.to(device).float(), batch["target_num"].to(device),
+        batch["is_numeric"].to(device),
+        return_components=True,
     )
 
     print(f"\n  SpatialLoss output: {official_loss.item():.6f}")
+    print(f"  Components: ce={components['ce']:.6f}, sl1={components['sl1']:.6f}")
+    print(f"  CE per step: {components.get('ce_per_step', [])}")
     if per_token_losses:
         avg = sum(per_token_losses) / len(per_token_losses)
         diff_check = abs(avg - official_loss.item())
@@ -360,13 +527,12 @@ def main():
 
     is_finite = math.isfinite(official_loss.item())
     print(f"  Finite: {is_finite}")
-    print(f"  Micro vocab: {logits.shape[2]}")
-    print(f"  Expected loss ≈ log({logits.shape[2]}) ≈ {math.log(logits.shape[2]):.2f}")
+    print(f"  Full vocab: {logits.shape[2]}")
 
     # ------------------------------------------------------------------ #
     # SECTION 5: Inference
     # ------------------------------------------------------------------ #
-    from model_micro.pipeline import find_mask_positions, SYSTEM_PROMPT
+    from model_micro.pipeline import find_mask_positions
     from PIL import Image
 
     print(f"\n{'='*70}")
@@ -394,21 +560,10 @@ def main():
     if target_size:
         pil_image = pil_image.resize(target_size, Image.LANCZOS)
 
-    # Build generation-format input_ids (prompt only, no answer)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": [
-            {"type": "image", "image": pil_image},
-            {"type": "text",  "text": question},
-        ]},
-    ]
-    text = pipeline.processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-    inputs = pipeline.processor(text=[text], images=[pil_image],
-                                return_tensors="pt", padding=False)
-    gen_input_ids = inputs["input_ids"].to(device=dev)
+    # Build generation-format input_ids (direct tokenization, no chat template)
+    gen_input_ids = pipeline.processor.tokenizer(
+        question, return_tensors="pt", padding=False
+    ).input_ids.to(device=dev)
 
     # Find <mask> positions
     mask_positions = find_mask_positions(gen_input_ids, pipeline.processor.tokenizer)
@@ -418,9 +573,13 @@ def main():
     n = min(len(mask_positions), len(rle_list[0]))
     mask_positions = mask_positions[:n]
 
-    print(f"  Question: {question}")
-    print(f"  GT answer: {batch['answers'][0]}")
-    print(f"  n_masks:   {n}")
+    # GT thinking (chain-of-thought reasoning from dataset)
+    gt_thinking = entry["conversations"][1]["value"] if len(entry.get("conversations", [])) > 1 else "(none)"
+
+    print(f"  Question:     {question}")
+    print(f"  GT thinking:  {gt_thinking}")
+    print(f"  GT answer:    {batch['answers'][0]}")
+    print(f"  n_masks:      {n}")
 
     pipeline.eval()
     with torch.no_grad():
@@ -429,7 +588,7 @@ def main():
             rle_list=[rle_list[0][:n]] if n > 0 else None,
             mask_token_positions=[mask_positions] if n > 0 else None,
             decoded_masks=[decoded_masks[0][:n]] if n > 0 else None,
-            max_new_tokens=40,
+            max_new_tokens=150,
         )
 
     raw_output = pipeline.processor.tokenizer.decode(
@@ -453,10 +612,10 @@ def main():
     print("=" * 70)
 
     checks = [
-        (remap_ok, "Token remapping produces valid embed indices"),
+        (vocab_ok, "Token IDs valid for embed + embeddings trainable"),
         (is_finite, f"Loss is finite ({official_loss.item():.4f})"),
-        (logits.shape[2] == pipeline.micro_vocab_size,
-         f"Logits vocab matches micro_vocab ({logits.shape[2]} == {pipeline.micro_vocab_size})"),
+        (logits.shape[2] == pipeline.qwen.model.language_model.embed_tokens.weight.shape[0],
+         f"Logits vocab matches model ({logits.shape[2]} == {pipeline.qwen.model.language_model.embed_tokens.weight.shape[0]})"),
     ]
     for ok, msg in checks:
         print(f"  [{'OK' if ok else 'FAIL'}] {msg}")
