@@ -1,21 +1,20 @@
-# SpatialVLM Architecture — Qwen 3.5 Micro (211M)
+# SpatialVLM Architecture — Qwen 3.5 Micro
 
 ## Origin
 
-Surgically pruned from **Qwen 3.5 0.8B (853M)** — a 75% parameter reduction.
+Surgically pruned from **Qwen 3.5 0.8B (853M)** — a ~85% parameter reduction.
 Pretrained weights are transferred (not random init), then fine-tuned on the 499K warehouse dataset.
 
 | Cut | Original | Micro | Savings |
 |-----|----------|-------|---------|
 | Vision ViT blocks | 12 | **4** | 56.7M |
-| Decoder layers | 24 (6 groups) | **8 (2 groups)** | 332M |
-| Vocab size | 248,320 | **319** | 253.7M |
-| Context length | 262,144 | **2,048** | VRAM only |
+| Decoder layers | 24 (6 groups) | **8 (2 groups, LoopLM T_max=3)** | 332M |
+| Vocab / Embedding | 248,320 | **248,321 (full + <num>, TRAINABLE)** | 0 |
+| Context length | 262,144 | **512** | VRAM only |
 | Number Head | — | **+0.26M** (NEW, softplus) | — |
-| **Total** | **853M** | **~211M** | **~642M (75%)** |
+| **Total** | **853M** | **~465M (~465M trainable)** | **~388M (45%)** |
 
 > **Key**: `hidden_dim = 1024` is **unchanged** — all tensor shapes between modules stay identical.
-> GSA and RTI require **zero modification**.
 
 ---
 
@@ -37,7 +36,9 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 > **Depth**: ~78K RGB-D pairs — real depth sensor data available \
 > **Regions**: encoded as `<mask>` in question text, with per-region **RLE** in JSON \
-> **Tokens used**: 318 unique (full dataset scan) + 1 `[NUM]` token -> **319 vocab** (no buffer)
+> **Vocab**: Full original vocabulary (248,321 = 248,320 + <num> token) \
+> **CoT**: GPT reasoning wrapped in `<think>...</think>` as chain-of-thought training signal \
+> **Labels**: Question & answer tokenized separately then concatenated (BPE-safe boundary)
 
 ---
 
@@ -49,35 +50,36 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | LLM Hidden Dim | 1024 | **1024** (unchanged) |
 | Vision Blocks | 12 | **4** |
 | Vision Hidden Dim | 768 | **768** (unchanged) |
-| Decoder Layers | 24 | **8** |
-| Layer Layout | 6 × (3 DeltaNet + 1 GatedAttn) | **2 × (3 DeltaNet + 1 GatedAttn)** |
+| Decoder Layers | 24 | **8 (LoopLM T_max=3 = effective depth 24)** |
+| Layer Layout | 6 × (3 DeltaNet + 1 GatedAttn) | **2 × (3 DeltaNet + 1 GatedAttn) × T_max loops** |
 | FFN (SwiGLU) dim | 3584 | **3584** (unchanged) |
-| Vocab / Embedding | 248,320 | **319** |
-| Context Length | 262,144 | **2,048** |
+| Vocab / Embedding | 248,320 | **248,321 (full + <num>)** |
+| Context Length | 262,144 | **512** |
 | **Number Head** | — | **Linear(1024->256->1)** |
 
 ### Parameter Breakdown
 
-| Component | Params | % | Detail |
-|-----------|--------|---|--------|
-| Vision Encoder | 44.10M | 20.9% | 4 ViT blocks (768-dim) + merger |
-| Token Embeddings (tied w/ LM Head) | 0.33M | 0.2% | 319 × 1024 |
-| Text Decoder (8 layers + Norm) | 166.04M | 78.6% | 6 DeltaNet + 2 GatedAttn |
-| Number Head | 0.26M | 0.1% | xVal-style regression (softplus) |
-| **Total (Qwen Micro)** | **~211M** | 100% | |
-| GSA (2 blocks, custom) | +16.91M | — | Unchanged from v1 |
-| RTI (region tokens, custom) | +0.032M | — | Unchanged from v1 |
-| **Grand Total (loaded)** | **~228M** | | |
+| Component | Params | Trainable | Detail |
+|-----------|--------|-----------|--------|
+| Vision Encoder | 44.10M | ✅ Yes | 4 ViT blocks (768-dim) + merger |
+| Token Embeddings (tied w/ LM Head) | 254M | ✅ **Trainable** | 248,321 × 1024 (full vocab) |
+| Text Decoder (8 layers × T_max=3) | ~166M | ✅ Yes | 2 × (3 DeltaNet + 1 GatedAttn), effective depth 24 |
+| Number Head | 0.26M | ✅ Yes | xVal-style regression (softplus) |
+| **Total (Qwen Micro)** | **~465M** | **~465M** | All trainable |
+| GSA (2 blocks, custom) | +16.91M | ✅ Yes | Custom module |
+| RTI (region tokens, custom) | +0.032M | ✅ Yes | Custom module |
+| **Grand Total** | **~482M** | **~482M trainable** | |
 
-### VRAM Estimate (FP16 training)
+### VRAM Estimate (BF16 training)
 
-| | Original 0.8B | **Micro 211M** |
+| | Original 0.8B | **Micro ~482M** |
 |---|---|---|
-| Model weights | ~1.7 GB | **~0.45 GB** |
-| KV cache (inference) | ~2 GB | **~0.02 GB** |
-| Gradients + optimizer | ~5 GB | **~1.4 GB** |
-| Batch data headroom (12GB GPU) | ~3 GB | **~10 GB** |
-| **Estimated batch size** | 1–2 | **8–16** |
+| Model weights | ~1.7 GB | **~0.96 GB** |
+| KV cache (inference) | ~2 GB | **~0.04 GB** |
+| Gradients + optimizer | ~5 GB | **~2.9 GB** |
+| Logits [B=8, L=80, V] | ~640 MB (248K) | **~640 MB (248K)** |
+| Batch data headroom (12GB GPU) | ~3 GB | **~7.5 GB** |
+| **Estimated batch size** | 1–2 | **6–10** |
 
 ---
 
@@ -103,63 +105,60 @@ Micro:                                               [block.0  block.1  block.2 
 - `blocks.8->0, 9->1, 10->2, 11->3`: 4 × 7.09M = 28.36M
 - `merger`: unchanged — 12.59M
 
-### Decoder: 24 -> 8 Layers (2 groups)
+### Decoder: 24 -> 8 Layers (LoopLM, T_max=3)
 
-**Keep groups [0, 5] -> renumber to [0, 1]**
+**Keep groups [0,1] -> 8 layers, loop T_max=3 at runtime = effective depth 24**
+
+Based on "Scaling Latent Reasoning via Looped Language Models" (Ouro, arXiv:2510.25741).
 
 - Group 0 (layers 0–3): **early** — question parsing, token-level understanding
-- Group 5 (layers 20–23): **late** — answer generation, cross-modal fusion
+- Group 1 (layers 4–7): **mid** — deeper reasoning, spatial relation processing
+- LoopLM: iterative refinement with **fixed T_max=3 loops** (always full depth)
 
 ```
-Original:  [Group 0]  Group 1  Group 2  Group 3  Group 4  [Group 5]
-           layers 0-3                                      layers 20-23
-              ↓                                               ↓
-Micro:     [Group 0]                                      [Group 1]
-           layers 0-3                                     layers 4-7
+Original:  [Group 0]  [Group 1]  Group 2  Group 3  Group 4  Group 5
+           layers 0-3  layers 4-7                            layers 20-23
+              ↓
+Micro:     [Group 0 + Group 1] × T_max = effective depth 24 (always 3 loops)
+           layers 0-7  →  layers 0-7  →  layers 0-7
+           loop 1         loop 2         loop 3
 ```
 
 **Per group** = 3 × DeltaNet (~21.55M each) + 1 × GatedAttn (~18.35M) = ~83.0M
-**2 groups** = ~166.0M
+**2 groups × T_max=3** = ~166M params, effective depth 24 (same as original!)
 
 **Layer type pattern**: `[linear, linear, linear, full, linear, linear, linear, full]`
 
-### Vocabulary: 248,320 -> 319
+**Training**: uniform-weighted CE loss across all loop steps: `L = (1/T) · Σ_t CE^(t)`.
+All steps receive equal gradient, ensuring deeper loops are properly trained.
+**Inference**: always runs full T_max=3 loops, uses final step's logits.
 
-Full dataset scan (all fields across 499K train + 1.9K val + 19K test + system prompt):
-**318 unique Qwen token IDs**. Add 1 `[NUM]` token -> **319 total**. No buffer padding.
+### Vocabulary: 248,320 -> 248,321 (Full Original + <num>)
 
-We keep **Qwen's original tokenizer** and remap IDs. This preserves pretrained embedding
-knowledge — each new token ID maps directly to an existing Qwen embedding row.
+**No vocabulary pruning.** The full original Qwen 3.5 vocabulary (248,320 tokens) is kept intact.
+Only the `<num>` token is appended at the end (ID = 248,320) for numeric regression tasks.
 
-Implementation: `model_micro/train_tokenizer.py` -> outputs `micro_vocab.json` + `micro_token_mapping.json`
+This preserves the pretrained BPE tokenizer completely — all byte-level tokens and merge rules
+are intact, ensuring correct encoding/decoding of all text.
 
-1. Tokenize all data fields with Qwen tokenizer -> collect 318 unique token IDs
-2. Build mapping: `old_id -> new_id (0..317)`, `[NUM] = 318`
-3. Slice embedding: `new_embed = old_embed[kept_old_ids]` -> `[318, 1024]`
-4. Append random init for `[NUM]`: final embed = `[319, 1024]`
+**<num> token**: Placed at the **end of vocab** (ID = 248,320).
+Random init, stored in config as `num_token_id`.
 
-**Token ID Remapping** (runtime, in `model_micro/pipeline.py`):
+**TRAINABLE**: `embed_tokens.weight.requires_grad = True`. LM head is tied → also trainable.
+With 248K tokens, embedding is ~254M params — the largest component of the model.
 
-The original Qwen tokenizer is kept for text encoding/decoding. At runtime, the pipeline
-remaps IDs using `micro_token_mapping.json`:
 
-| Direction | Method | Where |
-|-----------|--------|-------|
-| old -> new | `pipeline.remap_to_new(ids)` | Before `embed_tokens()`, before CE labels |
-| new -> old | `pipeline.remap_to_old(ids)` | After `generate()` for tokenizer decode |
 
-The loss function accepts `remap_fn=pipeline.remap_to_new` to remap labels automatically.
-
-### Context: 262,144 -> 2,048
+### Context: 262,144 -> 512
 
 Config-only change. RoPE is computed dynamically — no weight modification.
 
-At 450p input resolution with 2×2 spatial merge:
-- Visual tokens: ~130 (adaptive, depends on aspect ratio)
-- System prompt: ~80 tokens
-- Question + mask tokens: ~100–300
-- Answer: ~10 tokens
-- **Total: ~320–520 tokens** — fits easily in 2,048
+At 320p input resolution with 2×2 spatial merge:
+- Visual tokens: 160
+- Question text: ~25–35 tokens
+- `<think>` GPT reasoning: ~30–80 tokens
+- Structured answer: ~8 tokens
+- **Total: ~230–290 tokens** — fits in 512
 
 ---
 
@@ -195,9 +194,9 @@ flowchart TB
         SOFT --> MRGB & MDEP
     end
 
-    subgraph DECODER["Text Decoder (166M)"]
-        EMB["Token Embeddings\n319 vocab × 1024"]
-        DEC["8 Decoder Layers\n2 × (3 DeltaNet + 1 GatedAttn)\nhidden=1024, FFN=3584"]
+    subgraph DECODER["Text Decoder (166M, LoopLM T_max=3)"] 
+        EMB["Token Embeddings\n248K vocab x 1024\nTRAINABLE"]
+        DEC["8 Layers x T_max=3 loops (LoopLM)\n2 x (3 DeltaNet + 1 GatedAttn)\nhidden=1024, FFN=3584"]
         EMB --> DEC
     end
 
@@ -217,7 +216,7 @@ flowchart TB
     MDEP --> DEC
 
     DEC --> LM
-    DEC -->|"hidden @ [NUM]"| NUM
+    DEC -->|"hidden @ <num>"| NUM
 
     style INPUT fill:#1a1a2e,stroke:#e94560,color:#fff
     style VISION fill:#16213e,stroke:#0f3460,color:#fff
@@ -234,12 +233,12 @@ flowchart TB
 | Custom Module | File | Position | Function | Params |
 |--------------|------|----------|----------|--------|
 | **GSA** (2 blocks) | `gsa.py` | After Merger, before Decoder | Inject depth geometry into visual tokens | **~16.9M** |
-| **RTI** | `region_token.py` | After GSA, before Decoder | Decode RLE -> `<mask_rgb><mask_depth>` injection | **~0.032M** |
+| **RTI** | `rti.py` | After GSA, before Decoder | Decode RLE -> `[mask_rgb, mask_depth, space]` 3→3 injection | **~0.032M** |
 | **Number Head** | `num_head.py` | After Decoder | xVal-style distance regression | **~0.26M** |
 
 ### GSA Detail — DFormerv2 Full_GSA (2 blocks × ~8.46M)
 
-Unchanged from v1. Operates on visual tokens [B, N, 1024] with depth prior.
+Operates on visual tokens [B, N, 1024] with depth prior.
 
 | Sub-module | Params/block |
 |------------|-------------|
@@ -249,9 +248,12 @@ Unchanged from v1. Operates on visual tokens [B, N, 1024] with depth prior.
 | FeedForwardNetwork | 4.218M |
 | **× 2 blocks** | **~16.91M** |
 
-### RTI Detail — Region-Level Token Injection
+### RTI Detail — Region-Level Token Injection (3→3)
 
-Each `<mask>` -> `<mask_rgb><mask_depth>` (2 tokens).
+Each `<mask>` (3 tokens: `<`, `mask`, `>`) → `[mask_rgb, mask_depth, space_embed]` (3 tokens).
+
+**3→3 in-place replacement**: sequence length is **UNCHANGED**. No offset calculations,
+no front-trimming of labels, no padding needed. This avoids alignment complexity.
 
 | Sub-module | Params |
 |------------|--------|
@@ -259,131 +261,138 @@ Each `<mask>` -> `<mask_rgb><mask_depth>` (2 tokens).
 | Depth projector | 31,744 |
 | **Total** | **~0.032M** |
 
-### RTI Batching Strategy (NEW — enables batch_size > 1)
+| Token | Source |
+|-------|--------|
+| `mask_rgb` | Gated attention pooling over visual tokens [1, 1024] |
+| `mask_depth` | Depth statistics → Linear(28→1024) [1, 1024] |
+| `space_embed` | Frozen embedding of `" "` (space) token [1, 1024] |
 
-The v1 RTI processed masks serially with `batch_size=1` only. The Micro RTI supports `batch_size > 1`
-via per-sample processing with padded output.
+### RTI Batching Strategy (enables batch_size > 1)
+
+The RTI supports `batch_size > 1` via in-place per-sample replacement (no output length changes).
 
 Implementation: `model_micro/rti.py` + `src/dataloader/dataloader_new.py`
 
-| Aspect | v1 | Micro |
-|--------|-----|-------|
-| `forward()` input | `rle_list: list[dict]` (single sample) | `rle_list: list[list[dict]]` (batched) |
-| `inject_into_text_embeds()` output | `[1, L', D]` | `[B, max_L', D]` + output lengths |
-| `collate_fn()` | `assert batch_size == 1` | Pads to max length, nests masks as `list[list]` |
-| Effective batch | 1 (grad accum only) | **8–16** (true batching) |
+| Aspect | Detail |
+|--------|-------|
+| `forward()` input | `rle_list: list[list[dict]]` (batched) |
+| `inject_into_text_embeds()` | **3→3 in-place** (no length change) |
+| `collate_fn()` | Pads to max length, nests masks as `list[list]` |
+| Effective batch | **8–16** (true batching) |
 
-### Number Head — xVal-style Regression (NEW)
+### Number Head — xVal-style Regression
 
 Implementation: `model_micro/num_head.py`
 
 `LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> softplus()`
 
-Params: ~262K. Takes hidden state at `[NUM]` position, outputs non-negative scalar.
+Params: ~262K. Takes hidden state at `<num>` position, outputs non-negative scalar.
 `softplus(x) = log(1 + exp(x))` — smooth everywhere, always positive (no gradient discontinuity).
 
-**Why this fixes the distance and count problems:**
+**How it handles distance and count:**
 
-| | Old (CE on digits) | New (Number Head) |
-|---|---|---|
-| `4.52` distance | 4 tokens: `"4"` `"."` `"5"` `"2"` | 1 token: `[NUM]` -> scalar 4.52 |
-| `3` count | 1 token: `"3"` | 1 token: `[NUM]` -> scalar 3.0 |
-| Loss for pred=4.50 | CE(2->0) ≈ same penalty | SmoothL1 = 0.0 (< β) |
-| Loss for pred=9.52 | CE(4->9) ≈ same penalty | SmoothL1 = 4.5 (linear) |
-| Correct signal? | ✗ (magnitude blind) | ✓ (proportional, bounded grad) |
-| Benchmark metric | RMSE (both tasks) | ✓ MSE training = RMSE eval |
+- **Prediction**: Instead of generating multiple digit tokens (e.g., 4 tokens for `4.52`), a single `<num>` token outputs the scalar value.
+- **Loss**: SmoothL1 loss provides a proportional, bounded gradient based on numerical error.
+- **Evaluation**: Training MSE translates directly to evaluation RMSE.
 
 ---
 
-## LM Head — Structured Output Format
+## Output Format — Chain-of-Thought with `<think>`
 
-### Text-only tasks (mcq, left_right)
+The model generates GPT reasoning inside `<think>...</think>` before the structured answer.
+This is chain-of-thought distillation: the model learns spatial reasoning from GPT explanations.
 
-Standard text generation via LM Head: `left_right | "left"`, `mcq | "2"`
+### Training target format
 
-### Numeric tasks: distance AND count (NEW)
+| Task | Training target |
+|------|-----------------|
+| mcq | `<think>The transporter [Region 1] is not transporting... pallet [Region 5] is closest.</think>mcq \| "5"` |
+| distance | `<think>The pallet [Region 0] and pallet [Region 1] are 9.81 meters apart.</think>distance \| <num>` |
+| count | `<think>The buffer region [Region 0] is filled with pallets [Region 3] [Region 9]... has 2 pallets.</think>count \| <num>` |
+| left_right | `<think>The pallet [Region 0] is situated on the right of pallet [Region 1].</think>left_right \| "right"` |
 
-The answer contains a `[NUM]` token instead of digit tokens. The Number Head reads its
-hidden state to output a continuous scalar.
+### Dual output heads
 
-| Task | Target text | Number Head target | LM Head learns | Number Head learns |
-|------|-------------|-------------------|----|----|
-| left_right | `left_right \| "left"` | — | Full answer | — |
-| mcq | `mcq \| "2"` | — | Full answer | — |
-| distance | `distance \| [NUM]` | 5.73 | Category + format | Distance value |
-| count | `count \| [NUM]` | 3.0 | Category + format | Count value |
+| Head | What it learns | Active for |
+|------|---------------|------------|
+| **LM Head** | `<think>` reasoning + category + format | All tasks |
+| **Number Head** | Scalar from hidden state @ <num> position | distance, count |
 
 ---
 
-## Loss Function
+## Loss Function — Uniform Per-Step CE
 
 Implementation: `model_micro/loss.py`
 
-`L = L_CE + α · L_SmoothL1`
+Based on "Scaling Latent Reasoning via Looped Language Models" (Ouro, arXiv:2510.25741).
 
-- **L_CE**: Autoregressive CrossEntropy on all tokens (ignores -100 prompt tokens)
+`L = (1/T) · Σ_t CE^(t) + α · L_SmoothL1`
+
+Where:
+```
+L = (1/T) · Σ_t CE^(t)(label_smoothing=0.1)  +  α · L_SmoothL1
+```
+
+- **CE^(t)**: Per-step cross-entropy at loop step t (LM head applied at every step)
+- **T**: Number of loop steps (T_max = 4). All steps receive equal gradient weight.
 - **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
   - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
   - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
-- Front-trims labels to align with RTI-modified logits
+- **No label trimming**: 3→3 RTI preserves sequence length — labels and logits always align
+
+**Training regime**: Single-stage joint training. All loop steps are trained equally.
 
 ---
 
-## Training Strategy — Full Fine-tuning from Scratch
+## Tokenization & Label Strategy (BPE-safe)
 
-**No phased warmup. No LoRA.** The Micro model is small enough for full fine-tuning
-on a 12GB GPU from the very first epoch. All components train simultaneously.
+Question and answer are **tokenized separately**, then their token IDs are **concatenated**.
+This guarantees exact label boundaries regardless of BPE context-dependent merging.
 
-**Why single-phase:**
-- Model weights: ~0.42 GB -> ~1.7 GB total with gradients + Adam states
-- Leaves ~10 GB for batch data (batch size 8–16 with FP16)
-- Groups 1–4 were pruned, so the remaining early (group 0) and late (group 5)
-  layers must re-learn to communicate directly — full fine-tuning is preferred
-- LoRA's low-rank constraint would bottleneck this adaptation
+```
+q_ids   = tokenizer.encode(question)          # [q1, q2, ..., qN]
+sep_ids = tokenizer.encode("\n")              # [sep]
+a_ids   = tokenizer.encode(full_answer)       # [a1, a2, ..., aM]
+
+input_ids = q_ids + sep_ids + a_ids           # exact concatenation
+labels    = [-100]*len(q_ids+sep_ids) + a_ids  # -100 for question, active for answer
+```
+
+**Why this matters**: BPE tokenizers are context-dependent. Tokenizing `question + "\n" + answer`
+as one string can produce different token boundaries at the `\n` than tokenizing parts separately.
+Separate tokenization + concatenation guarantees the label boundary is always exact.
+
+---
+
+## Training Strategy — Full Fine-tuning
+
+**All components trainable**. With pruned ~300 vocab, the embedding
+layer is negligible (~0.3M params), allowing nearly all capacity for the decoder.
 
 | Component | Status | LR |
 |-----------|--------|-----|
-| Vision Encoder (4 ViT blocks) | **Trainable** | 5e-5 |
-| Token Embeddings | **Trainable** | 2e-5 |
-| Text Decoder (8 layers) | **Trainable** | 2e-5 |
-| GSA (2 blocks) | **Trainable** | 5e-5 |
-| RTI | **Trainable** | 5e-5 |
-| Number Head | **Trainable** | 5e-4 |
+| Vision Encoder (4 ViT blocks) | ✅ **Trainable** | 5e-5 |
+| Token Embeddings (248K, tied w/ LM Head) | ✅ **Trainable** | 1e-5 |
+| Text Decoder (8 layers × T_max=3) | ✅ **Trainable** | 1e-5 |
+| GSA (2 blocks) | ✅ **Trainable** | 5e-5 |
+| RTI | ✅ **Trainable** | 5e-5 |
+| Number Head | ✅ **Trainable** | 5e-4 |
 
-**Loss**: `L = L_CE + α·L_SmoothL1` (SmoothL1 active for distance + count samples)
+**Loss**: `L = (1/T) · Σ_t CE^(t)(label_smoothing=0.1) + α·L_SmoothL1` (α=0.1)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
-
-> **Batch size**: With ~0.42 GB model weights on 12GB RTX 3060, expect **batch size 8–16**
-> with FP16 mixed precision. This is a 4–8× improvement over the original 0.8B model.
-
----
-
-## Pruning Implementation Script
-
-Implementation: `model_micro/prune.py`
-
-Usage: `python model_micro/prune.py`
-Steps:
-1. Load original Qwen 3.5 0.8B weights
-2. Prune vision encoder: blocks [8,9,10,11] -> renumber [0,1,2,3]
-3. Prune decoder: layers [0,1,2,3,20,21,22,23] -> renumber [0..7]
-4. Prune vocabulary: use `micro_token_mapping.json` to slice embeddings [319, 1024]
-5. Add `[NUM]` token (random init)
-6. Save pruned checkpoint + updated config
 
 ---
 
 ## Visual Token Count at Different Resolutions
 
-| Input | ViT patches | Post-merger tokens | Fits 2048 ctx? |
+| Input | ViT patches | Post-merger tokens | Fits 512 ctx? |
 |-------|------------|-------------------|----------------|
-| 448×252 (450p-ish) | 28×16 = 448 | 112 | ✅ ~520 total |
-| 640×360 (360p) | 40×22 = 880 | 220 | ✅ ~630 total |
-| 800×450 (450p) | 50×28 = 1400 | 350 | ✅ ~760 total |
-| 960×540 (540p) | 60×34 = 2040 | 510 | ✅ ~920 total |
-| 1280×720 (720p) | 80×44 = 3520 | 880 | ⚠️ ~1290 total |
-| 1920×1080 (1080p) | 120×68 = 8160 | 2040 | ✗ Exceeds 2048 |
+| **512×320 (320p)** | **32×20 = 640** | **160** | ✅ **~260 total (default)** |
+| 640×384 (384p) | 40×24 = 960 | 240 | ✅ ~340 total |
+| 800×448 (450p) | 50×28 = 1400 | 350 | ✅ ~450 total |
+| 960×544 (540p) | 60×34 = 2040 | 510 | ✅ ~610 total |
+| 1280×720 (720p) | 80×44 = 3520 | 880 | ⚠️ ~980 total |
 
-> At 450p training resolution, total sequence length is ~520–760 tokens.
-> Context length of 2048 supports up to ~720p comfortably.
+> Default training resolution: **320p (512×320)** — 160 visual tokens.
+> Total sequence (visual + CoT text): ~230–290 tokens. Fits in 512.

@@ -1,24 +1,29 @@
 """
 MODULE: Full Pipeline — SpatialVLM Micro (Training)
 
-Architecture (211M total):
+Architecture (~216M total, ~216M trainable):
     1. Qwen 3.5 Vision Encoder (pruned: 4 ViT blocks, 44M)
        4 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
     2. GSA: Geometry Self-Attention — DFormerv2 Full_GSA CVPR 2025
        Position: after merger, before concat fusion (~16.9M)
     3. RTI: Region-Level Token Injection (batched) (~0.032M)
-       Each <mask> -> [mask_rgb | mask_depth] (2 tokens × 1024-dim)
+       Each <mask> -> [mask_rgb | mask_depth | space] (3 -> 3 tokens × 1024-dim)
     4. Concat Fusion: [visual_tokens | text+region_tokens]
-    5. Qwen 3.5 Backbone (pruned: 8 layers, 166M) — full fine-tuning
+    5. Qwen 3.5 Backbone (pruned: 4 layers, looped T_max=4× via LoopLM)
+       LoopLM: per-step LM head loss + exit gate + entropy regularization
+       Based on "Scaling Latent Reasoning via Looped Language Models" (Ouro)
     6. Dual Heads:
-       - LM Head (tied w/ embed): category + text answer
+       - LM Head (tied w/ embed, TRAINABLE): category + text answer (per-step)
        - Number Head (xVal): distance/count regression (~0.26M)
+    7. Exit Gate: Learned adaptive exit for each loop step (~1K)
 
-Output format:
-    left_right | "left"      -> LM Head only
-    mcq | "2"                -> LM Head only
-    distance | NUM          -> LM Head (category) + Number Head (value)
-    count | NUM             -> LM Head (category) + Number Head (value)
+<num> token ID read from config (set by prune.py).
+
+Output format (with chain-of-thought):
+    <think>GPT reasoning</think>left_right | "left"
+    <think>GPT reasoning</think>mcq | "2"
+    <think>GPT reasoning</think>distance | <num>
+    <think>GPT reasoning</think>count | <num>
 """
 
 import re
@@ -37,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_micro.gsa import GSA
 from model_micro.rti import RTE
+
 from model_micro.num_head import NumberHead
 
 # Default model path — pruned Micro checkpoint (from prune.py)
@@ -45,35 +51,23 @@ MODEL_NAME = os.path.join(
     "qwen3.5-micro"
 )
 
-# System Prompt
-SYSTEM_PROMPT = (
-    "You are a spatial reasoning assistant.\n"
-    "Your response MUST be exactly one line in this format:\n"
-    "CATEGORY | VALUE\n\n"
-    "CATEGORY must be exactly one of these four words:\n"
-    "  left_right\n"
-    "  mcq\n"
-    "  distance\n"
-    "  count\n\n"
-    "The separator ' | ' (space pipe space) is mandatory.\n\n"
-    "VALUE rules:\n"
-    '- left_right: "left" or "right" (with double quotes)\n'
-    '- mcq: "0", "1", "2", etc. (with double quotes)\n'
-    "- distance: NUM (the word NUM, Number Head predicts the value)\n"
-    "- count: NUM (the word NUM, Number Head predicts the value)\n\n"
-    "Examples:\n"
-    'left_right | "left"\n'
-    'mcq | "1"\n'
-    "distance | NUM\n"
-    "count | NUM\n\n"
-    "Output ONLY the category, pipe, and value. Nothing else."
-)
+# NUM_TOKEN_ID: <num> token ID read from config.json at module level (set by prune.py)
+# This must be available at import time for the dataloader
+def _read_num_token_id():
+    config_path = os.path.join(MODEL_NAME, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+        return cfg.get("num_token_id", 248044)
+    return 248044  # fallback for old checkpoints
+
+NUM_TOKEN_ID = _read_num_token_id()
 
 # Regex for structured output parsing
 # Format: category | answer
 _OUTPUT_RE = re.compile(
     r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'(?P<answer>"left"|"right"|"\d+"|NUM|\d+\.\d+|\d+)',
+    r'(?P<answer>"left"|"right"|"\d+"|<num>|\d+\.\d+|\d+)',
     re.IGNORECASE,
 )
 
@@ -81,25 +75,28 @@ _OUTPUT_RE = re.compile(
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
     """Find token positions of <mask> in input_ids.
     Handles BPE punctuation merging (e.g., '>' + ',' -> '>,').
+    Caches per tokenizer instance to avoid stale values.
     """
-    if not hasattr(find_mask_positions, '_cached'):
-        find_mask_positions._mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
-        find_mask_positions._lt_ids = set()
+    tok_id = id(tokenizer)
+    if not hasattr(find_mask_positions, '_cache'):
+        find_mask_positions._cache = {}
+    if tok_id not in find_mask_positions._cache:
+        mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
+        lt_ids = set()
         for test in [" <", "  <"]:
             enc = tokenizer.encode(test, add_special_tokens=False)
             if len(enc) == 1:
-                find_mask_positions._lt_ids.add(enc[0])
-        find_mask_positions._cached = True
+                lt_ids.add(enc[0])
+        find_mask_positions._cache[tok_id] = (mask_id, lt_ids)
 
-    mask_id = find_mask_positions._mask_id
-    lt_ids = find_mask_positions._lt_ids
+    mask_id, lt_ids = find_mask_positions._cache[tok_id]
 
     ids = input_ids[0].tolist() if input_ids.dim() == 2 else input_ids.tolist()
     positions = []
     i = 0
     while i < len(ids) - 2:
         if ids[i] in lt_ids and ids[i+1] == mask_id:
-            # Robust check: BPE merges '>' with punctuation (e.g., '>,')
+            # Robust check: BPE merges '>' with punctuation (e.g., '>,' )
             decoded_gt = tokenizer.decode([ids[i+2]])
             if decoded_gt.startswith(">"):
                 positions.append(i)
@@ -125,10 +122,17 @@ class SpatialVLM(nn.Module):
         self.region_token_extractor    - RegionTokenExtractor  (~0.032M)
         self.num_head                  - NumberHead (xVal)     (~0.26M)
 
+
     Qwen built-in (pruned):
         self.qwen.model.visual         - Vision Encoder + Merger (4 blocks)
-        self.qwen.model.language_model - 8-layer backbone
-        self.qwen.lm_head              - Tied vocab projection
+        self.qwen.model.language_model - 4-layer backbone (looped T_max×)
+        self.qwen.lm_head              - Vocab projection
+
+    LoopLM decoder (from Ouro paper, arXiv:2510.25741):
+        4 physical layers × T_max iterations = effective depth 16 (default)
+        Exit gate predicts per-step exit probability λ_t.
+        Training: per-step LM head loss weighted by exit distribution + entropy.
+        Inference: early exit when cumulative exit prob exceeds threshold q.
     """
 
     def __init__(
@@ -140,10 +144,40 @@ class SpatialVLM(nn.Module):
         dtype                          = torch.bfloat16,
         device_map:              str   = "auto",
         attn_implementation:     str   = "sdpa",
+        num_loops:               int   = None,  # None = read from config (T_max)
     ):
         super().__init__()
 
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+        # Read num_loops (T_max) from config (set by prune.py), or use default
+        if num_loops is None:
+            num_loops = getattr(config, 'num_loops', None)
+            if num_loops is None:
+                config_path = os.path.join(model_name, "config.json")
+                if os.path.exists(config_path):
+                    with open(config_path) as f:
+                        raw_config = json.load(f)
+                    num_loops = raw_config.get("num_loops", 4)
+                else:
+                    num_loops = 4
+        self.num_loops = num_loops  # T_max
+
+        # Read <num> token ID from config
+        num_token_id = getattr(config, 'num_token_id', None)
+        if num_token_id is None:
+            config_path = os.path.join(model_name, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    raw_config = json.load(f)
+                num_token_id = raw_config.get("num_token_id", 248044)
+            else:
+                num_token_id = 248044
+        self.num_token_id = num_token_id
+
+        # Update module-level for dataloader access
+        global NUM_TOKEN_ID
+        NUM_TOKEN_ID = self.num_token_id
 
         print(f"Loading {model_name}...")
         self.qwen = AutoModelForImageTextToText.from_pretrained(
@@ -172,8 +206,13 @@ class SpatialVLM(nn.Module):
         # Custom Module 2: RTI
         self.region_token_extractor = RTE(hidden_dim=1024)
 
-        # Custom Module 3: Number Head (NEW for Micro)
+        # Custom Module 3: Number Head
         self.num_head = NumberHead(hidden_dim=1024)
+
+
+
+        # Decoder dropout (applied after each backbone layer)
+        self.decoder_dropout = nn.Dropout(dropout)
 
         # Move custom modules to match Qwen device/dtype
         qwen_device = next(self.qwen.parameters()).device
@@ -185,55 +224,33 @@ class SpatialVLM(nn.Module):
         self.num_head = self.num_head.to(device=qwen_device, dtype=qwen_dtype)
         print(f"  Custom modules (GSA + RTI + NumHead) -> {qwen_device} ({qwen_dtype})")
 
-        # --- Token ID remapping (old Qwen IDs <-> pruned new IDs) ---
-        mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "micro_token_mapping.json")
-        with open(mapping_path, "r") as f:
-            mapping = json.load(f)
+        # --- Embeddings are TRAINABLE ---
+        embed = self.qwen.model.language_model.embed_tokens
+        embed.weight.requires_grad = True
+        print(f"  Embeddings: TRAINABLE ({embed.weight.shape[0]} tokens, requires_grad=True)")
+        print(f"  <num> token ID: {self.num_token_id}")
+        n_layers = len(list(self.qwen.model.language_model.layers))
+        print(f"  LoopLM: {n_layers} layers × T_max={self.num_loops} = max depth {n_layers * self.num_loops}")
 
-        kept_old_ids = mapping["kept_old_ids"]              # original Qwen IDs (including NUM=16968)
-        old_to_new   = mapping["old_to_new"]                # {"old_id_str": new_id}
-        total_vocab  = mapping["total_vocab"]                # N (all tokens including NUM)
-
-        # Build lookup: old_id -> new_id (size = max_old_id + 1)
-        max_old_id = max(kept_old_ids)
-        remap_old_to_new = torch.full((max_old_id + 1,), fill_value=0, dtype=torch.long)
-        for old_str, new_id in old_to_new.items():
-            remap_old_to_new[int(old_str)] = new_id
-        self.register_buffer("remap_old_to_new", remap_old_to_new)
-
-        # Build reverse: new_id -> old_id (size = total_vocab)
-        remap_new_to_old = torch.zeros(total_vocab, dtype=torch.long)
-        for old_str, new_id in old_to_new.items():
-            remap_new_to_old[new_id] = int(old_str)
-        self.register_buffer("remap_new_to_old", remap_new_to_old)
-
-        self.micro_vocab_size = total_vocab
-        print(f"  Token remapping: {len(kept_old_ids)} old IDs -> {total_vocab} new IDs")
+        # Cache space token embedding for RTI 3 -> 3 injection
+        # Try several encodings since BPE may handle whitespace differently
+        self._space_token_id = None
+        for test_str in [" ", "  ", " .", ". "]:
+            ids = self.processor.tokenizer.encode(test_str, add_special_tokens=False)
+            if ids:
+                self._space_token_id = ids[0]
+                break
+        if self._space_token_id is None:
+            # Fallback: use token ID 0 (usually a byte token)
+            self._space_token_id = 0
+            print(f"  [WARN] Could not find space token, using ID 0 as fallback")
+        else:
+            decoded = self.processor.tokenizer.decode([self._space_token_id])
+            print(f"  Space token ID: {self._space_token_id} -> '{decoded}'")
 
     @property
     def device(self):
         return next(self.qwen.parameters()).device
-
-    # ---- Token ID remapping ----
-
-    def remap_to_new(self, ids: torch.Tensor) -> torch.Tensor:
-        """Remap original Qwen token IDs -> pruned new IDs [0..318].
-
-        IDs beyond the remap table are mapped to 0 (safe fallback).
-        Labels with value -100 are preserved.
-        """
-        lut = self.remap_old_to_new.to(ids.device)
-        mask_ignore = ids == -100
-        safe_ids = ids.clamp(0, lut.shape[0] - 1)
-        new_ids = lut[safe_ids]
-        new_ids[mask_ignore] = -100
-        return new_ids
-
-    def remap_to_old(self, ids: torch.Tensor) -> torch.Tensor:
-        """Remap pruned new IDs [0..318] -> original Qwen IDs (for tokenizer decode)."""
-        lut = self.remap_new_to_old.to(ids.device)
-        safe_ids = ids.clamp(0, lut.shape[0] - 1)
-        return lut[safe_ids]
 
     # ---- Vision Encoder ----
 
@@ -313,10 +330,11 @@ class SpatialVLM(nn.Module):
     ) -> tuple:
         """Build [B, T, 1024] inputs_embeds for the backbone.
 
+        RTI uses 3 -> 3 replacement: sequence length is UNCHANGED.
+
         Returns:
             inputs_embeds: [B, T, 1024]
             n_visual:      int (number of visual tokens)
-            text_lengths:  list[int] (actual text length per sample after RTI)
         """
         # Step 1: Vision Encoder + Merger -> [B, N, 1024]
         visual_tokens = self._get_visual_tokens(
@@ -334,15 +352,11 @@ class SpatialVLM(nn.Module):
             visual_tokens, depth_maps, h_patches=h_vis, w_patches=w_vis
         )
 
-        # Step 3: Text embeddings (remap old IDs -> new IDs for pruned vocab)
+        # Step 3: Text embeddings (direct — pruned vocab, trainable)
         embed = self.qwen.model.language_model.embed_tokens
-        new_ids = self.remap_to_new(input_ids)
-        text_embeds = embed(new_ids)  # [B, L, 1024]
+        text_embeds = embed(input_ids)  # [B, L, 1024]
 
-        # Step 4: RTI - inject region tokens at <mask> positions
-        text_lengths = [input_ids.shape[1]] * input_ids.shape[0]  # default
-        mask_token_len = 0  # 0 = no RTI happened
-
+        # Step 4: RTI - inject region tokens at <mask> positions (3 -> 3)
         if (rle_list is not None and mask_token_positions is not None
                 and any(len(rl) > 0 for rl in rle_list)):
             region_tokens = self.region_token_extractor(
@@ -352,78 +366,43 @@ class SpatialVLM(nn.Module):
             mask_token_len = len(self.processor.tokenizer.encode(
                 "<mask>", add_special_tokens=False
             ))
-            text_embeds, text_lengths = self.region_token_extractor.inject_into_text_embeds(
+
+            # Get space embedding for 3 -> 3 RTI padding
+            space_embed = embed(
+                torch.tensor([self._space_token_id], device=embed.weight.device)
+            ).squeeze(0).detach()  # [1024] detached (frozen space token)
+
+            text_embeds = self.region_token_extractor.inject_into_text_embeds(
                 text_embeds, mask_token_positions, region_tokens,
-                mask_token_len=mask_token_len,
+                mask_token_len=mask_token_len, space_embed=space_embed,
             )
 
         # Step 5: Concat Fusion -- [visual | text+region]
         inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
 
-        return inputs_embeds, n_visual, text_lengths, mask_token_len
+        return inputs_embeds, n_visual
 
-    # ---- Backbone forward ----
+    # ---- Backbone: single loop step ----
 
-    def _backbone_forward(
+    def _run_one_loop(
         self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor = None,
+        hidden: torch.Tensor,
+        lm,
+        position_ids: torch.Tensor,
+        position_embeddings,
+        causal_mask,
+        linear_mask,
         past_key_values=None,
         cache_position: torch.Tensor = None,
         use_gradient_checkpointing: bool = False,
-    ):
-        """Run backbone layers on inputs_embeds -> [B, T, 1024].
-
-        Args:
-            attention_mask: [B, T] with 1 for real tokens, 0 for padding.
-                If None, all tokens are treated as real (no padding).
-            past_key_values: Qwen3_5DynamicCache for KV-cache.
-            cache_position: position indices for cache.
-        """
-        B, seq_len, _ = inputs_embeds.shape
-        lm = self.qwen.model.language_model
-
-        if cache_position is not None:
-            position_ids = cache_position.unsqueeze(0).expand(B, -1)
-        else:
-            position_ids = torch.arange(
-                seq_len, device=inputs_embeds.device
-            ).unsqueeze(0).expand(B, -1)
-
-        position_embeddings = None
-        if hasattr(lm, "rotary_emb"):
-            position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
-
-        # Build per-layer-type masks from the 2D attention_mask
-        # Mirrors Qwen3_5TextModel.forward() logic:
-        #   full_attention -> 4D causal mask (causal + padding)
-        #   linear_attention -> 2D mask (zeros out padding hidden states)
-        causal_mask = None
-        linear_mask = None
-
-        if attention_mask is not None:
-            # Full attention: 4D causal mask via transformers utility
-            causal_mask = create_causal_mask(
-                config=lm.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position if cache_position is not None
-                    else torch.arange(seq_len, device=inputs_embeds.device),
-                past_key_values=past_key_values,
-            )
-
-            # Linear attention: 2D boolean mask (used by apply_mask_to_padding_states)
-            # Not needed when: (1) cached decode step, or (2) no padding exists
-            if cache_position is not None and cache_position[0] > 0:
-                linear_mask = None  # cached decode step
-            elif torch.all(attention_mask == 1):
-                linear_mask = None  # no padding
-            else:
-                linear_mask = attention_mask
-
-        hidden = inputs_embeds
+        loop_offset: int = 0,
+    ) -> torch.Tensor:
+        """Run one iteration of the N physical layers."""
         for layer in lm.layers:
-            # Pick mask type based on layer architecture
+            orig_idx = getattr(layer, "layer_idx", None)
+            if orig_idx is not None and past_key_values is not None:
+                layer.layer_idx = orig_idx + loop_offset
+
             if hasattr(layer, 'layer_type'):
                 layer_mask = linear_mask if layer.layer_type == "linear_attention" else causal_mask
             else:
@@ -454,10 +433,83 @@ class SpatialVLM(nn.Module):
                     layer_out = layer(hidden)
                 hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
+            if orig_idx is not None and past_key_values is not None:
+                layer.layer_idx = orig_idx
+
+            hidden = self.decoder_dropout(hidden)
+
         return hidden
 
+    # ---- Backbone forward (LoopLM) ----
 
-    # ---- Forward ----
+    def _backbone_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        past_key_values=None,
+        cache_position: torch.Tensor = None,
+        use_gradient_checkpointing: bool = False,
+    ):
+        """Run LoopLM backbone: N layers × T_max loop steps.
+
+        Returns:
+            hidden_per_step: list of T_max tensors [B, T, D] — hidden states
+                             after each loop step (before final norm).
+            exit_lambdas:    list of T_max tensors [B] — per-step exit probs.
+        """
+        B, seq_len, _ = inputs_embeds.shape
+        lm = self.qwen.model.language_model
+
+        if cache_position is not None:
+            position_ids = cache_position.unsqueeze(0).expand(B, -1)
+        else:
+            position_ids = torch.arange(
+                seq_len, device=inputs_embeds.device
+            ).unsqueeze(0).expand(B, -1)
+
+        position_embeddings = None
+        if hasattr(lm, "rotary_emb"):
+            position_embeddings = lm.rotary_emb(inputs_embeds, position_ids)
+
+        causal_mask = None
+        linear_mask = None
+
+        if attention_mask is not None:
+            causal_mask = create_causal_mask(
+                config=lm.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position if cache_position is not None
+                    else torch.arange(seq_len, device=inputs_embeds.device),
+                past_key_values=past_key_values,
+            )
+
+            if cache_position is not None and cache_position[0] > 0:
+                linear_mask = None
+            elif torch.all(attention_mask == 1):
+                linear_mask = None
+            else:
+                linear_mask = attention_mask
+
+        hidden = inputs_embeds
+        hidden_per_step = []
+
+        # === LoopLM: apply N layers × T_max times ===
+        for loop_idx in range(self.num_loops):
+            hidden = self._run_one_loop(
+                hidden, lm, position_ids, position_embeddings,
+                causal_mask, linear_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                loop_offset=loop_idx * len(lm.layers),
+            )
+            hidden_per_step.append(hidden)
+
+        return hidden_per_step
+
+
+    # ---- Forward (training) ----
 
     def forward(
         self,
@@ -468,86 +520,72 @@ class SpatialVLM(nn.Module):
         rle_list:             list = None,    # [B][num_masks]
         mask_token_positions: list = None,    # [B][num_masks]
         decoded_masks:        list = None,    # [B][num_masks]
-        num_token_positions:  list = None,    # [B] position of NUM in input_ids
+        num_token_positions:  list = None,    # [B] position of <num> in input_ids
         attention_mask:       torch.Tensor = None,  # [B, L]
         use_gradient_checkpointing: bool = False,
         vision_requires_grad: bool = False,
     ) -> dict:
-        """Training forward pass.
+        """Training forward pass with LoopLM per-step outputs.
 
         Returns:
             dict with:
-                'logits':   [B, L', vocab_size] — text-only logits (aligned with labels)
-                'num_pred': [B] — Number Head predictions (0 for non-numeric samples)
+                'logits_per_step': list of T_max tensors [B, L, V] — text logits per loop
+                'num_pred':        [B] — Number Head predictions (from final step)
         """
-        inputs_embeds, n_visual, text_lengths, mask_token_len = self._build_inputs_embeds(
+        inputs_embeds, n_visual = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
             vision_requires_grad=vision_requires_grad,
         )
 
         # Build full attention_mask: [B, n_visual + text_len]
-        # Visual tokens are always real (all 1s), text part uses the passed mask.
         full_attention_mask = None
         if attention_mask is not None:
             B_mask = attention_mask.shape[0]
-            # RTI changes text length: each <mask> (mask_token_len tokens) -> 2 tokens
-            # Compute actual text length after RTI injection
-            actual_text_len = inputs_embeds.shape[1] - n_visual
-            # Visual tokens: always attend (all 1s)
             vis_mask = torch.ones(B_mask, n_visual, dtype=attention_mask.dtype,
                                   device=attention_mask.device)
-            # Text mask: trim or pad to match actual text length after RTI
-            if attention_mask.shape[1] >= actual_text_len:
-                text_mask = attention_mask[:, :actual_text_len]
-            else:
-                text_mask = F.pad(attention_mask, (0, actual_text_len - attention_mask.shape[1]), value=0)
-            full_attention_mask = torch.cat([vis_mask, text_mask], dim=1)
+            full_attention_mask = torch.cat([vis_mask, attention_mask], dim=1)
 
-        # Backbone -- full sequence (visual + text)
-        hidden = self._backbone_forward(
+        # Backbone -- LoopLM: per-step hidden states (always T_max steps)
+        hidden_per_step = self._backbone_forward(
             inputs_embeds,
             attention_mask=full_attention_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
         )
-        hidden = self.qwen.model.language_model.norm(hidden)
 
-        # LM Head -- only on text tokens (visual tokens have no labels)
-        text_hidden = hidden[:, n_visual:, :]
-        logits = self.qwen.lm_head(text_hidden)
+        # Per-step LM logits (only on text tokens)
+        lm_norm = self.qwen.model.language_model.norm
+        logits_per_step = []
+        for h in hidden_per_step:
+            h_normed = lm_norm(h)
+            text_h = h_normed[:, n_visual:, :]
+            logits_per_step.append(self.qwen.lm_head(text_h))
 
-        # Number Head -- extract hidden states at NUM positions
-        # IMPORTANT: RTI changes sequence length. Each <mask> (3 tokens)
-        # is replaced by 2 RTI tokens, shrinking the text by (3 - 2) = 1 per mask.
-        # Must adjust NUM positions.
+        # Number Head -- uses FINAL step hidden state
+        final_hidden = lm_norm(hidden_per_step[-1])
         B = input_ids.shape[0]
-        num_pred = torch.zeros(B, device=hidden.device, dtype=hidden.dtype)
+        num_pred = torch.zeros(B, device=final_hidden.device, dtype=final_hidden.dtype)
 
         if num_token_positions is not None:
             num_hidden_list = []
             num_indices = []
             for b, pos in enumerate(num_token_positions):
                 if pos is not None and pos >= 0:
-                    # Count masks BEFORE this NUM position to compute offset
-                    if mask_token_len > 0 and mask_token_positions is not None and b < len(mask_token_positions):
-                        masks_before = sum(1 for mp in mask_token_positions[b] if mp < pos)
-                        # Each mask: mask_token_len -> 2 tokens (net: -(mask_token_len-2))
-                        rti_offset = masks_before * (mask_token_len - 2)
-                    else:
-                        rti_offset = 0
-
-                    adjusted_pos = n_visual + pos - rti_offset
-                    if 0 <= adjusted_pos < hidden.shape[1]:
-                        num_hidden_list.append(hidden[b, adjusted_pos, :])
+                    adjusted_pos = n_visual + pos
+                    if 0 <= adjusted_pos < final_hidden.shape[1]:
+                        num_hidden_list.append(final_hidden[b, adjusted_pos, :])
                         num_indices.append(b)
 
             if num_hidden_list:
-                h_num = torch.stack(num_hidden_list, dim=0)  # [K, 1024]
-                preds = self.num_head(h_num)                  # [K]
+                h_num = torch.stack(num_hidden_list, dim=0)
+                preds = self.num_head(h_num)
                 for k, b in enumerate(num_indices):
                     num_pred[b] = preds[k]
 
-        return {"logits": logits, "num_pred": num_pred}
+        return {
+            "logits_per_step": logits_per_step,
+            "num_pred": num_pred,
+        }
 
     # ---- Generate (inference) ----
 
@@ -560,20 +598,26 @@ class SpatialVLM(nn.Module):
         input_ids:            torch.Tensor,
         rle_list:             list = None,
         mask_token_positions: list = None,
-        max_new_tokens:       int  = 80,
+        max_new_tokens:       int  = 150,
         do_sample:            bool = False,
         temperature:          float = 1.0,
+        repetition_penalty:   float = 1.2,
         decoded_masks:        list = None,
         **gen_kwargs,
     ) -> torch.Tensor:
-        """Autoregressive generation with KV-cache.
+        """Autoregressive generation with LoopLM (always T_max loops).
 
+        At each token generation step, the backbone loops T_max times.
+        Uses the FINAL loop step's logits for token selection.
+
+        Args:
+            repetition_penalty: Penalize repeated tokens. >1.0 reduces repetition.
         Returns:
             output_ids: [B, generated_len] newly generated token ids
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
-        inputs_embeds, n_visual, text_lengths, _ = self._build_inputs_embeds(
+        inputs_embeds, n_visual = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
         )
@@ -583,27 +627,27 @@ class SpatialVLM(nn.Module):
         B, T, _ = inputs_embeds.shape
         dev = inputs_embeds.device
 
-        # Remap eos_id to new vocab space
-        eos_id_old = self.processor.tokenizer.eos_token_id
-        if eos_id_old is not None and eos_id_old < self.remap_old_to_new.shape[0]:
-            eos_id_new = self.remap_old_to_new[eos_id_old].item()
-        else:
-            eos_id_new = None
-
+        eos_id = self.processor.tokenizer.eos_token_id
         cache = Qwen3_5DynamicCache(config=lm.config)
-
-        # Build attention_mask for prefill (no padding in inference, batch_size=1)
-        # All tokens are real during generation
         attn_mask = torch.ones(B, T, dtype=torch.long, device=dev)
 
-        # Prefill
+        # Prefill — run full T_max loops
         cache_position = torch.arange(T, device=dev)
-        hidden = self._backbone_forward(
+        hidden_per_step = self._backbone_forward(
             inputs_embeds, attention_mask=attn_mask,
             past_key_values=cache, cache_position=cache_position,
         )
-        hidden = lm.norm(hidden[:, -1:, :])
+        # Use final step for first token
+        hidden = lm.norm(hidden_per_step[-1][:, -1:, :])
         logits = self.qwen.lm_head(hidden)
+
+        if repetition_penalty != 1.0:
+            for b in range(B):
+                for tok_id in input_ids[b].unique():
+                    if logits[b, -1, tok_id] > 0:
+                        logits[b, -1, tok_id] /= repetition_penalty
+                    else:
+                        logits[b, -1, tok_id] *= repetition_penalty
 
         if do_sample and temperature > 0:
             probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
@@ -611,19 +655,31 @@ class SpatialVLM(nn.Module):
         else:
             next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
-        generated = [next_tok]  # new IDs
+        generated = [next_tok]
+        all_generated = next_tok.clone()
 
-        # Decode
+        # Decode with LoopLM early exit
         for step in range(max_new_tokens - 1):
-            if eos_id_new is not None and (next_tok == eos_id_new).all():
+            if eos_id is not None and (next_tok == eos_id).all():
                 break
 
-            tok_embed = embed(next_tok)  # next_tok is already in new ID space
+            tok_embed = embed(next_tok)
             step_cache_pos = torch.tensor([T + step], device=dev)
 
-            hidden = self._backbone_forward(tok_embed, past_key_values=cache, cache_position=step_cache_pos)
-            hidden = lm.norm(hidden)
+            # LoopLM decode: always run full T_max loops
+            hidden_per_step = self._backbone_forward(
+                tok_embed, past_key_values=cache, cache_position=step_cache_pos,
+            )
+            hidden = lm.norm(hidden_per_step[-1])
             logits = self.qwen.lm_head(hidden)
+
+            if repetition_penalty != 1.0:
+                for b in range(B):
+                    for tok_id in all_generated[b].unique():
+                        if logits[b, -1, tok_id] > 0:
+                            logits[b, -1, tok_id] /= repetition_penalty
+                        else:
+                            logits[b, -1, tok_id] *= repetition_penalty
 
             if do_sample and temperature > 0:
                 probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
@@ -632,11 +688,10 @@ class SpatialVLM(nn.Module):
                 next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
             generated.append(next_tok)
+            all_generated = torch.cat([all_generated, next_tok], dim=1)
 
-        # Remap generated tokens back to old IDs for tokenizer decode
-        output_new = torch.cat(generated, dim=1)  # [B, gen_len] in new ID space
-        output_old = self.remap_to_old(output_new) # [B, gen_len] in old ID space
-        return output_old
+        output_ids = torch.cat(generated, dim=1)  # [B, gen_len]
+        return output_ids
 
     # ---- Output parsing ----
 
@@ -644,9 +699,12 @@ class SpatialVLM(nn.Module):
     def parse_output(text: str) -> dict:
         """Parse structured LM output -> {category, answer}.
 
-        Expected format: category | value
+        Expected format: <think>reasoning</think>category | value
+        Strips <think>...</think> before parsing.
         """
-        m = _OUTPUT_RE.search(text)
+        # Strip chain-of-thought reasoning
+        clean = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+        m = _OUTPUT_RE.search(clean)
         if m:
             category = m.group("category").strip().lower()
             answer   = m.group("answer").strip()
@@ -662,26 +720,23 @@ class SpatialVLM(nn.Module):
         question: str,
         depth_map: torch.Tensor,        # [H, W] raw depth tensor
         rle_list: list = None,
-        max_new_tokens: int = 30,
+        max_new_tokens: int = 150,
     ) -> dict:
         """Single-shot inference: image + question -> {category, answer, raw}."""
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": [
-                {"type": "image", "image": image},
-                {"type": "text",  "text": question},
-            ]},
-        ]
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = self.processor(text=[text], images=[image], return_tensors="pt")
-
+        # Tokenize question directly — no chat template, no system prompt
         dev   = self.device
         dtype = next(self.qwen.parameters()).dtype
-        pixel_values   = inputs["pixel_values"].to(device=dev, dtype=dtype)
-        image_grid_thw = inputs["image_grid_thw"].to(device=dev)
-        input_ids      = inputs["input_ids"].to(device=dev)
+
+        input_ids = self.processor.tokenizer(
+            question, return_tensors="pt", padding=False
+        ).input_ids.to(dev)
+
+        # Process image separately
+        image_inputs = self.processor.image_processor(
+            images=image, return_tensors="pt"
+        )
+        pixel_values   = image_inputs["pixel_values"].to(device=dev, dtype=dtype)
+        image_grid_thw = image_inputs["image_grid_thw"].to(device=dev)
         depth_batch    = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
 
         # Auto-find <mask> positions
@@ -704,8 +759,8 @@ class SpatialVLM(nn.Module):
             max_new_tokens=max_new_tokens,
         )
         raw_output = self.processor.tokenizer.decode(
-            output_ids[0], skip_special_tokens=True
-        ).strip()
+            output_ids[0], skip_special_tokens=False
+        ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
 
         parsed = self.parse_output(raw_output)
 
@@ -766,10 +821,10 @@ if __name__ == "__main__":
 
     components = {
         "Qwen Visual (encoder+merger)":    pipeline.qwen.model.visual,
-        "Qwen Embeddings (tied->LM Head)": pipeline.qwen.model.language_model.embed_tokens,
-        "Qwen Backbone (8 layers)":        pipeline.qwen.model.language_model.layers,
+        "Qwen Embeddings (+ LM Head)":     pipeline.qwen.model.language_model.embed_tokens,
+        "Qwen Backbone (layers)":          pipeline.qwen.model.language_model.layers,
         "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
-        "Qwen LM Head (tied->Embeddings)": pipeline.qwen.lm_head,
+        "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
         "GSA (DFormerv2 Full_GSA x2)":     pipeline.gsa,
         "RTI (Region Token Injector)":     pipeline.region_token_extractor,
         "Number Head (xVal regression)":   pipeline.num_head,
@@ -779,7 +834,7 @@ if __name__ == "__main__":
         "RTI (Region Token Injector)",
         "Number Head (xVal regression)",
     }
-    tied_names = {"Qwen LM Head (tied->Embeddings)"}
+    tied_names = {"Qwen LM Head (tied->Embed)"}
 
     total_custom, total_qwen = 0, 0
     for name, module in components.items():
@@ -798,10 +853,11 @@ if __name__ == "__main__":
     print(f"  Qwen Micro:       {total_qwen:>12,} ({total_qwen/1e6:.4f}M)")
     print(f"  Custom modules:   {total_custom:>12,} ({total_custom/1e6:.4f}M)")
     print(f"  Total unique:     {total_qwen + total_custom:>12,} ({(total_qwen + total_custom)/1e6:.4f}M)")
-    print(f"\n  Micro vocab: {pipeline.micro_vocab_size} (embed: {pipeline.qwen.model.language_model.embed_tokens.weight.shape})")
-    print(f"  Tokenizer vocab: {pipeline.processor.tokenizer.vocab_size} (original Qwen, used for encode/decode)")
-    print(f"  Decoder layers: {len(list(pipeline.qwen.model.language_model.layers))}")
+    print(f"\n  Vocab: {pipeline.qwen.model.language_model.embed_tokens.weight.shape[0]} (TRAINABLE)")
+    print(f"  <num> token ID: {pipeline.num_token_id}")
+    print(f"  Trainable params: {sum(p.numel() for p in pipeline.parameters() if p.requires_grad)/1e6:.2f}M")
+    n_layers = len(list(pipeline.qwen.model.language_model.layers))
+    print(f"  LoopLM: {n_layers} layers × T_max={pipeline.num_loops} = max depth {n_layers * pipeline.num_loops}")
     print(f"  ViT blocks: {len(list(pipeline.qwen.model.visual.blocks))}")
 
     print_vram_usage("final")
-

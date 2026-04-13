@@ -259,42 +259,35 @@ class RTE(nn.Module):
         text_embeds:    torch.Tensor,                # [B, L, 1024]
         mask_positions: List[List[int]],             # [B][num_masks_b] sorted <mask> start indices
         region_tokens:  List[List[Tuple[torch.Tensor, torch.Tensor]]],
-        mask_token_len: int = 1,
-    ) -> torch.Tensor:                               # [B, L', 1024]  (L' may differ per sample)
-        """Replace each <mask> token sequence with [mask_rgb, mask_depth].
+        mask_token_len: int = 3,                     # <mask> = 3 tokens: < mask >
+        space_embed:    torch.Tensor = None,         # [D] frozen embedding of " " token
+    ) -> torch.Tensor:                               # [B, L, 1024]  (same length!)
+        """Replace each <mask> (3 tokens) with [mask_rgb, mask_depth, space_embed].
 
-        For batched operation, processes each sample independently and pads
-        to the maximum output length in the batch.
+        3 -> 3 replacement: sequence length is UNCHANGED. No padding needed.
+
+        Args:
+            text_embeds:    [B, L, D] text token embeddings
+            mask_positions: [B][num_masks] positions of <mask> starts
+            region_tokens:  [B][num_masks] (mask_rgb, mask_depth) pairs
+            mask_token_len: number of tokens per <mask> (always 3: < mask >)
+            space_embed:    [D] embedding of space " " token (3rd replacement token)
 
         Returns:
-            embeds: [B, max_L', 1024] — padded output
+            embeds: [B, L, D] — same shape as input (3 -> 3 preserves length)
         """
         B, L, D = text_embeds.shape
-        all_sequences = []
 
         for b in range(B):
             positions = mask_positions[b]
             tokens = region_tokens[b]
 
-            segments, prev = [], 0
             for pos, (rgb, dep) in zip(positions, tokens):
-                if pos > prev:
-                    segments.append(text_embeds[b:b+1, prev:pos, :])
-                segments.append(rgb.unsqueeze(1))      # [1, 1, D]
-                segments.append(dep.unsqueeze(1))      # [1, 1, D]
-                prev = pos + mask_token_len
-            if prev < L:
-                segments.append(text_embeds[b:b+1, prev:, :])
+                # Replace 3 tokens in-place: [<, mask, >] -> [mask_rgb, mask_depth, space]
+                if pos + mask_token_len <= L:
+                    text_embeds[b, pos,     :] = rgb.squeeze(0)      # mask_rgb  [1024]
+                    text_embeds[b, pos + 1, :] = dep.squeeze(0)      # mask_depth [1024]
+                    if space_embed is not None:
+                        text_embeds[b, pos + 2, :] = space_embed     # space " " [1024]
 
-            all_sequences.append(torch.cat(segments, dim=1))  # [1, L'_b, D]
-
-        # Pad all to max length
-        max_len = max(seq.shape[1] for seq in all_sequences)
-        padded = torch.zeros(B, max_len, D, device=text_embeds.device, dtype=text_embeds.dtype)
-        output_lengths = []
-        for b, seq in enumerate(all_sequences):
-            L_b = seq.shape[1]
-            padded[b, :L_b, :] = seq[0]
-            output_lengths.append(L_b)
-
-        return padded, output_lengths
+        return text_embeds

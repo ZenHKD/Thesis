@@ -1,19 +1,20 @@
 """
-SpatialVLM Micro — Combined Loss: CE (text) + SmoothL1 (numeric)
-=============================================================
+SpatialVLM Micro — Uniform Per-Step CE + SmoothL1
+============================================================================
 
-L = L_CE + α · L_SmoothL1
+Training loss (single-stage):
 
-L_CE:  Standard autoregressive CrossEntropy on structured text targets.
-       Active on ALL samples (category tokens + answer tokens).
-       Ignores prompt tokens (masked as -100).
+    L = (1/T) · Σ_t CE^(t) + α · L_SmoothL1
+
+Where:
+    - CE^(t):  Per-step cross-entropy at loop step t
+    - T:       Number of loop steps (T_max = 4)
+    - α:       Weight for SmoothL1 (Number Head) loss
+
+All loop steps receive equal gradient weight (simple LoopLM).
 
 L_SmoothL1: SmoothL1 (Huber) loss on Number Head predictions.
        Active only for numeric samples (distance + count).
-       Bounded gradients (max 1.0) — eliminates spikes from large targets.
-
-The RTI injection changes sequence length (each <mask> becomes 2 tokens
-instead of 3).
 """
 
 import torch
@@ -22,65 +23,83 @@ import torch.nn.functional as F
 
 
 class SpatialLoss(nn.Module):
-    """Combined CE (text) + SmoothL1 (numeric) loss for SpatialVLM Micro.
+    """Uniform-weighted LoopLM loss for SpatialVLM Micro.
+
+    Combines:
+        1. Uniform-averaged per-step CE loss across all loop steps
+        2. SmoothL1 loss for numeric regression (Number Head)
 
     Args:
-        alpha:        Weight for SmoothL1 loss relative to CE loss.
-        ignore_index: Token index to ignore in CE loss (default: -100).
-        remap_fn:     Optional callable to remap label IDs (old -> new vocab).
-                      Pass pipeline.remap_to_new for pruned vocab models.
+        alpha:           Weight for SmoothL1 loss relative to CE loss.
+        ignore_index:    Token index to ignore in CE loss (default: -100).
+        label_smoothing: Label smoothing for CE loss (default: 0.1).
     """
 
-    def __init__(self, alpha: float = 1.0, ignore_index: int = -100,
-                 remap_fn=None):
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        ignore_index: int = -100,
+        label_smoothing: float = 0.1,
+    ):
         super().__init__()
         self.alpha = alpha
         self.ignore_index = ignore_index
-        self.remap_fn = remap_fn
+        self.label_smoothing = label_smoothing
+
+    def _per_step_ce(
+        self,
+        logits: torch.Tensor,   # [B, L, V]
+        targets: torch.Tensor,  # [B, L]
+    ) -> torch.Tensor:
+        """Compute CE loss for a single loop step.
+
+        Returns:
+            Scalar CE loss (averaged over non-ignored tokens).
+        """
+        # Shift: logits[t] predicts targets[t+1]
+        shift_logits = logits[:, :-1, :].contiguous().float()
+        shift_labels = targets[:, 1:].contiguous()
+
+        if (shift_labels != self.ignore_index).sum() == 0:
+            return shift_logits.sum() * 0.0
+
+        return F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=self.ignore_index,
+            label_smoothing=self.label_smoothing,
+        )
 
     def forward(
         self,
-        lm_logits:  torch.Tensor,   # [B, L, V] — LM Head output (V=319)
-        lm_targets: torch.Tensor,   # [B, L']   — token targets (old IDs, -100 for prompt)
-        num_pred:   torch.Tensor,   # [B]       — Number Head output
-        num_gt:     torch.Tensor,   # [B]       — ground truth number (distance or count)
-        is_numeric: torch.Tensor,   # [B]       — boolean mask for numeric samples
-        return_components: bool = False,  # if True, return (total, dict of components)
+        logits_per_step: list[torch.Tensor],  # T_max × [B, L, V]
+        lm_targets:      torch.Tensor,         # [B, L]
+        num_pred:        torch.Tensor,         # [B]
+        num_gt:          torch.Tensor,         # [B]
+        is_numeric:      torch.Tensor,         # [B]
+        return_components: bool = False,
     ) -> torch.Tensor:
-        """
+        """Compute uniform-weighted LoopLM training loss.
+
+        L = (1/T) · Σ_t CE^(t) + α · L_SmoothL1
+
         Returns:
-            Scalar loss = L_CE + α · L_SmoothL1
-            If return_components=True: (total_loss, {'ce': ..., 'sl1': ...})
+            Scalar loss (or tuple with component dict if return_components=True).
         """
-        # --- Remap labels: old Qwen IDs -> new pruned IDs [0..318] ---
-        if self.remap_fn is not None:
-            lm_targets = self.remap_fn(lm_targets)
+        T_max = len(logits_per_step)
 
-        # --- Align labels with logits (RTI changes sequence length) ---
-        if lm_targets.shape[1] > lm_logits.shape[1]:
-            lm_targets = lm_targets[:, -lm_logits.shape[1]:]
-        elif lm_targets.shape[1] < lm_logits.shape[1]:
-            lm_targets = torch.nn.functional.pad(
-                lm_targets, (0, lm_logits.shape[1] - lm_targets.shape[1]), 
-                value=self.ignore_index
-            )
+        # --- 1. Per-step CE losses ---
+        ce_per_step = []
+        for t in range(T_max):
+            ce_t = self._per_step_ce(logits_per_step[t], lm_targets)
+            ce_per_step.append(ce_t)
 
-        # --- CE Loss: shift logits[t] predicts targets[t+1] ---
-        # Upcast to float32 for numerical stability (bfloat16 backward can fail)
-        shift_logits = lm_logits[:, :-1, :].contiguous().float()
-        shift_labels = lm_targets[:, 1:].contiguous()
+        ce_stack = torch.stack(ce_per_step)  # [T_max]
 
-        # Guard: return zero if all tokens are ignored (avoids NaN)
-        if (shift_labels != self.ignore_index).sum() == 0:
-            loss_ce = shift_logits.sum() * 0.0
-        else:
-            loss_ce = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=self.ignore_index,
-            )
+        # --- 2. Uniform-weighted CE: (1/T) · Σ_t CE^(t) ---
+        loss_ce = ce_stack.mean()
 
-        # --- SmoothL1 Loss: only on numeric samples (distance + count) ---
+        # --- 3. SmoothL1 loss (Number Head) ---
         if is_numeric.any():
             loss_sl1 = F.smooth_l1_loss(
                 num_pred[is_numeric].float(),
@@ -88,11 +107,14 @@ class SpatialLoss(nn.Module):
                 beta=1.0,
             )
         else:
-            loss_sl1 = torch.tensor(0.0, device=lm_logits.device)
+            loss_sl1 = torch.tensor(0.0, device=lm_targets.device)
 
         total = loss_ce + self.alpha * loss_sl1
 
         if return_components:
-            return total, {'ce': loss_ce.item(), 'sl1': loss_sl1.item()}
+            return total, {
+                'ce': loss_ce.item(),
+                'sl1': loss_sl1.item(),
+                'ce_per_step': ce_stack.detach().cpu().tolist(),
+            }
         return total
-
