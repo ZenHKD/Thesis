@@ -4,14 +4,15 @@ SpatialVLM Micro Training — Full Fine-tuning
 
 All components trainable from epoch 1:
     - Vision Encoder (4 ViT blocks)       lr=5e-5
-    - Token Embeddings + LM Head (tied)   lr=2e-5
-    - Text Decoder (8 layers)             lr=2e-5
+    - Token Embeddings + LM Head (tied)   lr=2e-5  (TRAINABLE, full vocab)
+    - Text Decoder (4 layers × N loops)   lr=2e-5
     - GSA (DFormerv2 Full_GSA x2)         lr=5e-5
     - RTI (Region Token Injector)         lr=5e-5
+    - Exit Gate (LoopLM)                  lr=5e-4
     - Number Head (xVal regression)       lr=5e-4
 
-Loss:   L = L_CE + α · L_SmoothL1
-        CE on structured text targets (category | answer)
+Loss:   L = Σ_t p(t)·CE^(t) - β·H(p) + α·L_SmoothL1
+        (LoopLM: per-step CE weighted by exit distribution + entropy bonus)
         SmoothL1 on Number Head output for distance + count samples
 
 Usage:
@@ -100,21 +101,20 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
     parser.add_argument("--split",       default="train", choices=["train", "train_sample"])
-    parser.add_argument("--epochs",      type=int,   default=10)
+    parser.add_argument("--epochs",      type=int,   default=20)
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
-    parser.add_argument("--lr-backbone", type=float, default=2e-5)
-    parser.add_argument("--lr-embed",    type=float, default=2e-5)
+    parser.add_argument("--lr-backbone", type=float, default=1e-5)
     parser.add_argument("--lr-custom",   type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-4)
-    parser.add_argument("--alpha",       type=float, default=1.0,
-                        help="Weight for SmoothL1 loss (α in L = L_CE + α·L_SmoothL1)")
+    parser.add_argument("--alpha",       type=float, default=0.1,
+                        help="Weight for SmoothL1 loss (α in L)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--batch-size",  type=int,   default=8)
-    parser.add_argument("--grad-accum",  type=int,   default=2)
+    parser.add_argument("--batch-size",  type=int,   default=2)
+    parser.add_argument("--grad-accum",  type=int,   default=4)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int,  default=500)
-    parser.add_argument("--resolution",  default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
+    parser.add_argument("--resolution",  default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--grad-ckpt", action="store_true",
                         help="Enable gradient checkpointing (saves VRAM, slower)")
     # Validation
@@ -129,6 +129,8 @@ def main():
     parser.add_argument("--save-steps",  type=int,   default=20000)
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--num-workers", type=int,   default=2)
+    parser.add_argument("--num-loops",   type=int,   default=None,
+                        help="Decoder loop count (None = read from config)")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -152,6 +154,7 @@ def main():
         dtype=dtype,
         device_map=args.device,
         attn_implementation=args.attn_impl,
+        num_loops=args.num_loops,
     )
     print_vram_usage("after model load")
 
@@ -159,28 +162,27 @@ def main():
     # 2. CONFIGURE TRAINABLE PARAMETERS (5 groups)
     # ====================================================================
     print(f"\n{'='*70}")
-    print("PARAMETER GROUPS (all trainable)")
+    print("PARAMETER GROUPS")
     print("=" * 70)
 
-    # All parameters trainable
+    # Embeddings are TRAINABLE (full 248K vocab)
+    # All other parameters are trainable
     for param in pipeline.parameters():
-        param.requires_grad = True
+        if param.requires_grad:
+            pass  # already set
 
     # Build 5 optimizer param groups
-    vision_params = list(pipeline.qwen.model.visual.parameters())
-    embed_params  = list(pipeline.qwen.model.language_model.embed_tokens.parameters())
-    decoder_params = list(pipeline.qwen.model.language_model.layers.parameters()) + \
-                     list(pipeline.qwen.model.language_model.norm.parameters())
+    vision_params = [p for p in pipeline.qwen.model.visual.parameters() if p.requires_grad]
+    embed_params = [p for p in pipeline.qwen.model.language_model.embed_tokens.parameters() if p.requires_grad]
+    decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
+                     [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
     gsa_rti_params = list(pipeline.gsa.parameters()) + \
                      list(pipeline.region_token_extractor.parameters())
     numhead_params = list(pipeline.num_head.parameters())
 
-    # Deduplicate: LM head is tied to embed_tokens, already counted
-    # Don't add lm_head params separately
-
     groups = [
         ("Vision Encoder",  vision_params,  args.lr_vision),
-        ("Embeddings",      embed_params,   args.lr_embed),
+        ("Embeddings",      embed_params,   args.lr_backbone),  
         ("Decoder",         decoder_params, args.lr_backbone),
         ("GSA + RTI",       gsa_rti_params, args.lr_custom),
         ("Number Head",     numhead_params, args.lr_numhead),
@@ -193,6 +195,8 @@ def main():
     total_trainable = sum(p.numel() for p in pipeline.parameters() if p.requires_grad)
     print(f"  {'─'*60}")
     print(f"  {'Total trainable':20s}: {total_trainable:>12,} ({total_trainable/1e6:.2f}M)")
+    n_layers = len(list(pipeline.qwen.model.language_model.layers))
+    print(f"  LoopLM: {n_layers} layers × T_max={pipeline.num_loops} = max depth {n_layers * pipeline.num_loops}")
 
     # ====================================================================
     # 3. LOAD DATA
@@ -203,7 +207,8 @@ def main():
 
     processor = pipeline.processor
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[args.resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     dataset = SpatialVLMDataset(
         args.split, processor=processor, target_size=target_size,
@@ -234,7 +239,7 @@ def main():
     # ====================================================================
     param_groups = [
         {"params": vision_params,  "lr": args.lr_vision,   "name": "vision"},
-        {"params": embed_params,   "lr": args.lr_embed,    "name": "embed"},
+        {"params": embed_params,   "lr": args.lr_backbone,  "name": "embed"},
         {"params": decoder_params, "lr": args.lr_backbone,  "name": "decoder"},
         {"params": gsa_rti_params, "lr": args.lr_custom,    "name": "gsa_rti"},
         {"params": numhead_params, "lr": args.lr_numhead,   "name": "numhead"},
@@ -244,7 +249,7 @@ def main():
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(total_steps - args.warmup_steps, 1), eta_min=1e-6,
     )
-    criterion = SpatialLoss(alpha=args.alpha, remap_fn=pipeline.remap_to_new)
+    criterion = SpatialLoss(alpha=args.alpha)
     dev = pipeline.device
 
     # ====================================================================
@@ -265,7 +270,7 @@ def main():
     # ====================================================================
     csv_fields = [
         "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1",
-        "lr_vision", "lr_embed", "lr_decoder", "lr_custom", "lr_numhead",
+        "lr_vision", "lr_decoder", "lr_custom", "lr_numhead",
         "grad_norm", "samples_per_sec",
     ]
 
@@ -294,7 +299,7 @@ def main():
     print("TRAINING")
     print("=" * 70)
     print(f"  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  "
-          f"lr_embed={args.lr_embed}  lr_custom={args.lr_custom}  lr_numhead={args.lr_numhead}")
+          f"lr_custom={args.lr_custom}  lr_numhead={args.lr_numhead}  embed={args.lr_backbone}")
     print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}  alpha={args.alpha}")
     print()
 
@@ -359,11 +364,11 @@ def main():
                     continue
                 raise
 
-            logits = output["logits"]
+            logits_per_step = output["logits_per_step"]
             num_pred = output["num_pred"]
 
             loss = criterion(
-                logits, labels,
+                logits_per_step, labels,
                 num_pred, batch["target_num"].to(dev),
                 batch["is_numeric"].to(dev),
             ) / args.grad_accum
@@ -379,10 +384,10 @@ def main():
             pbar.set_postfix({
                 "step": global_step,
                 "loss": f"{window_avg:.4f}",
-                "lr": f"{optimizer.param_groups[2]['lr']:.2e}",
+                "lr": f"{optimizer.param_groups[2]['lr']:.2e}",  # decoder lr
             })
 
-            del logits, output, loss, pixel_values, depth_maps, num_pred
+            del logits_per_step, output, loss, pixel_values, depth_maps, num_pred
 
             # Optimizer step every grad_accum micro-steps
             if micro_step % args.grad_accum == 0:
@@ -412,15 +417,16 @@ def main():
                     current_epoch = (global_step * effective_batch) / total_samples
 
                     lr_v = optimizer.param_groups[0]["lr"]
-                    lr_e = optimizer.param_groups[1]["lr"]
-                    lr_d = optimizer.param_groups[2]["lr"]
-                    lr_c = optimizer.param_groups[3]["lr"]
-                    lr_n = optimizer.param_groups[4]["lr"]
+                    lr_e = optimizer.param_groups[1]["lr"]  # embed
+                    lr_d = optimizer.param_groups[2]["lr"]  # decoder
+                    lr_c = optimizer.param_groups[3]["lr"]  # gsa_rti_loop
+                    lr_n = optimizer.param_groups[4]["lr"]  # numhead
 
                     tqdm.write(
                         f"  step={global_step:>7d}  "
                         f"epoch={current_epoch:.2f}  "
                         f"loss={window_avg:.4f}  "
+                        f"lr_e={lr_e:.2e}  "
                         f"lr_d={lr_d:.2e}  "
                         f"grad_norm={grad_norm:.3f}  "
                         f"samples/s={samples_sec:.1f}"
@@ -432,7 +438,7 @@ def main():
                         writer.writerow([
                             global_step, f"{current_epoch:.4f}",
                             f"{window_avg:.6f}", "", "", "",  # val_loss, val_ce, val_sl1 empty
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
+                            f"{lr_v:.8f}", f"{lr_d:.8f}",
                             f"{lr_c:.8f}", f"{lr_n:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
                         ])
@@ -467,10 +473,10 @@ def main():
 
                     current_epoch = (global_step * effective_batch) / total_samples
                     lr_v = optimizer.param_groups[0]["lr"]
-                    lr_e = optimizer.param_groups[1]["lr"]
-                    lr_d = optimizer.param_groups[2]["lr"]
-                    lr_c = optimizer.param_groups[3]["lr"]
-                    lr_n = optimizer.param_groups[4]["lr"]
+                    lr_e = optimizer.param_groups[1]["lr"]  # embed
+                    lr_d = optimizer.param_groups[2]["lr"]  # decoder
+                    lr_c = optimizer.param_groups[3]["lr"]  # gsa_rti_loop
+                    lr_n = optimizer.param_groups[4]["lr"]  # numhead
 
                     # Log to CSV with val_loss filled
                     with open(csv_path, "a", newline="") as f:
@@ -483,7 +489,7 @@ def main():
                             f"{lr_c:.8f}", f"{lr_n:.8f}",
                             " ", " ",
                         ])
-                    print(f"Validation complete: val_loss={val_loss:.4f} "
+                    print(f"\nValidation complete: val_loss={val_loss:.4f} "
                           f"(CE={val_ce:.4f}, SL1={val_sl1:.4f})")
 
         # ==============================================================

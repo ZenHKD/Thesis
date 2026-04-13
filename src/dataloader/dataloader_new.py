@@ -6,10 +6,14 @@ PyTorch Dataset for the NVIDIA Warehouse dataset, adapted for the Micro
 architecture with batch_size > 1 support and Number Head fields.
 
 Key changes from v1 dataloader:
-    1. format_answer(): distance/count -> "category | NUM" (Number Head)
-    2. __getitem__() adds: is_numeric, target_num fields
-    3. collate_fn(): supports batch_size > 1 with padding
-    4. No more `assert batch_size == 1`
+    1. format_answer(): distance/count -> "category | <num>" (Number Head)
+    2. Chain-of-thought: GPT reasoning wrapped in <think>...</think>
+    3. No chat template: question tokenized directly, image processed separately
+    4. collate_fn(): supports batch_size > 1 with padding
+    5. Separate tokenization: question & answer tokenized independently
+       then concatenated to guarantee exact label boundaries (BPE-safe)
+    6. RTI 3→3: <mask> (3 tokens) replaced by [mask_rgb, mask_depth, space]
+       — NO sequence length change, no trimming needed
 
 Splits: train (499K), val (1.9K), test (19K)
 
@@ -31,7 +35,7 @@ Usage:
             num_token_positions=batch["num_token_positions"],
         )
         loss = criterion(
-            out["logits"], batch["labels"],
+            out["logits_per_step"], batch["labels"],
             out["num_pred"], batch["target_num"], batch["is_numeric"],
         )
 """
@@ -43,15 +47,19 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageFilter
 import pycocotools.mask as mask_utils
+import random
+
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from model_micro.pipeline import SYSTEM_PROMPT, find_mask_positions
+from model_micro.pipeline import find_mask_positions, NUM_TOKEN_ID
 
 # Paths
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nvidia_warehouse_dataset")
+MODEL_MICRO_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "model_micro", "qwen3.5-micro")
 
 _SPLIT_CONFIG = {
     "train":        {"json": "train.json",        "dir": "train"},
@@ -62,7 +70,7 @@ _SPLIT_CONFIG = {
 
 
 # ===========================================================================
-# Answer formatting (Micro: NUM for numeric tasks)
+# Answer formatting (Micro: <|num|> for numeric tasks)
 # ===========================================================================
 
 def format_answer(category: str, normalized_answer) -> str:
@@ -71,13 +79,13 @@ def format_answer(category: str, normalized_answer) -> str:
     Format: <category> | <value>
 
     Micro architecture changes:
-        distance -> "distance | NUM"    (Number Head predicts the value)
-        count    -> "count | NUM"       (Number Head predicts the value)
+        distance -> "distance | <|num|>"    (Number Head predicts the value)
+        count    -> "count | <|num|>"       (Number Head predicts the value)
         mcq      -> 'mcq | "5"'          (LM Head, quoted integer)
         left_right-> 'left_right | "left"' (LM Head, quoted string)
     """
     if category in ("distance", "count"):
-        return f"{category} | NUM"
+        return f"{category} | <num>"
     else:
         raw = str(normalized_answer)
         formatted = f'"{raw}"'
@@ -106,7 +114,7 @@ class SpatialVLMDataset(Dataset):
         image_name       : str              — filename for debugging
         is_numeric       : bool             — True for distance/count
         target_num       : float            — ground truth number (0.0 if not numeric)
-        num_token_pos    : int              — position of NUM in input_ids (-1 if not numeric)
+        num_token_pos    : int              — position of <|num|> in input_ids (-1 if not numeric)
     """
 
     def __init__(
@@ -121,7 +129,7 @@ class SpatialVLMDataset(Dataset):
 
         self.split = split
         self.processor = processor
-        self.tokenizer = processor.tokenizer
+        self.tokenizer = processor.tokenizer  # single tokenizer (full vocab, no remapping)
 
         self.json_path = os.path.join(ROOT, cfg["json"])
         self.image_dir = os.path.join(ROOT, cfg["dir"], "images")
@@ -134,10 +142,13 @@ class SpatialVLMDataset(Dataset):
             self.data = self.data[:max_samples]
 
         self.target_size = target_size
-        self._assistant_marker = "<|im_start|>assistant\n"
 
-        # Cache NUM token ID for position finding
-        self._num_token_str = "NUM"
+        # Data augmentation (RGB only, no geometric transforms)
+        # Only active for training splits — val/test stay deterministic
+        self.augment = split in ("train", "train_sample")
+
+        # Cache <|num|> token ID
+        self.num_token_id = NUM_TOKEN_ID
 
     def __len__(self) -> int:
         return len(self.data)
@@ -149,6 +160,42 @@ class SpatialVLMDataset(Dataset):
             print(f"  [!] Skipping sample {idx} ({self.data[idx].get('image', '?')}): {e}")
             return self._load_sample((idx + 1) % len(self.data))
 
+    def _augment_rgb(self, image: Image.Image) -> Image.Image:
+        """Mild appearance-only augmentation for RGB images.
+
+        Safe transforms (no geometry changes):
+            - Brightness jitter (±15%)
+            - Contrast jitter (±15%)
+            - Saturation jitter (±15%)
+            - Gaussian blur (σ=0.1-1.0, 20% chance)
+
+        NOT applied: flip, rotate, crop, resize, affine
+        (these would break distance, left_right, and mask alignment)
+        """
+        from PIL import ImageEnhance
+
+        # Brightness: randomly adjust ±15%
+        if random.random() < 0.5:
+            factor = random.uniform(0.85, 1.15)
+            image = ImageEnhance.Brightness(image).enhance(factor)
+
+        # Contrast: randomly adjust ±15%
+        if random.random() < 0.5:
+            factor = random.uniform(0.85, 1.15)
+            image = ImageEnhance.Contrast(image).enhance(factor)
+
+        # Saturation: randomly adjust ±15%
+        if random.random() < 0.5:
+            factor = random.uniform(0.85, 1.15)
+            image = ImageEnhance.Color(image).enhance(factor)
+
+        # Gaussian blur: mild, 20% chance
+        if random.random() < 0.2:
+            radius = random.uniform(0.1, 1.0)
+            image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+
+        return image
+
     def _load_sample(self, idx: int) -> dict:
         entry = self.data[idx]
 
@@ -158,6 +205,11 @@ class SpatialVLMDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         if self.target_size:
             image = image.resize(self.target_size, Image.LANCZOS)
+
+        # Apply augmentation (RGB only, training splits only)
+        # Safe transforms that preserve geometry (no flip/crop/rotate/resize)
+        if self.augment:
+            image = self._augment_rgb(image)
 
         # 2. Load depth map
         depth_path = os.path.join(self.depth_dir, image_name.replace(".png", "_depth.png"))
@@ -171,38 +223,51 @@ class SpatialVLMDataset(Dataset):
         question_raw = entry["conversations"][0]["value"]
         question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
 
-        # 4. Build target answer string (Micro: NUM for numeric)
+        # 4. Get GPT reasoning from dataset (chain-of-thought)
+        gpt_reasoning = entry["conversations"][1]["value"]
+
+        # 5. Build target answer string (Micro: <|num|> for numeric)
         category = entry["category"]
         target_text = format_answer(category, entry["normalized_answer"])
 
-        # 5. Determine numeric fields
+        # 6. Build full answer with <think> chain-of-thought
+        full_answer = f"<think>{gpt_reasoning}</think>{target_text}"
+
+        # 7. Determine numeric fields
         is_numeric = category in ("distance", "count")
         target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
 
-        # 6. Build chat messages WITH answer
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text",  "text": question},
-            ]},
-            {"role": "assistant", "content": target_text},
-        ]
+        # 8. Tokenize with the micro tokenizer (full vocab, no remapping needed)
+        q_ids = self.tokenizer.encode(question, add_special_tokens=False)
+        sep_ids = self.tokenizer.encode("\n", add_special_tokens=False)
 
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
+        # For numeric categories, encode answer WITHOUT "<num>" and manually append <|num|> token
+        # (BPE would encode "<num>" as regular tokens — we need the special <|num|> token ID)
+        if is_numeric:
+            # full_answer = "<think>...reasoning...</think>category | <num>"
+            # Encode everything up to "<num>", then append <|num|> special token
+            answer_text = full_answer.rsplit("<num>", 1)[0]  # e.g. "<think>...</think>distance | "
+            a_ids = self.tokenizer.encode(answer_text, add_special_tokens=False) + [self.num_token_id]
+        else:
+            a_ids = self.tokenizer.encode(full_answer, add_special_tokens=False)
+
+        all_ids    = q_ids + sep_ids + a_ids
+        input_ids  = torch.tensor(all_ids, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+
+        # 9. Labels: question + separator = -100, answer = active
+        answer_start = len(q_ids) + len(sep_ids)
+        labels = input_ids.clone()
+        labels[:answer_start] = -100
+
+        # 10. Process image separately (pixel_values + grid only)
+        image_inputs = self.processor.image_processor(
+            images=image, return_tensors="pt"
         )
-        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-        inputs = self.processor(
-            text=[text], images=[image], return_tensors="pt", padding=False
-        )
+        pixel_values   = image_inputs["pixel_values"]
+        image_grid_thw = image_inputs["image_grid_thw"]
 
-        input_ids      = inputs["input_ids"].squeeze(0)
-        attention_mask = inputs["attention_mask"].squeeze(0)
-        pixel_values   = inputs["pixel_values"]
-        image_grid_thw = inputs["image_grid_thw"]
-
-        # 7. Find <mask> positions
+        # 11. Find <mask> positions in the token sequence
         mask_positions = find_mask_positions(input_ids.unsqueeze(0), self.tokenizer)
         rle_list = entry["rle"]
 
@@ -210,24 +275,21 @@ class SpatialVLMDataset(Dataset):
         mask_positions = mask_positions[:n]
         rle_list = rle_list[:n]
 
-        # 8. Build labels
-        labels = self._build_labels(input_ids, text, category)
-
-        # 9. Find NUM token position (for Number Head)
+        # 12. Find <|num|> token position (for Number Head)
         num_token_pos = -1
         if is_numeric:
             num_token_pos = self._find_num_token_pos(input_ids)
 
-        # 10. Format answer for metadata
+        # 13. Format answer for metadata
         raw_answer = str(entry["normalized_answer"])
         if category in ("mcq", "left_right"):
             answer_str = f'"{raw_answer}"'
         elif is_numeric:
-            answer_str = f"NUM={raw_answer}"
+            answer_str = f"<num>={raw_answer}"
         else:
             answer_str = raw_answer
 
-        # 11. Pre-decode RLE masks + soft masks
+        # 15. Pre-decode RLE masks + soft masks
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
@@ -263,48 +325,16 @@ class SpatialVLMDataset(Dataset):
             "num_token_pos":  num_token_pos,
         }
 
-    def _build_labels(self, input_ids: torch.Tensor, full_text: str,
-                       category: str) -> torch.Tensor:
-        """Build labels: mask prompt, keep entire answer active."""
-        labels = input_ids.clone()
-
-        marker_ids = self.tokenizer.encode(
-            self._assistant_marker, add_special_tokens=False
-        )
-
-        ids_list = input_ids.tolist()
-        marker_len = len(marker_ids)
-        answer_start = -1
-
-        for i in range(len(ids_list) - marker_len, -1, -1):
-            if ids_list[i:i + marker_len] == marker_ids:
-                answer_start = i + marker_len
-                break
-
-        if answer_start == -1:
-            labels[:] = -100
-            return labels
-
-        labels[:answer_start] = -100
-        return labels
-
     def _find_num_token_pos(self, input_ids: torch.Tensor) -> int:
-        """Find position of NUM token in input_ids.
+        """Find position of <|num|> token in input_ids.
 
-        BPE is context-dependent: in 'distance | NUM', the tokenizer produces
-        ' NUM' (with leading space, old_id=15473), NOT bare 'NUM' (old_id=16968).
-
-        We encode '| NUM' and take the last token to get the correct ID.
+        <|num|> token has a fixed ID in the vocab (appended by prune.py).
         """
         ids_list = input_ids.tolist()
 
-        # Get the actual token ID as it appears in context "| NUM"
-        ctx_ids = self.tokenizer.encode("| NUM", add_special_tokens=False)
-        num_id = ctx_ids[-1]  # ' NUM' (with space) = old_id 15473
-
-        # Search from end (NUM is in the answer portion)
+        # Search from end (<|num|> is in the answer portion)
         for i in range(len(ids_list) - 1, -1, -1):
-            if ids_list[i] == num_id:
+            if ids_list[i] == self.num_token_id:
                 return i
 
         return -1

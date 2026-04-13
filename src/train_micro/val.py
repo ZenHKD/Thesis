@@ -7,7 +7,7 @@ Called from train.py at the end of each epoch.
 
 Usage (standalone):
     python src/train_micro/val.py
-    python src/train_micro/val.py --resolution 450p --max-samples 100
+    python src/train_micro/val.py --resolution 320p --max-samples 100
 """
 import multiprocessing
 multiprocessing.set_start_method("spawn", force=True)
@@ -26,13 +26,13 @@ from model_micro.loss import SpatialLoss
 
 
 @torch.no_grad()
-def validate(pipeline, criterion, processor, resolution="450p",
+def validate(pipeline, criterion, processor, resolution="320p",
              batch_size=4, num_workers=2, max_samples=None, split="val"):
     """Run validation and return average loss.
 
     Args:
         pipeline:    SpatialVLM model (already on GPU)
-        criterion:   SpatialLoss with remap_fn
+        criterion:   SpatialLoss
         processor:   Qwen processor
         resolution:  image resolution
         batch_size:  validation batch size
@@ -44,7 +44,8 @@ def validate(pipeline, criterion, processor, resolution="450p",
         dict with 'val_loss', 'val_ce', 'val_mse', 'n_samples'
     """
     target_size = {"1080p": None, "720p": (1280, 720),
-                   "540p": (960, 540), "450p": (800, 450)}[resolution]
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[resolution]
 
     dataset = SpatialVLMDataset(split, processor=processor,
                                 max_samples=max_samples, target_size=target_size)
@@ -87,11 +88,11 @@ def validate(pipeline, criterion, processor, resolution="450p",
                 continue
             raise
 
-        logits = output["logits"]
+        logits_per_step = output["logits_per_step"]
         num_pred = output["num_pred"]
 
         loss, components = criterion(
-            logits, labels,
+            logits_per_step, labels,
             num_pred, batch["target_num"].to(dev),
             batch["is_numeric"].to(dev),
             return_components=True,
@@ -127,9 +128,9 @@ def main():
     parser.add_argument("--dtype",       default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl",   default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--resolution",  default="450p",
-                        choices=["1080p", "720p", "540p", "450p"])
-    parser.add_argument("--batch-size",  type=int, default=4)
+    parser.add_argument("--resolution",  default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
+    parser.add_argument("--batch-size",  type=int, default=8)
     parser.add_argument("--split",       default="val",
                         choices=["val", "train_sample"])
     parser.add_argument("--max-samples", type=int, default=None)
@@ -154,7 +155,7 @@ def main():
         pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
         print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    criterion = SpatialLoss(alpha=1.0, remap_fn=pipeline.remap_to_new)
+    criterion = SpatialLoss(alpha=0.1)
 
     results = validate(
         pipeline, criterion, pipeline.processor,
