@@ -64,6 +64,7 @@ def validate(pipeline, criterion, processor, resolution="320p",
     pbar = tqdm(loader, desc="Validation", leave=False)
     for batch in pbar:
         pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
+        pixel_values_rgb = batch["pixel_values_rgb"].to(device=dev, dtype=dtype, non_blocking=True)
         image_grid_thw = batch["image_grid_thw"].to(device=dev, non_blocking=True)
         depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
         input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
@@ -73,6 +74,7 @@ def validate(pipeline, criterion, processor, resolution="320p",
         try:
             output = pipeline(
                 pixel_values=pixel_values,
+                pixel_values_rgb=pixel_values_rgb,
                 image_grid_thw=image_grid_thw,
                 depth_maps=depth_maps,
                 input_ids=input_ids,
@@ -88,11 +90,11 @@ def validate(pipeline, criterion, processor, resolution="320p",
                 continue
             raise
 
-        logits_per_step = output["logits_per_step"]
+        logits = output["logits"]
         num_pred = output["num_pred"]
 
         loss, components = criterion(
-            logits_per_step, labels,
+            logits, labels,
             num_pred, batch["target_num"].to(dev),
             batch["is_numeric"].to(dev),
             return_components=True,

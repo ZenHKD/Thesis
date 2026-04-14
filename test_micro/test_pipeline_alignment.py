@@ -293,6 +293,7 @@ def main():
     dtype_model = next(pipeline.qwen.parameters()).dtype
 
     pixel_values_1b   = batch["pixel_values"].to(device=dev, dtype=dtype_model)
+    pixel_values_rgb_1b = batch["pixel_values_rgb"].to(device=dev, dtype=dtype_model)
     image_grid_thw_1b = batch["image_grid_thw"].to(device=dev)
     depth_maps_1b     = batch["depth_maps"].to(device=dev, dtype=dtype_model)
     input_ids_1b      = batch["input_ids"].to(device=dev)
@@ -300,7 +301,7 @@ def main():
     # Build inputs_embeds (visual + text with RTI)
     with torch.no_grad():
         inputs_embeds, n_visual = pipeline._build_inputs_embeds(
-            pixel_values_1b, image_grid_thw_1b, depth_maps_1b, input_ids_1b,
+            pixel_values_1b, pixel_values_rgb_1b, image_grid_thw_1b, depth_maps_1b, input_ids_1b,
             rle_list=batch["rle_list"],
             mask_token_positions=batch["mask_positions"],
             decoded_masks=batch["decoded_masks"],
@@ -392,7 +393,7 @@ def main():
             else:
                 offset = 0
 
-            rti_names = ["region_rgb", "region_depth", "space"]
+            rti_names = ["region_rgb", "region_depth", "region_geo"]
             if offset < len(rti_names):
                 rti_label = rti_names[offset]
             else:
@@ -439,7 +440,7 @@ def main():
     print(f"    Text tokens:       positions [{n_visual} .. {n_visual+n_text-1}]  ({n_text} tokens)")
     print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*3} positions replaced")
     print(f"      Original:  [<] [mask] [>]  → 3 text tokens")
-    print(f"      Replaced:  [region_rgb] [region_depth] [space]  → 3 RTI embeddings")
+    print(f"      Replaced:  [region_rgb] [region_depth] [region_geo]  → 3 RTI embeddings")
     print(f"    Total backbone:    {total_seq} positions = {n_visual} visual + {n_text} text")
     print(f"    Labels:            offset by n_visual={n_visual} (logits[:, n_visual:, :] aligns with labels)")
     print(f"    Depth map:         {list(depth_maps_1b.shape)}")
@@ -468,6 +469,7 @@ def main():
     print("=" * 70)
 
     pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype)
+    pixel_values_rgb = batch["pixel_values_rgb"].to(device=dev, dtype=dtype)
     image_grid_thw = batch["image_grid_thw"].to(device=dev)
     depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype)
 
@@ -475,6 +477,7 @@ def main():
     with torch.no_grad():
         output = pipeline(
             pixel_values=pixel_values,
+            pixel_values_rgb=pixel_values_rgb,
             image_grid_thw=image_grid_thw,
             depth_maps=depth_maps,
             input_ids=input_ids,
@@ -484,13 +487,10 @@ def main():
             num_token_positions=batch.get("num_token_positions"),
         )
 
-    logits_per_step = output["logits_per_step"]
+    logits = output["logits"]
     num_pred = output["num_pred"]
 
-    # Use final step logits for alignment analysis
-    logits = logits_per_step[-1]  # Last step = deepest
-
-    print(f"  logits_per_step: {len(logits_per_step)} steps, each {list(logits_per_step[0].shape)}")
+    print(f"  logits: {list(logits.shape)}")
     print(f"  num_pred: {num_pred.tolist()}")
 
     per_token_losses = print_forward_alignment(logits, labels.cpu(), tokenizer, pipeline)
@@ -503,9 +503,9 @@ def main():
     print("=" * 70)
 
     criterion = SpatialLoss(alpha=0.1)
-    device = logits_per_step[0].device
+    device = logits.device
     official_loss, components = criterion(
-        logits_per_step,
+        logits,
         labels.to(device),
         num_pred.to(device).float(), batch["target_num"].to(device),
         batch["is_numeric"].to(device),
@@ -584,7 +584,7 @@ def main():
     pipeline.eval()
     with torch.no_grad():
         output_ids = pipeline.generate(
-            pixel_values, image_grid_thw, depth_maps, gen_input_ids,
+            pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, gen_input_ids,
             rle_list=[rle_list[0][:n]] if n > 0 else None,
             mask_token_positions=[mask_positions] if n > 0 else None,
             decoded_masks=[decoded_masks[0][:n]] if n > 0 else None,

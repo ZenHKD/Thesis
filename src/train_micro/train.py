@@ -5,14 +5,11 @@ SpatialVLM Micro Training — Full Fine-tuning
 All components trainable from epoch 1:
     - Vision Encoder (4 ViT blocks)       lr=5e-5
     - Token Embeddings + LM Head (tied)   lr=2e-5  (TRAINABLE, full vocab)
-    - Text Decoder (4 layers × N loops)   lr=2e-5
-    - GSA (DFormerv2 Full_GSA x2)         lr=5e-5
+    - Text Decoder (24 layers, single pass)  lr=2e-5
     - RTI (Region Token Injector)         lr=5e-5
-    - Exit Gate (LoopLM)                  lr=5e-4
     - Number Head (xVal regression)       lr=5e-4
 
-Loss:   L = Σ_t p(t)·CE^(t) - β·H(p) + α·L_SmoothL1
-        (LoopLM: per-step CE weighted by exit distribution + entropy bonus)
+Loss:   L = CE + α·L_SmoothL1
         SmoothL1 on Number Head output for distance + count samples
 
 Usage:
@@ -129,8 +126,8 @@ def main():
     parser.add_argument("--save-steps",  type=int,   default=20000)
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--num-workers", type=int,   default=2)
-    parser.add_argument("--num-loops",   type=int,   default=None,
-                        help="Decoder loop count (None = read from config)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile on the Qwen backbone")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
@@ -154,9 +151,12 @@ def main():
         dtype=dtype,
         device_map=args.device,
         attn_implementation=args.attn_impl,
-        num_loops=args.num_loops,
     )
     print_vram_usage("after model load")
+
+    if args.compile:
+        print("  [*] Compiling Qwen backbone with torch.compile...")
+        pipeline.qwen = torch.compile(pipeline.qwen)
 
     # ====================================================================
     # 2. CONFIGURE TRAINABLE PARAMETERS (5 groups)
@@ -176,15 +176,14 @@ def main():
     embed_params = [p for p in pipeline.qwen.model.language_model.embed_tokens.parameters() if p.requires_grad]
     decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
                      [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
-    gsa_rti_params = list(pipeline.gsa.parameters()) + \
-                     list(pipeline.region_token_extractor.parameters())
+    rti_params = list(pipeline.region_token_extractor.parameters())
     numhead_params = list(pipeline.num_head.parameters())
 
     groups = [
         ("Vision Encoder",  vision_params,  args.lr_vision),
         ("Embeddings",      embed_params,   args.lr_backbone),  
         ("Decoder",         decoder_params, args.lr_backbone),
-        ("GSA + RTI",       gsa_rti_params, args.lr_custom),
+        ("RTI",             rti_params,     args.lr_custom),
         ("Number Head",     numhead_params, args.lr_numhead),
     ]
 
@@ -196,7 +195,7 @@ def main():
     print(f"  {'─'*60}")
     print(f"  {'Total trainable':20s}: {total_trainable:>12,} ({total_trainable/1e6:.2f}M)")
     n_layers = len(list(pipeline.qwen.model.language_model.layers))
-    print(f"  LoopLM: {n_layers} layers × T_max={pipeline.num_loops} = max depth {n_layers * pipeline.num_loops}")
+    print(f"  Decoder: {n_layers} layers (single pass)")
 
     # ====================================================================
     # 3. LOAD DATA
@@ -241,7 +240,7 @@ def main():
         {"params": vision_params,  "lr": args.lr_vision,   "name": "vision"},
         {"params": embed_params,   "lr": args.lr_backbone,  "name": "embed"},
         {"params": decoder_params, "lr": args.lr_backbone,  "name": "decoder"},
-        {"params": gsa_rti_params, "lr": args.lr_custom,    "name": "gsa_rti"},
+        {"params": rti_params,     "lr": args.lr_custom,    "name": "rti"},
         {"params": numhead_params, "lr": args.lr_numhead,   "name": "numhead"},
     ]
 
@@ -335,6 +334,7 @@ def main():
 
             # Move to device
             pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
+            pixel_values_rgb = batch["pixel_values_rgb"].to(device=dev, dtype=dtype, non_blocking=True)
             image_grid_thw = batch["image_grid_thw"].to(device=dev, non_blocking=True)
             depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
             input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
@@ -345,6 +345,7 @@ def main():
             try:
                 output = pipeline(
                     pixel_values=pixel_values,
+                    pixel_values_rgb=pixel_values_rgb,
                     image_grid_thw=image_grid_thw,
                     depth_maps=depth_maps,
                     input_ids=input_ids,
@@ -364,11 +365,11 @@ def main():
                     continue
                 raise
 
-            logits_per_step = output["logits_per_step"]
+            logits = output["logits"]
             num_pred = output["num_pred"]
 
             loss = criterion(
-                logits_per_step, labels,
+                logits, labels,
                 num_pred, batch["target_num"].to(dev),
                 batch["is_numeric"].to(dev),
             ) / args.grad_accum
@@ -387,7 +388,7 @@ def main():
                 "lr": f"{optimizer.param_groups[2]['lr']:.2e}",  # decoder lr
             })
 
-            del logits_per_step, output, loss, pixel_values, depth_maps, num_pred
+            del logits, output, loss, pixel_values, pixel_values_rgb, depth_maps, num_pred
 
             # Optimizer step every grad_accum micro-steps
             if micro_step % args.grad_accum == 0:
@@ -419,7 +420,7 @@ def main():
                     lr_v = optimizer.param_groups[0]["lr"]
                     lr_e = optimizer.param_groups[1]["lr"]  # embed
                     lr_d = optimizer.param_groups[2]["lr"]  # decoder
-                    lr_c = optimizer.param_groups[3]["lr"]  # gsa_rti_loop
+                    lr_c = optimizer.param_groups[3]["lr"]  # rti
                     lr_n = optimizer.param_groups[4]["lr"]  # numhead
 
                     tqdm.write(

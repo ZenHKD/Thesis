@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--resolution", default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
+    parser.add_argument("--device", default="cpu", choices=["cuda", "cpu"])
     args = parser.parse_args()
 
     target_size = {"1080p": None, "720p": (1280, 720),
@@ -86,7 +87,8 @@ def main():
         sample = dataset[idx]
         for key, val in sample.items():
             if isinstance(val, torch.Tensor):
-                print(f"  {key:18s}: {list(val.shape)}  dtype={val.dtype}")
+                val = val.to(args.device)
+                print(f"  {key:18s}: {list(val.shape)}  dtype={val.dtype}  device={val.device}")
             elif isinstance(val, list):
                 print(f"  {key:18s}: list[{len(val)}]")
             else:
@@ -143,7 +145,8 @@ def main():
         print(f"\n  Batch {i}:")
         for key, val in batch.items():
             if isinstance(val, torch.Tensor):
-                print(f"    {key:22s}: {list(val.shape)}  dtype={val.dtype}")
+                val = val.to(args.device)
+                print(f"    {key:22s}: {list(val.shape)}  dtype={val.dtype}  device={val.device}")
             elif isinstance(val, list):
                 if len(val) > 0 and isinstance(val[0], list):
                     print(f"    {key:22s}: list[{len(val)}] of lists "

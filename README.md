@@ -136,7 +136,7 @@ git clone https://github.com/ZenHKD/Thesis.git
 cd Thesis
 
 # Download Qwen 3.5 0.8B locally
-huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir model/qwen3.5-0.8b
+hf download Qwen/Qwen3.5-0.8B --local-dir model/qwen3.5-0.8b
 
 # Setup HF token for dataset access
 echo "HF_TOKEN=hf_your_token_here" > .env

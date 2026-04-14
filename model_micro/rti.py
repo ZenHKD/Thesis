@@ -1,27 +1,29 @@
 """
-MODULE: Region-Level Token Injection (RTI) — Micro (Batched)
+MODULE: Region-Level Token Injection (RTI)
 
-Position: After GSA, before Backbone
+Position: Before Concat Fusion (independent of Vision Encoder)
 Input:
-    visual_tokens  [B, N, 1024]   post-GSA depth-aware tokens
-    depth_map      [B, H, W]      raw sensor depth
-    rle_list       list[list[dict]]  RLE entries per sample in batch
-    image_grid_thw Tensor[B, 3]   [t, h, w] from Qwen processor
+    rgb_images     [B, 3, H, W]      raw RGB (0-1 range)
+    depth_maps     [B, H, W]         raw sensor depth
+    rle_list       list[list[dict]]   RLE entries per sample in batch
+    image_grid_thw Tensor[B, 3]      [t, h, w] for soft mask grid sizing
 
-Each <mask> in the question -> 2 tokens:
-    mask_rgb   = DB-style soft Gated Attention Pool -> [1, 1024]
-    mask_depth = [mean_d, std_d, cx_soft, cy_soft, r0..r23] -> Linear(28->1024) -> [1, 1024]
+Each <mask> in the question -> 3 learned tokens:
+    mask_rgb   = RGB appearance stats    -> Linear(12->1024) + LN -> [1, 1024]
+    mask_depth = depth stats + radial    -> Linear(28->1024) + LN -> [1, 1024]
+    mask_geo   = spatial context         -> Linear(16->1024) + LN -> [1, 1024]
 
-Injection: replace each <mask> token with [mask_rgb, mask_depth]
+RTI is completely independent of the Vision Encoder.
+Two parallel streams feed the decoder:
+    Stream 1: RGB -> Vision Encoder -> visual_tokens (scene-level semantics)
+    Stream 2: RGB + Depth + RLE -> RTI -> per-region tokens (region-level descriptors)
 
-Batched RTI Strategy (Flatten -> Parallel -> Scatter):
-    1. FLATTEN: Collect all masks from all samples -> total_masks
-    2. PARALLEL: Process all masks in a single GPU kernel
-    3. SCATTER: Inject back into pre-padded text embeddings
+Batched Strategy (Flatten -> Parallel Project -> Scatter):
+    1. FLATTEN: Extract feature vectors for each mask (GPU tensor ops)
+    2. PARALLEL: Stack all features, project in single batched matmul
+    3. SCATTER: Inject into text embeddings at <mask> positions
 
-NOTE: The parallel processing of _rgb_token and _depth_token is done
-      per-mask but with minimal Python overhead. True GPU parallelism
-      happens in the attention pooling (batched matmul).
+Injection: 3->3 in-place replacement (sequence length UNCHANGED)
 """
 
 import math
@@ -34,11 +36,11 @@ import pycocotools.mask as mask_utils
 
 
 # ----------------------------------------------------------------------------
-# Helpers (unchanged from v1)
+# Helpers
 # ----------------------------------------------------------------------------
 
 def _soft_mask_from_coverage(
-    coverage: torch.Tensor,                         # [h_vis, w_vis] in [0, 1]
+    coverage: torch.Tensor,                         # [h, w] in [0, 1]
     k: float = 50.0,
     theta: float = 0.3,
 ) -> torch.Tensor:
@@ -47,16 +49,16 @@ def _soft_mask_from_coverage(
 
 
 def _radial_depth_profile(
-    depth_map:  torch.Tensor,                       # [B, H, W]
-    soft2d:     torch.Tensor,                       # [h_vis, w_vis]
+    depth_map:  torch.Tensor,                       # [1, H, W]
+    soft2d:     torch.Tensor,                       # [h_soft, w_soft]
     cx_soft:    torch.Tensor,
     cy_soft:    torch.Tensor,
     n_rays:     int = 24,
     n_samples:  int = 20,
-) -> torch.Tensor:                                  # [B, n_rays]
+) -> torch.Tensor:                                  # [1, n_rays]
     """Differentiable 24-ray radial depth profile."""
     B, H, W = depth_map.shape
-    h_vis, w_vis = soft2d.shape
+    h_soft, w_soft = soft2d.shape
     dev  = depth_map.device
     dt   = depth_map.dtype
 
@@ -84,10 +86,10 @@ def _radial_depth_profile(
     )
     d_samples = d_samples.squeeze(1).squeeze(-1).reshape(B, n_rays, n_samples)
 
-    xs_p   = (xs_pix / (W - 1)) * (w_vis - 1)
-    ys_p   = (ys_pix / (H - 1)) * (h_vis - 1)
-    xs_pg  = (xs_p / max(w_vis - 1, 1)) * 2.0 - 1.0
-    ys_pg  = (ys_p / max(h_vis - 1, 1)) * 2.0 - 1.0
+    xs_p   = (xs_pix / (W - 1)) * (w_soft - 1)
+    ys_p   = (ys_pix / (H - 1)) * (h_soft - 1)
+    xs_pg  = (xs_p / max(w_soft - 1, 1)) * 2.0 - 1.0
+    ys_pg  = (ys_p / max(h_soft - 1, 1)) * 2.0 - 1.0
     grid_p = torch.stack([xs_pg, ys_pg], dim=-1).reshape(1, n_rays * n_samples, 1, 2)
 
     soft_in = soft2d.float().unsqueeze(0).unsqueeze(0)
@@ -103,38 +105,49 @@ def _radial_depth_profile(
 
 
 # ----------------------------------------------------------------------------
-# RTE - Region Token Extractor (Batched)
+# RTE - Region Token Extractor (3 learned tokens per <mask>)
 # ----------------------------------------------------------------------------
 
 class RTE(nn.Module):
-    """Extract (mask_rgb, mask_depth) token pairs from RLE annotations.
+    """Extract 3 learned region tokens per <mask> from raw inputs.
 
-    Supports batch_size > 1 via flatten->process->scatter strategy.
+    Independent of Vision Encoder. Processes:
+        - Raw RGB image -> appearance features -> mask_rgb
+        - Raw depth map -> depth profile features -> mask_depth
+        - Raw depth map + mask -> spatial context -> mask_geo
 
     Learnable:
-        rgb_gate    Linear(1024, 1, bias=False)
-        depth_proj  Linear(28, 1024, bias=True) + LayerNorm
+        rgb_proj    Linear(12, 1024) + LayerNorm
+        depth_proj  Linear(28, 1024) + LayerNorm
+        geo_proj    Linear(16, 1024) + LayerNorm
     """
 
-    def __init__(
-        self,
-        hidden_dim:      int = 1024,
-        depth_stats_dim: int = 28,
-    ):
+    RGB_FEAT_DIM = 12
+    DEPTH_FEAT_DIM = 28
+    GEO_FEAT_DIM = 16
+
+    def __init__(self, hidden_dim: int = 1024):
         super().__init__()
-        self.rgb_gate = nn.Linear(hidden_dim, 1, bias=False)
+        self.rgb_proj = nn.Sequential(
+            nn.Linear(self.RGB_FEAT_DIM, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
         self.depth_proj = nn.Sequential(
-            nn.Linear(depth_stats_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(self.DEPTH_FEAT_DIM, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.geo_proj = nn.Sequential(
+            nn.Linear(self.GEO_FEAT_DIM, hidden_dim),
+            nn.LayerNorm(hidden_dim),
         )
 
-    # ---- Private helpers (single-mask processing) ----
+    # ---- Private: RLE decoding ----
 
     def _rle_to_soft_mask(
         self,
-        rle:   dict,
-        h_vis: int,
-        w_vis: int,
+        rle:    dict,
+        h_soft: int,
+        w_soft: int,
         device: torch.device = None,
     ) -> Tuple[np.ndarray, torch.Tensor]:
         """RLE -> binary mask + DB-style soft coverage mask."""
@@ -143,37 +156,93 @@ class RTE(nn.Module):
         if device is not None:
             t = t.to(device)
         coverage = F.adaptive_avg_pool2d(
-            t.unsqueeze(0).unsqueeze(0), (h_vis, w_vis)
+            t.unsqueeze(0).unsqueeze(0), (h_soft, w_soft)
         ).squeeze()
+
+        # Relative Coverage Normalization
+        coverage = coverage / (coverage.max() + 1e-8)
+
         soft2d   = _soft_mask_from_coverage(coverage)
         return binary, soft2d
 
-    def _rgb_token(
+    # ---- Private: Feature extraction ----
+
+    def _rgb_features(
         self,
-        visual_tokens: torch.Tensor,   # [1, N, 1024]
-        soft2d:        torch.Tensor,    # [h_vis, w_vis]
-    ) -> torch.Tensor:                  # [1, 1024]
-        """DB-style Soft Gated Attention Pool over visual tokens."""
-        dev   = visual_tokens.device
-        dtype = visual_tokens.dtype
+        rgb_image:   torch.Tensor,      # [3, H, W] float (0-1)
+        binary_mask: np.ndarray,         # [H, W] bool
+        device:      torch.device = None,
+    ) -> torch.Tensor:                   # [12]
+        """Extract RGB appearance features from masked region.
 
-        soft_flat = soft2d.reshape(-1).to(device=dev, dtype=dtype)
-        log_soft  = torch.log(soft_flat.clamp(min=1e-8))
+        Features (12-dim):
+            mean R, G, B        (3)  — average color
+            std R, G, B         (3)  — color variation
+            mean luminance      (1)  — brightness
+            std luminance       (1)  — texture energy
+            min luminance       (1)
+            max luminance       (1)
+            color contrast      (1)  — std across channel means
+            saturation          (1)  — (max_ch - min_ch) / (max_ch + eps)
+        """
+        dev = device or rgb_image.device
+        dtype = next(self.parameters()).dtype
 
-        scores  = self.rgb_gate(visual_tokens).squeeze(-1)              # [1, N]
-        weights = torch.softmax(scores + log_soft.unsqueeze(0), dim=-1) # [1, N]
-        mask_rgb = (weights.unsqueeze(-1) * visual_tokens).sum(dim=1)   # [1, 1024]
-        return mask_rgb
+        mask_t = torch.from_numpy(binary_mask).to(device=dev, dtype=torch.bool)
 
-    def _depth_token(
+        # Per-channel mean and std [6]
+        ch_means = []
+        ch_stds = []
+        for c in range(3):
+            vals = rgb_image[c][mask_t]
+            if vals.numel() == 0:
+                ch_means.append(torch.tensor(0.0, device=dev))
+                ch_stds.append(torch.tensor(0.0, device=dev))
+            else:
+                ch_means.append(vals.mean())
+                ch_stds.append(vals.std(correction=0).clamp(min=0))
+
+        # Luminance [4]
+        gray = rgb_image.mean(dim=0)  # [H, W]
+        gray_vals = gray[mask_t]
+        if gray_vals.numel() == 0:
+            lum_mean = torch.tensor(0.0, device=dev)
+            lum_std  = torch.tensor(0.0, device=dev)
+            lum_min  = torch.tensor(0.0, device=dev)
+            lum_max  = torch.tensor(0.0, device=dev)
+        else:
+            lum_mean = gray_vals.mean()
+            lum_std  = gray_vals.std(correction=0).clamp(min=0)
+            lum_min  = gray_vals.min()
+            lum_max  = gray_vals.max()
+
+        # Derived [2]
+        cm = torch.stack(ch_means)
+        color_contrast = cm.std(correction=0)
+        saturation = (cm.max() - cm.min()) / (cm.max() + 1e-8)
+
+        features = torch.stack(
+            ch_means + ch_stds +
+            [lum_mean, lum_std, lum_min, lum_max, color_contrast, saturation]
+        )
+        return features.to(dtype)  # [12]
+
+    def _depth_features(
         self,
-        depth_map:    torch.Tensor,   # [1, H, W]
-        binary_mask:  np.ndarray,     # [H, W]
-        soft2d:       torch.Tensor,   # [h_vis, w_vis]
-        h_vis:        int,
-        w_vis:        int,
-    ) -> torch.Tensor:                # [1, 1024]
-        """Compute 28-dim depth stats -> Linear(28->1024) -> [1, 1024]."""
+        depth_map:    torch.Tensor,      # [1, H, W]
+        binary_mask:  np.ndarray,         # [H, W] bool
+        soft2d:       torch.Tensor,       # [h_soft, w_soft]
+        h_soft:       int,
+        w_soft:       int,
+    ) -> torch.Tensor:                   # [28]
+        """Compute 28-dim depth statistics for masked region.
+
+        Features (28-dim):
+            mean_d              (1)
+            std_d               (1)
+            centroid cx, cy     (2)  — soft-mask weighted
+            24 radial depth rays (24) — from centroid outward
+        """
         B, H, W = depth_map.shape
         dev     = depth_map.device
         dtype   = next(self.parameters()).dtype
@@ -181,100 +250,221 @@ class RTE(nn.Module):
         bool_mask = torch.from_numpy(binary_mask).to(device=dev)
 
         if bool_mask.sum() == 0:
-            stats = torch.zeros(B, 28, device=dev, dtype=dtype)
-            return self.depth_proj(stats)
+            return torch.zeros(self.DEPTH_FEAT_DIM, device=dev, dtype=dtype)
 
         soft2d_dev = soft2d.to(dev)
         soft_sum   = soft2d_dev.sum() + 1e-8
-        grid_x     = torch.arange(w_vis, device=dev, dtype=soft2d_dev.dtype)
-        grid_y     = torch.arange(h_vis, device=dev, dtype=soft2d_dev.dtype)
-        cx_soft    = (soft2d_dev.sum(0) * grid_x).sum() / (soft_sum * w_vis)
-        cy_soft    = (soft2d_dev.sum(1) * grid_y).sum() / (soft_sum * h_vis)
+        grid_x     = torch.arange(w_soft, device=dev, dtype=soft2d_dev.dtype)
+        grid_y     = torch.arange(h_soft, device=dev, dtype=soft2d_dev.dtype)
+        cx_soft    = (soft2d_dev.sum(0) * grid_x).sum() / (soft_sum * w_soft)
+        cy_soft    = (soft2d_dev.sum(1) * grid_y).sum() / (soft_sum * h_soft)
 
         vals       = depth_map[:, bool_mask].float()
-        mean_d     = vals.mean(dim=1)
-        std_d      = vals.std(dim=1, correction=0).clamp(min=0.0)
+        mean_d     = vals.mean(dim=1)                    # [1]
+        std_d      = vals.std(dim=1, correction=0).clamp(min=0.0)  # [1]
 
         profile = _radial_depth_profile(
             depth_map, soft2d_dev, cx_soft, cy_soft
-        )
+        )                                                 # [1, 24]
 
-        cx_b = cx_soft.expand(B).unsqueeze(1).to(mean_d.dtype)
-        cy_b = cy_soft.expand(B).unsqueeze(1).to(mean_d.dtype)
+        cx_b = cx_soft.unsqueeze(0).to(mean_d.dtype)     # [1]
+        cy_b = cy_soft.unsqueeze(0).to(mean_d.dtype)     # [1]
         stats = torch.cat([
-            mean_d.unsqueeze(1),
-            std_d.unsqueeze(1),
-            cx_b,
-            cy_b,
-            profile.to(mean_d.dtype),
-        ], dim=1)
+            mean_d,                                       # [1]
+            std_d,                                        # [1]
+            cx_b,                                         # [1]
+            cy_b,                                         # [1]
+            profile.squeeze(0).to(mean_d.dtype),          # [24]
+        ], dim=0)                                         # [28]
 
-        return self.depth_proj(stats.to(dtype))
+        return stats.to(dtype)
+
+    def _geo_features(
+        self,
+        depth_map:    torch.Tensor,      # [H, W] (single sample, no batch dim)
+        binary_mask:  np.ndarray,         # [H, W] bool
+    ) -> torch.Tensor:                   # [16]
+        """Compute spatial context features for masked region.
+
+        Features (16-dim):
+            global_mean_d       (1)  — scene average depth
+            global_std_d        (1)  — scene depth variation
+            relative_depth      (1)  — region_mean / global_mean
+            depth_percentile    (1)  — fraction of pixels shallower than region
+            area_ratio          (1)  — mask_pixels / total_pixels
+            centroid_x          (1)  — normalized 0-1
+            centroid_y          (1)  — normalized 0-1
+            bbox_x0             (1)  — normalized bbox left
+            bbox_y0             (1)  — normalized bbox top
+            bbox_w              (1)  — normalized bbox width
+            bbox_h              (1)  — normalized bbox height
+            min_depth_norm      (1)  — region min / (global max + eps)
+            max_depth_norm      (1)  — region max / (global max + eps)
+            aspect_ratio        (1)  — bbox_w / (bbox_h + eps)
+            dist_to_center      (1)  — centroid distance to image center
+            depth_range_norm    (1)  — (region_max - region_min) / (global_max + eps)
+        """
+        dev   = depth_map.device
+        dtype = next(self.parameters()).dtype
+        H, W  = depth_map.shape
+
+        mask_t = torch.from_numpy(binary_mask).to(device=dev, dtype=torch.bool)
+
+        if mask_t.sum() == 0:
+            return torch.zeros(self.GEO_FEAT_DIM, device=dev, dtype=dtype)
+
+        # Global depth stats
+        depth_f = depth_map.float()
+        global_mean = depth_f.mean()
+        global_std  = depth_f.std(correction=0).clamp(min=0)
+        global_max  = depth_f.max().clamp(min=1e-8)
+
+        # Region depth stats
+        region_vals = depth_f[mask_t]
+        region_mean = region_vals.mean()
+        region_min  = region_vals.min()
+        region_max  = region_vals.max()
+
+        relative_depth   = region_mean / (global_mean + 1e-8)
+        depth_percentile = (depth_f < region_mean).float().mean()
+        area_ratio       = mask_t.float().sum() / (H * W)
+
+        # Centroid (from binary mask)
+        ys, xs = torch.where(mask_t)
+        centroid_x = xs.float().mean() / max(W - 1, 1)
+        centroid_y = ys.float().mean() / max(H - 1, 1)
+
+        # Bounding box (normalized)
+        bbox_x0 = xs.min().float() / max(W - 1, 1)
+        bbox_y0 = ys.min().float() / max(H - 1, 1)
+        bbox_w  = (xs.max() - xs.min()).float() / max(W - 1, 1)
+        bbox_h  = (ys.max() - ys.min()).float() / max(H - 1, 1)
+
+        min_depth_norm   = region_min / global_max
+        max_depth_norm   = region_max / global_max
+        aspect_ratio     = bbox_w / (bbox_h + 1e-8)
+        dist_to_center   = ((centroid_x - 0.5) ** 2 + (centroid_y - 0.5) ** 2).sqrt()
+        depth_range_norm = (region_max - region_min) / global_max
+
+        features = torch.stack([
+            global_mean, global_std, relative_depth, depth_percentile,
+            area_ratio, centroid_x, centroid_y,
+            bbox_x0, bbox_y0, bbox_w, bbox_h,
+            min_depth_norm, max_depth_norm, aspect_ratio,
+            dist_to_center, depth_range_norm,
+        ])
+        return features.to(dtype)  # [16]
 
     # ---- Batched forward ----
 
     def forward(
         self,
-        visual_tokens:  torch.Tensor,                # [B, N, 1024]
-        depth_map:      torch.Tensor,                # [B, H, W]
-        rle_list:       List[List[dict]],             # [B][num_masks_b]
-        image_grid_thw: torch.Tensor,                # [B, 3]
-        decoded_masks:  List[List[dict]] = None,     # [B][num_masks_b]
-    ) -> List[List[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Process all masks for all samples in the batch.
+        rgb_images:     torch.Tensor,                  # [B, 3, H, W]
+        depth_maps:     torch.Tensor,                  # [B, H, W]
+        rle_list:       List[List[dict]],               # [B][num_masks_b]
+        image_grid_thw: torch.Tensor,                  # [B, 3] — for soft mask grid sizing
+        decoded_masks:  List[List[dict]] = None,        # [B][num_masks_b] pre-decoded
+    ) -> List[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        """Process all masks for all samples in batch.
+
+        Batched Strategy (Flatten -> Parallel Project -> Scatter):
+            1. Extract feature vectors per mask (GPU tensor ops)
+            2. Stack all features, project in single batched matmul per projector
+            3. Scatter results back to per-sample structure
 
         Returns:
-            result[b][m] = (mask_rgb, mask_depth) for sample b, mask m
-            mask_rgb:   [1, 1024]
-            mask_depth: [1, 1024]
+            result[b][m] = (mask_rgb, mask_depth, mask_geo) for sample b, mask m
+            Each token: [1, 1024]
         """
-        B = visual_tokens.shape[0]
-        _, h_patches, w_patches = [int(x) for x in image_grid_thw[0].tolist()]
-        h_vis, w_vis = h_patches // 2, w_patches // 2
-        dev = visual_tokens.device
+        B = depth_maps.shape[0]
+        dev = depth_maps.device
 
-        result = []
+        # Soft mask grid size (decoupled from visual tokens — just a smoothing param)
+        _, h_patches, w_patches = [int(x) for x in image_grid_thw[0].tolist()]
+        h_soft = max(h_patches // 2, 1)
+        w_soft = max(w_patches // 2, 1)
+
+        # ---- Phase 1: FLATTEN — extract features per mask ----
+        all_rgb_feats = []
+        all_dep_feats = []
+        all_geo_feats = []
+        mask_counts = []
+
         for b in range(B):
-            vis_b = visual_tokens[b:b+1]  # [1, N, 1024]
-            dep_b = depth_map[b:b+1]      # [1, H, W]
             masks_b = rle_list[b]
             dec_b = decoded_masks[b] if decoded_masks is not None else None
 
-            pairs = []
             for m, rle in enumerate(masks_b):
+                # Get binary + soft masks (pre-decoded in dataloader when available)
                 if dec_b is not None and m < len(dec_b):
                     binary = dec_b[m]['binary']
                     soft2d = dec_b[m]['soft2d']
                 else:
-                    binary, soft2d = self._rle_to_soft_mask(rle, h_vis, w_vis, device=dev)
+                    binary, soft2d = self._rle_to_soft_mask(rle, h_soft, w_soft, device=dev)
 
-                rgb = self._rgb_token(vis_b, soft2d)                     # [1, 1024]
-                dep = self._depth_token(dep_b, binary, soft2d, h_vis, w_vis)  # [1, 1024]
-                pairs.append((rgb, dep))
-            result.append(pairs)
+                # RGB features from raw image [12]
+                rgb_feat = self._rgb_features(rgb_images[b], binary, device=dev)
+                all_rgb_feats.append(rgb_feat)
+
+                # Depth features [28]
+                dep_feat = self._depth_features(
+                    depth_maps[b:b+1], binary, soft2d, h_soft, w_soft
+                )
+                all_dep_feats.append(dep_feat)
+
+                # Geo features [16]
+                geo_feat = self._geo_features(depth_maps[b], binary)
+                all_geo_feats.append(geo_feat)
+
+            mask_counts.append(len(masks_b))
+
+        # ---- Phase 2: PARALLEL — batch project all masks at once ----
+        if len(all_rgb_feats) == 0:
+            return [[] for _ in range(B)]
+
+        # Stack: [total_masks, feat_dim] — single GPU kernel per projection
+        rgb_stack = torch.stack(all_rgb_feats)       # [M_total, 12]
+        dep_stack = torch.stack(all_dep_feats)       # [M_total, 28]
+        geo_stack = torch.stack(all_geo_feats)       # [M_total, 16]
+
+        rgb_tokens = self.rgb_proj(rgb_stack)        # [M_total, 1024]
+        dep_tokens = self.depth_proj(dep_stack)      # [M_total, 1024]
+        geo_tokens = self.geo_proj(geo_stack)        # [M_total, 1024]
+
+        # ---- Phase 3: SCATTER — distribute back to per-sample structure ----
+        result = []
+        idx = 0
+        for b in range(B):
+            triples = []
+            for m in range(mask_counts[b]):
+                triples.append((
+                    rgb_tokens[idx:idx+1],    # [1, 1024]
+                    dep_tokens[idx:idx+1],    # [1, 1024]
+                    geo_tokens[idx:idx+1],    # [1, 1024]
+                ))
+                idx += 1
+            result.append(triples)
         return result
 
     def inject_into_text_embeds(
         self,
         text_embeds:    torch.Tensor,                # [B, L, 1024]
         mask_positions: List[List[int]],             # [B][num_masks_b] sorted <mask> start indices
-        region_tokens:  List[List[Tuple[torch.Tensor, torch.Tensor]]],
+        region_tokens:  List[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
         mask_token_len: int = 3,                     # <mask> = 3 tokens: < mask >
-        space_embed:    torch.Tensor = None,         # [D] frozen embedding of " " token
-    ) -> torch.Tensor:                               # [B, L, 1024]  (same length!)
-        """Replace each <mask> (3 tokens) with [mask_rgb, mask_depth, space_embed].
+    ) -> torch.Tensor:                               # [B, L, 1024]
+        """Replace each <mask> (3 tokens) with [mask_rgb, mask_depth, mask_geo].
 
-        3 -> 3 replacement: sequence length is UNCHANGED. No padding needed.
+        3 -> 3 replacement: sequence length UNCHANGED.
 
         Args:
             text_embeds:    [B, L, D] text token embeddings
             mask_positions: [B][num_masks] positions of <mask> starts
-            region_tokens:  [B][num_masks] (mask_rgb, mask_depth) pairs
+            region_tokens:  [B][num_masks] (mask_rgb, mask_depth, mask_geo) triples
             mask_token_len: number of tokens per <mask> (always 3: < mask >)
-            space_embed:    [D] embedding of space " " token (3rd replacement token)
 
         Returns:
-            embeds: [B, L, D] — same shape as input (3 -> 3 preserves length)
+            embeds: [B, L, D] — same shape as input
         """
         B, L, D = text_embeds.shape
 
@@ -282,12 +472,10 @@ class RTE(nn.Module):
             positions = mask_positions[b]
             tokens = region_tokens[b]
 
-            for pos, (rgb, dep) in zip(positions, tokens):
-                # Replace 3 tokens in-place: [<, mask, >] -> [mask_rgb, mask_depth, space]
+            for pos, (rgb, dep, geo) in zip(positions, tokens):
                 if pos + mask_token_len <= L:
-                    text_embeds[b, pos,     :] = rgb.squeeze(0)      # mask_rgb  [1024]
+                    text_embeds[b, pos,     :] = rgb.squeeze(0)      # mask_rgb   [1024]
                     text_embeds[b, pos + 1, :] = dep.squeeze(0)      # mask_depth [1024]
-                    if space_embed is not None:
-                        text_embeds[b, pos + 2, :] = space_embed     # space " " [1024]
+                    text_embeds[b, pos + 2, :] = geo.squeeze(0)      # mask_geo   [1024]
 
         return text_embeds

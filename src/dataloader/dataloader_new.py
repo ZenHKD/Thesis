@@ -101,6 +101,7 @@ class SpatialVLMDataset(Dataset):
 
     Each __getitem__ returns a dict with:
         pixel_values     : [num_patches, 1536]
+        pixel_values_rgb: [3, H_orig, W_orig] — raw image tensor for RTI
         image_grid_thw   : [1, 3]
         depth_map        : [H, W]
         input_ids        : [T]
@@ -290,7 +291,11 @@ class SpatialVLMDataset(Dataset):
             answer_str = raw_answer
 
         # 15. Pre-decode RLE masks + soft masks
+        # Must match rti.py: Relative Coverage Normalization + dynamic h_vis/w_vis
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
+        # Dynamic grid: if merger stride=2 → //2, if stride=1 → same
+        # For current Qwen merger (stride=2), pixel_values patches = h_p*w_p
+        # and visual tokens N = (h_p//2) * (w_p//2)
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
         for rle_entry in rle_list:
@@ -304,11 +309,20 @@ class SpatialVLMDataset(Dataset):
             coverage = torch.nn.functional.adaptive_avg_pool2d(
                 t.unsqueeze(0).unsqueeze(0), (h_vis, w_vis)
             ).squeeze()
+
+            # Relative Coverage Normalization (must match rti.py)
+            coverage = coverage / (coverage.max() + 1e-8)
+
             soft2d = torch.sigmoid(50.0 * (coverage - 0.3))
             decoded_masks.append({'binary': binary, 'soft2d': soft2d})
 
+        # 16. Raw RGB for RTI (0-1 float)
+        import torchvision.transforms.functional as TF
+        pixel_values_rgb = TF.to_tensor(image)  # [3, H_orig, W_orig]
+
         return {
             "pixel_values":   pixel_values,
+            "pixel_values_rgb": pixel_values_rgb,
             "image_grid_thw": image_grid_thw,
             "depth_map":      depth_map,
             "input_ids":      input_ids,
@@ -373,6 +387,7 @@ def collate_fn(batch: list[dict]) -> dict:
     # pixel_values might have variable patches (different resolution)
     # For same-resolution training, they should be stackable
     pixel_values = torch.cat([d["pixel_values"] for d in batch], dim=0)
+    pixel_values_rgb = torch.stack([d["pixel_values_rgb"] for d in batch], dim=0)
     image_grid_thw = torch.cat([d["image_grid_thw"] for d in batch], dim=0)
 
     # Depth maps (same resolution if target_size is set)
@@ -395,6 +410,7 @@ def collate_fn(batch: list[dict]) -> dict:
 
     return {
         "pixel_values":        pixel_values,
+        "pixel_values_rgb":    pixel_values_rgb,
         "image_grid_thw":      image_grid_thw,
         "depth_maps":          depth_maps,
         "input_ids":           input_ids,

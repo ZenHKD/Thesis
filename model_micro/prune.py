@@ -1,7 +1,7 @@
 """
 SpatialVLM Micro Pruning Pipeline (No External Pruning Libs)
 - Vision: Keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
-- Decoder: Keep layers [0,1,2,3,4,5,6,7] -> runtime loop 3x (LoopLM)
+- Decoder: Keep all 24 layers (single pass)
 - Vocab: FULL original vocabulary (248,320) + <num> token appended
 - Add <num> token at end of vocab (ID = 248,320)
 """
@@ -17,7 +17,7 @@ ORIGINAL_MODEL_PATH = Path(__file__).parent.parent / "model" / "qwen3.5-0.8b"
 OUTPUT_PATH = Path(__file__).parent / "qwen3.5-micro"
 
 KEEP_VISION_BLOCKS = [8, 9, 10, 11]
-KEEP_DECODER_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
+KEEP_DECODER_LAYERS = list(range(24))
 NUM_TOKEN = "<|num|>"
 
 # Copy these auxiliary files from original model
@@ -123,7 +123,7 @@ def prune_vision(sd: dict) -> dict:
 
 
 def prune_decoder(sd: dict) -> dict:
-    print(f"  Decoder: layers {KEEP_DECODER_LAYERS} (looped 3x at runtime)")
+    print(f"  Decoder: layers {KEEP_DECODER_LAYERS} (all 24 layers)")
     new = {}
     for k, v in sd.items():
         if "model.language_model.layers." in k:
@@ -135,7 +135,6 @@ def prune_decoder(sd: dict) -> dict:
         else:
             new[k] = v
     return new
-
 
 # ============== MAIN ==============
 
@@ -189,7 +188,6 @@ def main():
     # Update the MODEL's internal config
     model.config.vocab_size = new_vocab_size
     model.config.num_token_id = num_token_id
-    model.config.num_loops = 3  # T_max (LoopLM)
     model.config.max_position_embeddings = 512
     if hasattr(model.config, "text_config"):
         model.config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
@@ -207,7 +205,6 @@ def main():
     # Also update standalone config
     config.vocab_size = new_vocab_size
     config.num_token_id = num_token_id
-    config.num_loops = 3
     config.max_position_embeddings = 512
     if hasattr(config, "text_config"):
         config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
@@ -238,7 +235,6 @@ def main():
         "vocab_pruned": False,
         "kept_vision_blocks": KEEP_VISION_BLOCKS,
         "kept_decoder_layers": KEEP_DECODER_LAYERS,
-        "num_loops": 3,
     }
     with open(OUTPUT_PATH / "prune_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -250,7 +246,7 @@ def main():
     print("Pruning complete!")
     print(f"  Vocab:       248077 active tokens (Embeddings padded to {new_vocab_size})")
     print(f"  Vision:      12 blocks -> {len(KEEP_VISION_BLOCKS)}")
-    print(f"  Decoder:     24 layers -> {len(KEEP_DECODER_LAYERS)} (LoopLM T_max=3)")
+    print(f"  Decoder:     24 layers -> {len(KEEP_DECODER_LAYERS)}")
     print(f"  Embed:       {embed_params/1e6:.1f}M params ({embed_params * 2 / 1e6:.1f} MB bf16)")
     print(f"  Total:       {total_params/1e6:.1f}M params")
     print(f"  Output:      {OUTPUT_PATH}")

@@ -2,17 +2,20 @@
 
 ## Origin
 
-Surgically pruned from **Qwen 3.5 0.8B (853M)** — a ~85% parameter reduction.
+Surgically pruned from **Qwen 3.5 0.8B (853M)** — vision encoder pruned, decoder kept in full.
 Pretrained weights are transferred (not random init), then fine-tuned on the 499K warehouse dataset.
 
-| Cut | Original | Micro | Savings |
-|-----|----------|-------|---------|
+| Cut | Original | Micro v2 | Savings |
+|-----|----------|----------|---------| 
 | Vision ViT blocks | 12 | **4** | 56.7M |
-| Decoder layers | 24 (6 groups) | **8 (2 groups, LoopLM T_max=3)** | 332M |
-| Vocab / Embedding | 248,320 | **248,321 (full + <num>, TRAINABLE)** | 0 |
+| Decoder layers | 24 | **24 (full, single pass)** | 0 |
+| Vocab / Embedding | 248,320 | **248,321 (full + `<num>`, TRAINABLE)** | 0 |
 | Context length | 262,144 | **512** | VRAM only |
+| GSA | — | **REMOVED** | — |
+| LoopLM | — | **REMOVED** | — |
+| RTI | mask_rgb + mask_depth + space | **mask_rgb + mask_depth + mask_geo (3 learned tokens)** | — |
 | Number Head | — | **+0.26M** (NEW, softplus) | — |
-| **Total** | **853M** | **~465M (~465M trainable)** | **~388M (45%)** |
+| **Total** | **853M** | **~797M (~797M trainable)** | **~56M (7%)** |
 
 > **Key**: `hidden_dim = 1024` is **unchanged** — all tensor shapes between modules stay identical.
 
@@ -36,26 +39,29 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 > **Depth**: ~78K RGB-D pairs — real depth sensor data available \
 > **Regions**: encoded as `<mask>` in question text, with per-region **RLE** in JSON \
-> **Vocab**: Full original vocabulary (248,321 = 248,320 + <num> token) \
+> **Vocab**: Full original vocabulary (248,321 = 248,320 + `<num>` token) \
 > **CoT**: GPT reasoning wrapped in `<think>...</think>` as chain-of-thought training signal \
 > **Labels**: Question & answer tokenized separately then concatenated (BPE-safe boundary)
 
 ---
 
-## Qwen 3.5 Micro Architecture
+## Qwen 3.5 Micro v2 Architecture
 
-| Spec | Original 0.8B | **Micro** |
+| Spec | Original 0.8B | **Micro v2** |
 |------|-----------|-----------|
 | Type | VLM (Vision + Language) | Same |
 | LLM Hidden Dim | 1024 | **1024** (unchanged) |
-| Vision Blocks | 12 | **4** |
+| Vision Blocks | 12 | **4** (pruned) |
 | Vision Hidden Dim | 768 | **768** (unchanged) |
-| Decoder Layers | 24 | **8 (LoopLM T_max=3 = effective depth 24)** |
-| Layer Layout | 6 × (3 DeltaNet + 1 GatedAttn) | **2 × (3 DeltaNet + 1 GatedAttn) × T_max loops** |
+| Decoder Layers | 24 | **24 (full, single pass)** |
+| Layer Layout | 6 × (3 DeltaNet + 1 GatedAttn) | **6 × (3 DeltaNet + 1 GatedAttn)** (unchanged) |
 | FFN (SwiGLU) dim | 3584 | **3584** (unchanged) |
-| Vocab / Embedding | 248,320 | **248,321 (full + <num>)** |
+| Vocab / Embedding | 248,320 | **248,321 (full + `<num>`)** |
 | Context Length | 262,144 | **512** |
-| **Number Head** | — | **Linear(1024->256->1)** |
+| GSA | — | **REMOVED** |
+| LoopLM | — | **REMOVED** |
+| **RTI** | — | **3 learned tokens per `<mask>`** |
+| **Number Head** | — | **Linear(1024→256→1)** |
 
 ### Parameter Breakdown
 
@@ -63,31 +69,29 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 |-----------|--------|-----------|--------|
 | Vision Encoder | 44.10M | ✅ Yes | 4 ViT blocks (768-dim) + merger |
 | Token Embeddings (tied w/ LM Head) | 254M | ✅ **Trainable** | 248,321 × 1024 (full vocab) |
-| Text Decoder (8 layers × T_max=3) | ~166M | ✅ Yes | 2 × (3 DeltaNet + 1 GatedAttn), effective depth 24 |
+| Text Decoder (24 layers) | ~498M | ✅ Yes | 6 × (3 DeltaNet + 1 GatedAttn) |
+| RTI (3 learned tokens) | ~0.07M | ✅ Yes | rgb_proj + depth_proj + geo_proj |
 | Number Head | 0.26M | ✅ Yes | xVal-style regression (softplus) |
-| **Total (Qwen Micro)** | **~465M** | **~465M** | All trainable |
-| GSA (2 blocks, custom) | +16.91M | ✅ Yes | Custom module |
-| RTI (region tokens, custom) | +0.032M | ✅ Yes | Custom module |
-| **Grand Total** | **~482M** | **~482M trainable** | |
+| **Grand Total** | **~797M** | **~797M trainable** | |
 
 ### VRAM Estimate (BF16 training)
 
-| | Original 0.8B | **Micro ~482M** |
+| | Original 0.8B | **Micro v2 ~797M** |
 |---|---|---|
-| Model weights | ~1.7 GB | **~0.96 GB** |
+| Model weights | ~1.7 GB | **~1.6 GB** |
 | KV cache (inference) | ~2 GB | **~0.04 GB** |
-| Gradients + optimizer | ~5 GB | **~2.9 GB** |
-| Logits [B=8, L=80, V] | ~640 MB (248K) | **~640 MB (248K)** |
-| Batch data headroom (12GB GPU) | ~3 GB | **~7.5 GB** |
-| **Estimated batch size** | 1–2 | **6–10** |
+| Gradients + optimizer | ~5 GB | **~6.4 GB** |
+| Logits [B=2, L=80, V] | ~160 MB (248K) | **~160 MB (248K)** |
+| Batch data headroom (12GB GPU) | ~3 GB | **~3.8 GB** |
+| **Estimated batch size** | 1–2 | **2 (+ grad accum)** |
 
 ---
 
 ## Pruning Strategy — Which Weights to Keep
 
-### Vision: 12 -> 4 ViT Blocks
+### Vision: 12 → 4 ViT Blocks
 
-**Keep the LAST 4 blocks: [8, 9, 10, 11] -> renumber to [0, 1, 2, 3]**
+**Keep the LAST 4 blocks: [8, 9, 10, 11] → renumber to [0, 1, 2, 3]**
 
 Later ViT blocks encode higher-level semantic features (object identity, spatial layout).
 Early blocks (0–7) do low-level edge/texture processing. With fine-tuning, the remaining
@@ -95,61 +99,40 @@ Early blocks (0–7) do low-level edge/texture processing. With fine-tuning, the
 
 ```
 Original:  block.0  block.1  block.2  ...  block.7  [block.8  block.9  block.10  block.11]
-                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Micro:                                               [block.0  block.1  block.2   block.3 ]
 ```
 
 **Kept components:**
 - `patch_embed` (Conv3D): unchanged — 1.18M
 - `pos_embed`: unchanged — 1.77M
-- `blocks.8->0, 9->1, 10->2, 11->3`: 4 × 7.09M = 28.36M
+- `blocks.8→0, 9→1, 10→2, 11→3`: 4 × 7.09M = 28.36M
 - `merger`: unchanged — 12.59M
 
-### Decoder: 24 -> 8 Layers (LoopLM, T_max=3)
+### Decoder: 24 Layers — Full, Single Pass
 
-**Keep groups [0,1] -> 8 layers, loop T_max=3 at runtime = effective depth 24**
+**All 24 layers kept** Runs as a standard transformer decoder in a single forward pass.
 
-Based on "Scaling Latent Reasoning via Looped Language Models" (Ouro, arXiv:2510.25741).
+Each group = 3 × DeltaNet (~21.56M each) + 1 × GatedAttn (~18.35M) = ~83.0M
+6 groups = ~498M total
 
-- Group 0 (layers 0–3): **early** — question parsing, token-level understanding
-- Group 1 (layers 4–7): **mid** — deeper reasoning, spatial relation processing
-- LoopLM: iterative refinement with **fixed T_max=3 loops** (always full depth)
-
+**Layer type pattern (24 layers):**
 ```
-Original:  [Group 0]  [Group 1]  Group 2  Group 3  Group 4  Group 5
-           layers 0-3  layers 4-7                            layers 20-23
-              ↓
-Micro:     [Group 0 + Group 1] × T_max = effective depth 24 (always 3 loops)
-           layers 0-7  →  layers 0-7  →  layers 0-7
-           loop 1         loop 2         loop 3
+[linear, linear, linear, full, linear, linear, linear, full,
+ linear, linear, linear, full, linear, linear, linear, full,
+ linear, linear, linear, full, linear, linear, linear, full]
 ```
 
-**Per group** = 3 × DeltaNet (~21.55M each) + 1 × GatedAttn (~18.35M) = ~83.0M
-**2 groups × T_max=3** = ~166M params, effective depth 24 (same as original!)
-
-**Layer type pattern**: `[linear, linear, linear, full, linear, linear, linear, full]`
-
-**Training**: uniform-weighted CE loss across all loop steps: `L = (1/T) · Σ_t CE^(t)`.
-All steps receive equal gradient, ensuring deeper loops are properly trained.
-**Inference**: always runs full T_max=3 loops, uses final step's logits.
-
-### Vocabulary: 248,320 -> 248,321 (Full Original + <num>)
+### Vocabulary: 248,320 → 248,321 (Full Original + `<num>`)
 
 **No vocabulary pruning.** The full original Qwen 3.5 vocabulary (248,320 tokens) is kept intact.
-Only the `<num>` token is appended at the end (ID = 248,320) for numeric regression tasks.
+Only the `<num>` token is appended at the end (ID = 248,077) for numeric regression tasks.
 
-This preserves the pretrained BPE tokenizer completely — all byte-level tokens and merge rules
-are intact, ensuring correct encoding/decoding of all text.
-
-**<num> token**: Placed at the **end of vocab** (ID = 248,320).
-Random init, stored in config as `num_token_id`.
+**`<num>` token**: Random init, stored in config as `num_token_id`.
 
 **TRAINABLE**: `embed_tokens.weight.requires_grad = True`. LM head is tied → also trainable.
-With 248K tokens, embedding is ~254M params — the largest component of the model.
 
-
-
-### Context: 262,144 -> 512
+### Context: 262,144 → 512
 
 Config-only change. RoPE is computed dynamically — no weight modification.
 
@@ -167,61 +150,75 @@ At 320p input resolution with 2×2 spatial merge:
 ```mermaid
 flowchart TB
     subgraph INPUT["INPUT"]
-        Q["Question Text\n(with <mask> placeholders)"]
-        RGB["RGB Image (450p)"]
+        Q["Question Text\n(with &lt;mask&gt; placeholders)"]
+        RGB["RGB Image (320p)"]
         D["Depth Map"]
         RLE["RLE Masks"]
     end
 
-    subgraph VISION["Vision Encoder (44M)"]
-        PE["patch_embed (Conv3D)\n-> [B, N, 768]"]
-        POS["pos_embed (learned)"]
-        VIT["4 ViT Blocks\n(768-dim, blocks 8-11 from original)"]
-        MG["Merger (VL Projector)\n2×2 merge -> MLP(3072->1024)\n-> visual tokens [B, N/4, 1024]"]
-        PE --> POS --> VIT --> MG
+    subgraph STREAM1["Stream 1: Visual"]
+        subgraph VISION["Vision Encoder (44M)"]
+            PE["patch_embed (Conv3D)\n→ [B, N, 768]"]
+            POS["pos_embed (learned)"]
+            VIT["4 ViT Blocks\n(768-dim, blocks 8-11)"]
+            MG["Merger (VL Projector)\n2×2 merge → MLP(3072→1024)\n→ visual_tokens [B, 160, 1024]"]
+            PE --> POS --> VIT --> MG
+        end
     end
 
-    subgraph GSA["GSA: Geometry Self-Attention ×2 (16.9M)"]
-        GP["GeoPriorGen\n(depth -> RoPE + decay)"]
-        FGSA["Full_GSA + FFN\n(2 blocks)"]
-        GP --> FGSA
+    subgraph STREAM2["Stream 2: Region"]
+        subgraph RTI["RTI: Region Token Injection (0.07M)"]
+            SOFT["RLE → binary_mask\n→ soft2d coverage"]
+            MRGB["mask_rgb:\nRGB × binary → color/texture stats\n→ Linear(20→1024) + LN"]
+            MDEP["mask_depth:\ndepth × binary → depth stats\n→ Linear(28→1024) + LN"]
+            MGEO["mask_geo:\ndepth + mask → spatial context\n→ Linear(16→1024) + LN"]
+            SOFT --> MRGB & MDEP & MGEO
+        end
     end
 
-    subgraph RTI["RTI: Region Token Injection (0.032M)"]
-        SOFT["RLE -> soft coverage mask"]
-        MRGB["mask_rgb: Gated Attn Pool\n-> [B, 1024]"]
-        MDEP["mask_depth: depth stats\n-> Linear(28->1024) -> [B, 1024]"]
-        SOFT --> MRGB & MDEP
+    subgraph EMBED["Text Embedding"]
+        EMB["Token Embeddings\n248K vocab × 1024\nTRAINABLE"]
     end
 
-    subgraph DECODER["Text Decoder (166M, LoopLM T_max=3)"] 
-        EMB["Token Embeddings\n248K vocab x 1024\nTRAINABLE"]
-        DEC["8 Layers x T_max=3 loops (LoopLM)\n2 x (3 DeltaNet + 1 GatedAttn)\nhidden=1024, FFN=3584"]
-        EMB --> DEC
+    subgraph INJECT["3→3 Injection"]
+        INJ["Replace &lt;mask&gt; tokens\nwith [mask_rgb, mask_depth, mask_geo]"]
+    end
+
+    subgraph FUSION["Concat Fusion"]
+        CAT["[visual_tokens | text_embeds]\n→ [B, 160+L, 1024]"]
+    end
+
+    subgraph DECODER["Text Decoder (498M)"]
+        DEC["24 Layers (single pass)\n6 × (3 DeltaNet + 1 GatedAttn)\nhidden=1024, FFN=3584"]
     end
 
     subgraph HEADS["Dual Output Heads"]
-        LM["LM Head (tied w/ embed)\n-> category + text answer\n(count, mcq, left_right)"]
-        NUM["Number Head (xVal)\nLinear(1024->256->1)\n-> continuous distance"]
+        LM["LM Head (tied w/ embed)\n→ category + text answer"]
+        NUM["Number Head (xVal)\nLinear(1024→256→1)\n→ scalar prediction"]
     end
 
     RGB --> PE
-    D --> GP
-    D --> MDEP
+    RGB --> MRGB
+    D --> MDEP & MGEO
     RLE --> SOFT
-    MG --> FGSA
-    FGSA --> MRGB
     Q --> EMB
-    MRGB --> DEC
-    MDEP --> DEC
+
+    MG --> CAT
+    MRGB & MDEP & MGEO --> INJ
+    EMB --> INJ --> CAT
+    CAT --> DEC
 
     DEC --> LM
-    DEC -->|"hidden @ <num>"| NUM
+    DEC -->|"hidden @ &lt;num&gt;"| NUM
 
     style INPUT fill:#1a1a2e,stroke:#e94560,color:#fff
+    style STREAM1 fill:#0a1628,stroke:#0f3460,color:#fff
+    style STREAM2 fill:#0a2818,stroke:#00b894,color:#fff
     style VISION fill:#16213e,stroke:#0f3460,color:#fff
-    style GSA fill:#0f3460,stroke:#533483,color:#fff
     style RTI fill:#0d3320,stroke:#00b894,color:#fff
+    style EMBED fill:#1a1a2e,stroke:#636e72,color:#fff
+    style INJECT fill:#1a2e1a,stroke:#6ab04c,color:#fff
+    style FUSION fill:#2d1a3e,stroke:#a855f7,color:#fff
     style DECODER fill:#16213e,stroke:#3b82f6,color:#fff
     style HEADS fill:#533483,stroke:#a855f7,color:#fff
 ```
@@ -232,53 +229,86 @@ flowchart TB
 
 | Custom Module | File | Position | Function | Params |
 |--------------|------|----------|----------|--------|
-| **GSA** (2 blocks) | `gsa.py` | After Merger, before Decoder | Inject depth geometry into visual tokens | **~16.9M** |
-| **RTI** | `rti.py` | After GSA, before Decoder | Decode RLE -> `[mask_rgb, mask_depth, space]` 3→3 injection | **~0.032M** |
-| **Number Head** | `num_head.py` | After Decoder | xVal-style distance regression | **~0.26M** |
+| **RTI** | `rti.py` | Before Decoder | RGB + Depth + RLE → `[mask_rgb, mask_depth, mask_geo]` 3→3 injection | **~0.07M** |
+| **Number Head** | `num_head.py` | After Decoder | xVal-style distance/count regression | **~0.26M** |
 
-### GSA Detail — DFormerv2 Full_GSA (2 blocks × ~8.46M)
+### RTI Detail — 3 Learned Tokens per `<mask>` Region
 
-Operates on visual tokens [B, N, 1024] with depth prior.
+The RTI module is **independent of the Vision Encoder**. It processes raw inputs (RGB image, depth map, RLE masks) to produce 3 informative tokens per `<mask>` region. These are injected into the text embedding sequence before concat fusion with visual tokens.
 
-| Sub-module | Params/block |
-|------------|-------------|
-| GeoPriorGen | ~0.000M |
-| cnn_pos_encode | 0.010M |
-| Full_GSA (Q/K/V/O + lepe) | 4.225M |
-| FeedForwardNetwork | 4.218M |
-| **× 2 blocks** | **~16.91M** |
+Two parallel streams feed the decoder:
+- **Stream 1 (Visual)**: RGB → Vision Encoder → 160 visual tokens (scene-level semantics)
+- **Stream 2 (Region)**: RGB + Depth + RLE → RTI → per-region tokens (region-level descriptors)
 
-### RTI Detail — Region-Level Token Injection (3→3)
-
-Each `<mask>` (3 tokens: `<`, `mask`, `>`) → `[mask_rgb, mask_depth, space_embed]` (3 tokens).
+Each `<mask>` (3 BPE tokens: `<`, `mask`, `>`) → `[mask_rgb, mask_depth, mask_geo]` (3 tokens).
 
 **3→3 in-place replacement**: sequence length is **UNCHANGED**. No offset calculations,
-no front-trimming of labels, no padding needed. This avoids alignment complexity.
+no front-trimming of labels, no padding needed.
+
+#### Token 1: `mask_rgb` — Region Appearance
+
+| Feature | Dim | Description |
+|---------|-----|-------------|
+| Mean R, G, B | 3 | Average color of the masked region |
+| Std R, G, B | 3 | Color variation within the region |
+| Color histogram | 12 | 4 bins per channel (R, G, B) |
+| Edge density | 1 | Ratio of edge pixels within the region |
+| Texture energy | 1 | Laplacian variance (texture measure) |
+| **Total** | **20** | → `Linear(20→1024) + LayerNorm` |
+
+Computed from: raw RGB image × binary mask (from RLE)
+
+#### Token 2: `mask_depth` — Region Depth Profile
+
+| Feature | Dim | Description |
+|---------|-----|-------------|
+| Mean depth | 1 | Average depth of masked pixels |
+| Std depth | 1 | Depth variation within region |
+| Centroid x, y | 2 | Soft-mask weighted centroid (normalized 0–1) |
+| 24 radial depth rays | 24 | Depth profile radiating from centroid |
+| **Total** | **28** | → `Linear(28→1024) + LayerNorm` |
+
+Computed from: raw depth map × binary mask, with soft2d for centroid/ray weighting
+
+#### Token 3: `mask_geo` — Spatial Context (NEW)
+
+| Feature | Dim | Description |
+|---------|-----|-------------|
+| Global mean depth | 1 | Scene average depth |
+| Global std depth | 1 | Scene depth variation |
+| Relative depth | 1 | `region_mean / global_mean` |
+| Depth percentile | 1 | Where region falls in global depth CDF |
+| Region area ratio | 1 | `mask_area / total_area` |
+| Centroid x, y | 2 | Normalized centroid position (0–1) |
+| Bbox width, height | 2 | Normalized bounding box dimensions |
+| Edge depth contrast | 1 | Boundary vs interior depth ratio |
+| Min depth (norm.) | 1 | Region min depth / global max |
+| Max depth (norm.) | 1 | Region max depth / global max |
+| Aspect ratio | 1 | `bbox_w / bbox_h` |
+| Compactness | 1 | `area / (perimeter²)` — shape measure |
+| **Total** | **~16** | → `Linear(16→1024) + LayerNorm` |
+
+Computed from: raw depth map + binary mask + soft2d mask
+
+#### RTI Learnable Parameters
 
 | Sub-module | Params |
 |------------|--------|
-| RGB gate | 1,024 |
-| Depth projector | 31,744 |
-| **Total** | **~0.032M** |
-
-| Token | Source |
-|-------|--------|
-| `mask_rgb` | Gated attention pooling over visual tokens [1, 1024] |
-| `mask_depth` | Depth statistics → Linear(28→1024) [1, 1024] |
-| `space_embed` | Frozen embedding of `" "` (space) token [1, 1024] |
+| `rgb_proj` (Linear(20→1024) + LN) | ~22K |
+| `depth_proj` (Linear(28→1024) + LN) | ~31K |
+| `geo_proj` (Linear(16→1024) + LN) | ~18K |
+| **RTI Total** | **~0.07M** |
 
 ### RTI Batching Strategy (enables batch_size > 1)
-
-The RTI supports `batch_size > 1` via in-place per-sample replacement (no output length changes).
 
 Implementation: `model_micro/rti.py` + `src/dataloader/dataloader_new.py`
 
 | Aspect | Detail |
-|--------|-------|
+|--------|--------|
 | `forward()` input | `rle_list: list[list[dict]]` (batched) |
 | `inject_into_text_embeds()` | **3→3 in-place** (no length change) |
 | `collate_fn()` | Pads to max length, nests masks as `list[list]` |
-| Effective batch | **8–16** (true batching) |
+| Effective batch | **2–4** (true batching) |
 
 ### Number Head — xVal-style Regression
 
@@ -316,31 +346,23 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 | Head | What it learns | Active for |
 |------|---------------|------------|
 | **LM Head** | `<think>` reasoning + category + format | All tasks |
-| **Number Head** | Scalar from hidden state @ <num> position | distance, count |
+| **Number Head** | Scalar from hidden state @ `<num>` position | distance, count |
 
 ---
 
-## Loss Function — Uniform Per-Step CE
+## Loss Function — CE + SmoothL1
 
 Implementation: `model_micro/loss.py`
 
-Based on "Scaling Latent Reasoning via Looped Language Models" (Ouro, arXiv:2510.25741).
-
-`L = (1/T) · Σ_t CE^(t) + α · L_SmoothL1`
+`L = CE(label_smoothing=0.1) + α · L_SmoothL1`
 
 Where:
-```
-L = (1/T) · Σ_t CE^(t)(label_smoothing=0.1)  +  α · L_SmoothL1
-```
-
-- **CE^(t)**: Per-step cross-entropy at loop step t (LM head applied at every step)
-- **T**: Number of loop steps (T_max = 4). All steps receive equal gradient weight.
+- **CE**: Cross-entropy loss on LM head output (single pass, no per-step weighting)
 - **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
   - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
   - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
+- **α**: Weight for SmoothL1 (default 0.1)
 - **No label trimming**: 3→3 RTI preserves sequence length — labels and logits always align
-
-**Training regime**: Single-stage joint training. All loop steps are trained equally.
 
 ---
 
@@ -358,27 +380,21 @@ input_ids = q_ids + sep_ids + a_ids           # exact concatenation
 labels    = [-100]*len(q_ids+sep_ids) + a_ids  # -100 for question, active for answer
 ```
 
-**Why this matters**: BPE tokenizers are context-dependent. Tokenizing `question + "\n" + answer`
-as one string can produce different token boundaries at the `\n` than tokenizing parts separately.
-Separate tokenization + concatenation guarantees the label boundary is always exact.
-
 ---
 
 ## Training Strategy — Full Fine-tuning
 
-**All components trainable**. With pruned ~300 vocab, the embedding
-layer is negligible (~0.3M params), allowing nearly all capacity for the decoder.
+**All components trainable.**
 
 | Component | Status | LR |
 |-----------|--------|-----|
 | Vision Encoder (4 ViT blocks) | ✅ **Trainable** | 5e-5 |
 | Token Embeddings (248K, tied w/ LM Head) | ✅ **Trainable** | 1e-5 |
-| Text Decoder (8 layers × T_max=3) | ✅ **Trainable** | 1e-5 |
-| GSA (2 blocks) | ✅ **Trainable** | 5e-5 |
+| Text Decoder (24 layers) | ✅ **Trainable** | 1e-5 |
 | RTI | ✅ **Trainable** | 5e-5 |
 | Number Head | ✅ **Trainable** | 5e-4 |
 
-**Loss**: `L = (1/T) · Σ_t CE^(t)(label_smoothing=0.1) + α·L_SmoothL1` (α=0.1)
+**Loss**: `L = CE(label_smoothing=0.1) + α·L_SmoothL1` (α=0.1)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
 
@@ -396,3 +412,19 @@ layer is negligible (~0.3M params), allowing nearly all capacity for the decoder
 
 > Default training resolution: **320p (512×320)** — 160 visual tokens.
 > Total sequence (visual + CoT text): ~230–290 tokens. Fits in 512.
+
+---
+
+## What Changed from v1 (Micro) to v2
+
+| Aspect | v1 (Micro) | v2 (Micro) |
+|--------|-----------|-----------|
+| **GSA** | 2 blocks, 16.9M params, 1330ms/step | **REMOVED** |
+| **LoopLM** | 8 layers × 3 loops | **REMOVED** |
+| **Decoder** | 8 layers (166M) | **24 layers, single pass (498M)** |
+| **RTI mask_rgb** | Gated attention pool over Vision Encoder output | **Raw RGB stats → Linear(20→1024)** |
+| **RTI 3rd token** | Frozen space embed (no information) | **Learned mask_geo (spatial context)** |
+| **RTI coupling** | Depends on Vision Encoder output | **Independent of Vision Encoder** |
+| **Total params** | ~482M | **~797M** |
+| **Loss** | `(1/T)·Σ CE^(t) + α·SmoothL1` | **`CE + α·SmoothL1`** |
+| **Speed** | ~2700ms/step (GSA bottleneck) | **~1400ms/step (estimated)** |

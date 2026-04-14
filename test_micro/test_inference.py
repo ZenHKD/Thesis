@@ -80,6 +80,7 @@ def run_inference(pipeline, sample: dict) -> dict:
     # image_grid_thw: [1, 3] — already has image dim
     # depth_map: [H, W] -> [1, H, W] — needs batch dim
     pixel_values   = sample["pixel_values"].to(device=dev, dtype=dtype)
+    pixel_values_rgb = sample["pixel_values_rgb"].unsqueeze(0).to(device=dev, dtype=dtype)
     image_grid_thw = sample["image_grid_thw"].to(device=dev)
     depth_map      = sample["depth_map"].unsqueeze(0).to(device=dev, dtype=dtype)
 
@@ -103,7 +104,7 @@ def run_inference(pipeline, sample: dict) -> dict:
 
     # Step 1: Generate text tokens (always T_max loops)
     output_ids = pipeline.generate(
-        pixel_values, image_grid_thw, depth_map, input_ids,
+        pixel_values, pixel_values_rgb, image_grid_thw, depth_map, input_ids,
         rle_list=[rle_list],
         mask_token_positions=[mask_positions],
         decoded_masks=[decoded_masks],
@@ -135,6 +136,7 @@ def run_inference(pipeline, sample: dict) -> dict:
         if num_token_pos >= 0:
             output = pipeline(
                 pixel_values=pixel_values,
+                pixel_values_rgb=pixel_values_rgb,
                 image_grid_thw=image_grid_thw,
                 depth_maps=depth_map,
                 input_ids=full_input_ids,
@@ -206,7 +208,7 @@ def main():
         print("  Using untrained pruned model (no checkpoint)")
     pipeline.eval()
 
-    print(f"\n  T_max (loops): {pipeline.num_loops}")
+    print(f"\n  Decoder Layers: 24 (single pass)")
 
     # ------------------------------------------------------------------ #
     # Load dataset
