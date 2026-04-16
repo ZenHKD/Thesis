@@ -12,40 +12,39 @@
 
 ### Micro model, see `model_micro/`
 
-Pruned from **Qwen 3.5 0.8B** (853M): Vision Encoder (12 → 4 blocks), Backbone (full 24 layers, **single-pass** — no looping). **Full original vocabulary** (248,076 + `<num>` = 248,077 tokens -> remain 248,320 tokens (padded)). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Two parallel input streams: visual (Vision Encoder → 160 tokens) and region (RTI, independent of Vision Encoder → 3 learned tokens per `<mask>`). Full fine-tuning (~797M trainable parameters).
+Pruned from **Qwen 3.5 0.8B** (853M): Vision Encoder (12 -> 4 blocks), Backbone (full 24 layers, **single-pass** — no looping). **Full original vocabulary** (248,076 + `<num>` = 248,077 tokens -> remain 248,320 tokens (padded)). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Two parallel input streams: visual (Vision Encoder -> 160 tokens) and region (RTI, independent of Vision Encoder -> 3 learned tokens per `<mask>`). Full fine-tuning (~797M trainable parameters).
 
-```
-RGB Image -----> [Vision Encoder] --> [Merger] --> visual tokens [B, 160, 1024]
-                  (4 ViT blocks)                         |
-                                                         |
-                +----------------------------------------+
-                |                                        |
-                v                                        |
-RGB Image --> [RTI: Region Token Injection]              |
-Depth Map  --> (Independent of Vision Encoder)           |
-RLE Masks  --> (mask_rgb + mask_depth + mask_geo)        |
-                |  3 learned tokens per <mask>           |
-                v                                        v
-Question --> [Embed] (Full 248,321 vocab) --> [Inject] --> [Concat Fusion]
-                                                                |
-                                                                v
-                                               [Qwen Backbone] 24 layers (single pass)
-                                               (6 × [3 DeltaNet + 1 GatedAttn])
-                                                                |
-                                              +-----------------+-----------------+
-                                              v                                   v
-                                          [LM Head]                       [Number Head] (xVal)
-                                              |                                   |
-                                              v                                   v
-                                       Structured Output                  Numeric Prediction
-                                  <think>reasoning</think>              distance (m) / count (n)
-                                       category | answer
-                                              |                                   |
-                                              v                                   v
-                                    L_CE (label_smooth=0.1)             L_SmoothL1 (regression)
-                                              |                                   |
-                                              +----------- L_total ---------------+
-                                                    L = L_CE + α·L_SmoothL1 (α=0.1)
+```text
+Stream 1 (Visual)
+RGB Image --------> [Vision Encoder] --> [Merger] ======> visual tokens [160, 1024]
+                     (4 ViT blocks)                              ||
+                                                                 ||
+Stream 2 (Region)                                                ||
+RGB Image --------> [RTI: Region Token Injection]                ||
+Depth Map --------> (Independent of Vision Encoder)              ||
+RLE Masks --------> (mask_rgb + mask_depth + mask_geo)           ||
+                                                    |            ||
+                                                    v            ||
+Question* --------> [Token Embedding] =========> [Inject] ==> [Concat Fusion]
+(*w/ <mask...>)    (Full 248,320 vocab)       (3->3 Replace)     ||
+                                                                 vv
+                                                   [Qwen Backbone] 24 layers (single pass)
+                                                   (6 × [3 DeltaNet + 1 GatedAttn])
+                                                                 ||
+                                             +===================++===================+
+                                             v                                        v
+                                         [LM Head]                            [Number Head] (xVal)
+                                             |                                        |
+                                             v                                        v
+                                      Structured Output                       Numeric Prediction
+                                 <think>reasoning</think>                   distance (m) / count (n)
+                                      category | answer
+                                             |                                        |
+                                             v                                        v
+                                   L_CE (label_smooth=0.0)                  L_SmoothL1 (regression)
+                                             |                                        |
+                                             +----------------- L_total --------------+
+                                                          L = L_CE + α·L_SmoothL1
 ```
 
 **Key differences from original model:**
@@ -82,7 +81,7 @@ Thesis/
 │   ├── rti.py                      # RTI (independent of Vision Encoder, batched)
 │   ├── num_head.py                 # Number Head (xVal-style softplus regression)
 │   ├── loss.py                     # Combined CE + SmoothL1 loss
-│   ├── prune.py                    # Pruning script (Qwen 3.5 0.8B → Micro)
+│   ├── prune.py                    # Pruning script (Qwen 3.5 0.8B -> Micro)
 │   ├── architecture_micro.md       # Detailed Micro architecture documentation
 │   └── qwen3.5-micro/              # Micro model weights (gitignored)
 ├── notebooks/

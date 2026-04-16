@@ -12,7 +12,7 @@ Key changes from v1 dataloader:
     4. collate_fn(): supports batch_size > 1 with padding
     5. Separate tokenization: question & answer tokenized independently
        then concatenated to guarantee exact label boundaries (BPE-safe)
-    6. RTI 3→3: <mask> (3 tokens) replaced by [mask_rgb, mask_depth, space]
+    6. RTI 3->3: <mask> (3 tokens) replaced by [mask_rgb, mask_depth, space]
        — NO sequence length change, no trimming needed
 
 Splits: train (499K), val (1.9K), test (19K)
