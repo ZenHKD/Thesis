@@ -56,7 +56,19 @@ def save_checkpoint(pipeline, optimizer, scheduler, step, epoch, loss, path):
 
     # Save model weights via safetensors
     model_state = {k: v for k, v in pipeline.state_dict().items()}
-    save_file(model_state, os.path.join(path, "model.safetensors"))
+    
+    # Safetensors vigorously rejects shared memory tensors (like tied embeddings/lm_head). 
+    # We explicitly strip out duplicates based on their raw memory pointer.
+    seen_ptrs = set()
+    cleaned_state = {}
+    for k, v in model_state.items():
+        ptr = v.data_ptr()
+        if ptr in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr)
+        cleaned_state[k] = v
+
+    save_file(cleaned_state, os.path.join(path, "model.safetensors"))
 
     # Save training state via torch
     torch.save({
