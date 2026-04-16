@@ -1,7 +1,5 @@
 """
-Test SpatialVLM Micro inference (always T_max loops).
-
-Uses the pipeline's built-in generate() which always runs all 4 loops.
+Test SpatialVLM Micro inference.
 
 Usage:
     # No checkpoint (untrained pruned model):
@@ -165,7 +163,8 @@ def main():
                         help="Checkpoint step to load (e.g. 20000). None = untrained.")
     parser.add_argument("--split",          default="train_sample",
                         choices=["train", "val", "test", "train_sample"])
-    parser.add_argument("--device",         default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--device",         default="cuda", choices=["cuda"],
+                        help="Device to run on (only cuda is supported)")
     parser.add_argument("--dtype",          default="bfloat16",
                         choices=["bfloat16", "float32"])
     parser.add_argument("--attn-impl",      default="flash_attention_2",
@@ -311,8 +310,9 @@ def main():
             if num_pred is not None:
                 try:
                     gt_num = float(gt_clean)
-                    match = abs(num_pred - gt_num) < 0.5
-                    match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} diff={abs(num_pred-gt_num):.2f}"
+                    rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
+                    match = rel_err < 0.10
+                    match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} rel_err={rel_err*100:.1f}%"
                 except (ValueError, TypeError):
                     match = False
                     match_detail = f"num_pred={num_pred:.2f} (GT not numeric)"
