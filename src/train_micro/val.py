@@ -152,9 +152,15 @@ def main():
 
     # Load checkpoint if specified
     if args.checkpoint:
-        ckpt_path = os.path.join(args.checkpoint, "checkpoint.pt")
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model_path = os.path.join(args.checkpoint, "model.safetensors")
+        if os.path.exists(model_path):
+            from safetensors.torch import load_file
+            model_state = load_file(model_path)
+            pipeline.load_state_dict(model_state, strict=False)
+        else:
+            ckpt_path = os.path.join(args.checkpoint, "checkpoint.pt")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
         print(f"  Loaded checkpoint: {args.checkpoint}")
 
     criterion = SpatialLoss(alpha=0.1)

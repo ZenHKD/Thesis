@@ -29,6 +29,7 @@ import math
 import argparse
 from collections import deque
 import torch
+from safetensors.torch import save_file, load_file
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -50,32 +51,41 @@ CHECKPOINT_DIR = os.path.join(PROJECT_DIR, "checkpoints", "micro")
 # =========================================================================
 
 def save_checkpoint(pipeline, optimizer, scheduler, step, epoch, loss, path):
-    """Save full model checkpoint."""
+    """Save full model checkpoint using safetensors."""
     os.makedirs(path, exist_ok=True)
 
+    # Save model weights via safetensors
+    model_state = {k: v for k, v in pipeline.state_dict().items()}
+    save_file(model_state, os.path.join(path, "model.safetensors"))
+
+    # Save training state via torch
     torch.save({
         "step": step,
         "epoch": epoch,
         "loss": loss,
-        "model_state_dict": {
-            k: v for k, v in pipeline.state_dict().items()
-        },
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-    }, os.path.join(path, "checkpoint.pt"))
+    }, os.path.join(path, "training_state.pt"))
     print(f"  [*] Checkpoint saved: {path}")
 
 
 def load_checkpoint(pipeline, optimizer, scheduler, path):
     """Load checkpoint and restore model + optimizer + scheduler."""
-    ckpt_path = os.path.join(path, "checkpoint.pt")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    model_path = os.path.join(path, "model.safetensors")
+    state_path = os.path.join(path, "training_state.pt")
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-
-    # Load model weights
-    pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if os.path.exists(model_path) and os.path.exists(state_path):
+        # Safetensors format
+        model_state = load_file(model_path)
+        pipeline.load_state_dict(model_state, strict=False)
+        ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
+    else:
+        # Fallback to old .pt format if resuming from earlier checkpoint
+        ckpt_path = os.path.join(path, "checkpoint.pt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found in {path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
 
     # Load optimizer + scheduler
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -98,16 +108,18 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
     parser.add_argument("--split",       default="train", choices=["train", "train_sample"])
-    parser.add_argument("--epochs",      type=int,   default=20)
+    parser.add_argument("--epochs",      type=int,   default=2)
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
     parser.add_argument("--lr-backbone", type=float, default=1e-5)
     parser.add_argument("--lr-custom",   type=float, default=5e-5)
-    parser.add_argument("--lr-numhead",  type=float, default=5e-4)
+    parser.add_argument("--lr-numhead",  type=float, default=5e-5)
     parser.add_argument("--alpha",       type=float, default=0.1,
                         help="Weight for SmoothL1 loss (α in L)")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--batch-size",  type=int,   default=2)
-    parser.add_argument("--grad-accum",  type=int,   default=4)
+    parser.add_argument("--batch-size",  type=int,   default=1)
+    parser.add_argument("--grad-accum",  type=int,   default=8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int,  default=500)
     parser.add_argument("--resolution",  default="320p",
@@ -123,7 +135,7 @@ def main():
                     help="Run validation every N steps (0 to disable)")
     # Logging & Checkpointing
     parser.add_argument("--log-steps",   type=int,   default=100)
-    parser.add_argument("--save-steps",  type=int,   default=20000)
+    parser.add_argument("--save-steps",  type=int,   default=5000)
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--num-workers", type=int,   default=2)
     parser.add_argument("--compile", action="store_true",
@@ -248,7 +260,7 @@ def main():
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(total_steps - args.warmup_steps, 1), eta_min=1e-6,
     )
-    criterion = SpatialLoss(alpha=args.alpha)
+    criterion = SpatialLoss(alpha=args.alpha, label_smoothing=args.label_smoothing)
     dev = pipeline.device
 
     # ====================================================================
@@ -476,7 +488,7 @@ def main():
                     lr_v = optimizer.param_groups[0]["lr"]
                     lr_e = optimizer.param_groups[1]["lr"]  # embed
                     lr_d = optimizer.param_groups[2]["lr"]  # decoder
-                    lr_c = optimizer.param_groups[3]["lr"]  # gsa_rti_loop
+                    lr_c = optimizer.param_groups[3]["lr"]  # rti
                     lr_n = optimizer.param_groups[4]["lr"]  # numhead
 
                     # Log to CSV with val_loss filled
@@ -498,6 +510,13 @@ def main():
         # ==============================================================
         epoch_elapsed = time.time() - epoch_start_time
         print(f"\nEpoch {epoch + 1} completed in {epoch_elapsed/60:.1f}min")
+
+        # Save end-of-epoch checkpoint
+        epoch_ckpt_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch + 1}")
+        save_checkpoint(
+            pipeline, optimizer, scheduler,
+            global_step, epoch + 1, window_avg, epoch_ckpt_path,
+        )
 
     # ====================================================================
     # 8. FINAL SUMMARY

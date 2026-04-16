@@ -124,7 +124,7 @@ def main():
             else:
                 print(f"  [OK] is_numeric=True, target_num={target_num}, num_token_pos={num_pos}")
             if num_pos == -1:
-                print(f"  [WARN] <num> token not found in input_ids")
+                print(f"  [WARN] <|num|> token not found in input_ids")
         else:
             if is_num:
                 print(f"  [FAIL] is_numeric should be False for {cat}")

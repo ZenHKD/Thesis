@@ -33,18 +33,34 @@ CKPT_DIR = os.path.join(ROOT, "checkpoints", "micro")
 # Checkpoint Loading
 # =========================================================================
 
-def load_checkpoint_weights(pipeline, step: int):
+def load_checkpoint_weights(pipeline, path: str):
     """Load only model weights from a training checkpoint (no optimizer)."""
-    ckpt_path = os.path.join(CKPT_DIR, f"step_{step}", "checkpoint.pt")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint directory not found: {path}")
 
-    print(f"  Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    print(f"  Loading checkpoint from: {path}")
+    
+    model_path = os.path.join(path, "model.safetensors")
+    if os.path.exists(model_path):
+        from safetensors.torch import load_file
+        model_state = load_file(model_path)
+        missing, unexpected = pipeline.load_state_dict(model_state, strict=False)
+        info = ("?", "?", "?")
+        
+        # Try to read info from training_state.pt
+        state_path = os.path.join(path, "training_state.pt")
+        if os.path.exists(state_path):
+            ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
+            info = ckpt.get("step", "?"), ckpt.get("epoch", "?"), ckpt.get("loss", "?")
+    else:
+        # Fallback to .pt
+        ckpt_path = os.path.join(path, "checkpoint.pt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found in {path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        missing, unexpected = pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
+        info = ckpt.get("step", "?"), ckpt.get("epoch", "?"), ckpt.get("loss", "?")
 
-    missing, unexpected = pipeline.load_state_dict(
-        ckpt["model_state_dict"], strict=False
-    )
     if missing:
         print(f"  Warning: Missing keys: {len(missing)}")
         for k in missing[:5]:
@@ -54,8 +70,10 @@ def load_checkpoint_weights(pipeline, step: int):
         for k in unexpected[:5]:
             print(f"    - {k}")
 
-    info = ckpt.get("step", "?"), ckpt.get("epoch", "?"), ckpt.get("loss", "?")
-    print(f"  Loaded: step={info[0]}, epoch={info[1]:.4f}, loss={info[2]:.6f}")
+    # Format epoch/loss nicely if they are numbers
+    epoch_str = f"{info[1]:.4f}" if isinstance(info[1], (float, int)) else str(info[1])
+    loss_str = f"{info[2]:.6f}" if isinstance(info[2], (float, int)) else str(info[2])
+    print(f"  Loaded: step={info[0]}, epoch={epoch_str}, loss={loss_str}")
     return info
 
 
@@ -63,7 +81,7 @@ def load_checkpoint_weights(pipeline, step: int):
 # Inference Runner
 # =========================================================================
 
-def run_inference(pipeline, sample: dict) -> dict:
+def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float = 0.9, top_k: int = 50, max_new_tokens: int = 150) -> dict:
     """Run inference on a single dataloader sample.
 
     Uses pipeline.generate() which always runs T_max loops.
@@ -85,8 +103,29 @@ def run_inference(pipeline, sample: dict) -> dict:
     # Re-tokenize without the answer (prompt only, direct tokenization)
     question = sample["_question"]
 
+    import re
+    question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
+
+    sys_str = (
+        "<|im_start|>system\n"
+        "You are an expert AI assistant for warehouse spatial reasoning. "
+        "Analyze the image and the specific object regions carefully. "
+        "First, output your step-by-step reasoning inside <think></think> tags. "
+        "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+    )
+    
+    h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+    h_vis, w_vis = h_p // 2, w_p // 2
+    num_visual_tokens = int(h_vis * w_vis)
+    
+    vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
+    user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+    eval_prompt = f"<|im_start|>assistant\n"
+    
+    full_prompt = sys_str + user_str + eval_prompt
+
     input_ids = pipeline.processor.tokenizer(
-        question, return_tensors="pt", padding=False
+        full_prompt, return_tensors="pt", padding=False
     ).input_ids.to(device=dev)
 
     # Find <mask> positions in the inference prompt
@@ -106,11 +145,14 @@ def run_inference(pipeline, sample: dict) -> dict:
         rle_list=[rle_list],
         mask_token_positions=[mask_positions],
         decoded_masks=[decoded_masks],
-        max_new_tokens=150,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        top_p=top_p,
+        top_k=top_k,
     )
     raw_output = pipeline.processor.tokenizer.decode(
         output_ids[0], skip_special_tokens=False
-    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
+    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
     raw_output = _re.sub(r'<think>.*?</think>\s*', '', raw_output, flags=_re.DOTALL).strip()
     parsed = pipeline.parse_output(raw_output)
 
@@ -118,13 +160,13 @@ def run_inference(pipeline, sample: dict) -> dict:
     num_pred_val = None
 
     _clean_pattern = _re.compile(
-        r'^<think>.+?</think>\s*(distance|count)\s*\|\s*<num>$', _re.DOTALL
+        r'^<think>.+?</think>\s*(distance|count)\s*\|\s*<\|num\|>$', _re.DOTALL
     )
 
     # Check raw output before stripping think tags
     raw_full = pipeline.processor.tokenizer.decode(
         output_ids[0], skip_special_tokens=False
-    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
+    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
     is_clean = bool(_clean_pattern.match(raw_full))
 
     if is_clean and parsed["category"] in ("distance", "count"):
@@ -159,8 +201,10 @@ def run_inference(pipeline, sample: dict) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Test SpatialVLM Micro inference")
+    parser.add_argument("--checkpoint",     type=str, default=None,
+                        help="Path to full checkpoint dir (e.g. checkpoints/micro/epoch_1)")
     parser.add_argument("--step",           type=int, default=None,
-                        help="Checkpoint step to load (e.g. 20000). None = untrained.")
+                        help="Legacy: Checkpoint step to load (e.g. 20000). None = untrained.")
     parser.add_argument("--split",          default="train_sample",
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--device",         default="cuda", choices=["cuda"],
@@ -172,6 +216,9 @@ def main():
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--max-new-tokens", type=int, default=150)
+    parser.add_argument("--do-sample",      action="store_true", help="Use sampling instead of greedy")
+    parser.add_argument("--top-p",          type=float, default=0.9, help="Top-p sampling")
+    parser.add_argument("--top-k",          type=int, default=50, help="Top-k sampling")
     parser.add_argument("--num-samples",    type=int, default=5,
                         help="Number of samples to test (from start of split)")
     parser.add_argument("--sample-idx",     type=int, nargs="+", default=None,
@@ -200,9 +247,16 @@ def main():
     )
     print_vram_usage("after model load")
 
-    if args.step is not None:
+    ckpt_label = "untrained"
+    if args.checkpoint is not None:
+        print(f"\n  Loading checkpoint: {args.checkpoint}...")
+        load_checkpoint_weights(pipeline, args.checkpoint)
+        ckpt_label = os.path.basename(args.checkpoint.rstrip("/"))
+    elif args.step is not None:
+        ckpt_path = os.path.join(CKPT_DIR, f"step_{args.step}")
         print(f"\n  Loading checkpoint step={args.step}...")
-        load_checkpoint_weights(pipeline, args.step)
+        load_checkpoint_weights(pipeline, ckpt_path)
+        ckpt_label = f"step_{args.step}"
     else:
         print("  Using untrained pruned model (no checkpoint)")
     pipeline.eval()
@@ -270,7 +324,6 @@ def main():
     # Run inference
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
-    ckpt_label = f"step={args.step}" if args.step else "untrained"
     print(f"INFERENCE  ({N} samples, {ckpt_label})")
     print(f"{'='*70}")
 
@@ -280,8 +333,8 @@ def main():
     for i, s in enumerate(samples):
         cat = s["category"]
         gt = s["answer"]
-        if gt.startswith("<num>="):
-            gt_clean = gt[6:]
+        if gt.startswith("<|num|>="):
+            gt_clean = gt[8:]
         else:
             gt_clean = gt.strip('"')
 
@@ -295,7 +348,7 @@ def main():
 
         try:
             with torch.no_grad():
-                result = run_inference(pipeline, s)
+                result = run_inference(pipeline, s, do_sample=args.do_sample, top_p=args.top_p, top_k=args.top_k, max_new_tokens=args.max_new_tokens)
         except Exception as e:
             print(f"  Warning: Inference failed: {e}")
             import traceback

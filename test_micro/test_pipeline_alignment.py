@@ -5,7 +5,7 @@ Integration test that loads REAL data and verifies:
 
   1. TOKEN TABLE
      Prints every token with position, ID, decoded text, label, active status.
-     Shows where the answer starts and <num> token position.
+     Shows where the answer starts and <|num|> token position.
 
   2. VOCAB + EMBEDDING CHECK
      Verifies input_ids are valid for the model vocab.
@@ -75,21 +75,7 @@ def print_token_table(input_ids: torch.Tensor, labels: torch.Tensor,
     print(f"  Answer tokens (active):  {n_active}")
     print(f"  Answer starts at position: {answer_start}")
 
-    head_rows   = list(range(min(5, L)))
-    pre_answer  = list(range(max(0, answer_start - 3), answer_start))
-    answer_rows = list(range(answer_start, min(answer_start + 20, L)))
-    tail_rows   = list(range(max(answer_start + 20, L - 3), L))
-
-    rows_to_show = sorted(set(head_rows + pre_answer + answer_rows + tail_rows))
-
-    header = f"  {'Pos':>5}  {'TokID':>7}  {'Decoded Token':<32}  {'Label':>8}  Active?"
-    print(f"\n{header}")
-    print(f"  {'─'*72}")
-
-    prev = -1
-    for pos in rows_to_show:
-        if pos - prev > 1:
-            print(f"  {'...':>5}  {'...':>7}  {'...':^32}  {'...':>8}  ...")
+    for pos in range(L):
         tok_id  = ids[pos]
         lbl     = lbls[pos]
         decoded = decode_token(tokenizer, tok_id)
@@ -97,7 +83,6 @@ def print_token_table(input_ids: torch.Tensor, labels: torch.Tensor,
         active  = "  YES  <--" if lbl != -100 else ""
         marker  = " <<< ANSWER START" if pos == answer_start else ""
         print(f"  {pos:>5}  {tok_id:>7}  {decoded:<32}  {lbl_str:>8}  {active}{marker}")
-        prev = pos
 
     print(f"  {'─'*72}")
     print(f"  Answer tokens decoded:")
@@ -164,8 +149,8 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
     print(f"  Vocab size: {vocab_size}")
 
     print(f"\n  {'Pos':>5}  {'TokenID':>8}  {'Decoded':>14}  "
-          f"{'Pred':>8}  {'P(target)':>10}  {'CE Loss':>9}  Match?")
-    print(f"  {'─'*85}")
+          f"{'Pred':>8}  {'DecPred':>14}  {'P(target)':>10}  {'CE Loss':>9}  Match?")
+    print(f"  {'─'*101}")
 
     logits_cpu = logits.cpu().float()
     per_token_losses = []
@@ -180,14 +165,15 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
         pred_id = logit_vec.argmax().item()
         # Decode directly (native Qwen IDs, no remapping)
         target_text = decode_token(tokenizer, token_id)
+        pred_text = decode_token(tokenizer, pred_id)
         match = "[OK]" if pred_id == token_id else "[FAIL]"
 
         print(f"  {t:>5}  {token_id:>8}  {target_text:>14}  "
-              f"{pred_id:>8}  {p_target:>10.6f}  {ce_loss:>9.4f}  {match}")
+              f"{pred_id:>8}  {pred_text:>14}  {p_target:>10.6f}  {ce_loss:>9.4f}  {match}")
 
     if per_token_losses:
         avg = sum(per_token_losses) / len(per_token_losses)
-        print(f"  {'─'*85}")
+        print(f"  {'─'*101}")
         print(f"  Average CE loss = {avg:.6f}")
         print(f"  Expected (untrained) ≈ log({vocab_size}) = {math.log(vocab_size):.2f}")
 
@@ -203,6 +189,9 @@ def main():
     parser.add_argument("--split",      default="train_sample",
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--sample-idx", type=int, default=0)
+    parser.add_argument("--category",       default=None,
+                        choices=["mcq", "left_right", "distance", "count"],
+                        help="Override sample-idx by filtering for a specific category")
     parser.add_argument("--resolution", default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--device",     default="cuda", choices=["cuda", "cpu"])
@@ -252,13 +241,22 @@ def main():
                              num_workers=0, pin_memory=False)
 
     batch = None
-    for i, b in enumerate(loader):
-        if i == args.sample_idx:
-            batch = b
-            break
-    if batch is None:
-        print(f"[!] sample_idx={args.sample_idx} out of range")
-        return
+    if args.category:
+        for b in loader:
+            if b["categories"][0] == args.category:
+                batch = b
+                break
+        if batch is None:
+            print(f"[!] No sample found with category={args.category}")
+            return
+    else:
+        for i, b in enumerate(loader):
+            if i == args.sample_idx:
+                batch = b
+                break
+        if batch is None:
+            print(f"[!] sample_idx={args.sample_idx} out of range")
+            return
 
     print(f"  Image:    {batch['image_names'][0]}")
     print(f"  Category: {batch['categories'][0]}")
@@ -327,12 +325,10 @@ def main():
     print(f"  │  Text Embeddings + RTI:")
     print(f"  │    input_ids: [{B}, {n_text}]")
     print(f"  │    n_masks (RTI 3→3 replace): {n_masks}")
-    print(f"  │    → text_embeds: [{B}, {n_text}, {D}]  (length unchanged by RTI)")
     print(f"  │")
-    print(f"  │  Concat Fusion:")
-    print(f"  │    inputs_embeds = [visual_tokens | text_embeds]")
-    print(f"  │                  = [{B}, {n_visual}+{n_text}, {D}]")
-    print(f"  │                  = [{B}, {total_seq}, {D}]")
+    print(f"  │  Inline Padding Fusion:")
+    print(f"  │    Replaced <|image_pad|> tokens with visual embeddings")
+    print(f"  │    inputs_embeds = [{B}, {total_seq}, {D}]")
     print(f"  └─────────────────────────────────────────────────────────────┘")
 
     # Now print the full sequence map
@@ -355,24 +351,18 @@ def main():
     print(f"  {'Pos':>8}  {'Pos':>8}")
     print(f"  {'─'*80}")
 
-    # Part 1: Visual tokens block (summarized)
-    print(f"  {0:>8}  {'─':>8}  {'VISUAL':<20}  {'[CLS/patch embed]':<25}  {'─':>6}")
-    print(f"  {'...':>8}  {'─':>8}  {'VISUAL':<20}  {f'({n_visual} patch tokens)':<25}  {'─':>6}  (no labels)")
-    print(f"  {n_visual-1:>8}  {'─':>8}  {'VISUAL':<20}  {'[last patch token]':<25}  {'─':>6}")
-    print(f"  {'─'*80}")
+    # Since visual tokens are now inline, there is no separated visual block prepended.
 
     # Part 2: Text tokens (with RTI markers)
     answer_start = next((i for i, v in enumerate(lbls) if v != -100), n_text)
 
     # Show every text token with its backbone position
-    prev_pos = n_visual - 1
+    prev_pos = -1
     mask_region_idx = 0
     i = 0
-    shown = 0
-    max_show = 80  # limit output
 
-    while i < n_text and shown < max_show:
-        backbone_pos = n_visual + i
+    while i < n_text:
+        backbone_pos = i
         tok_id  = ids[i]
         lbl     = lbls[i]
         decoded = decode_token(tokenizer, tok_id)
@@ -414,35 +404,20 @@ def main():
         lbl_str = str(lbl) if lbl != -100 else "─"
         active  = "  YES  ←" if lbl != -100 else ""
 
-        # Condense consecutive prompt tokens
-        if src_type == "TEXT (prompt)" and i > 4 and i < answer_start - 3:
-            if prev_pos == backbone_pos - 1 and shown > 5:
-                if i == 5:
-                    print(f"  {'...':>8}  {'...':>8}  {'TEXT (prompt)':<20}  {'...':<25}  {'─':>6}")
-                    shown += 1
-                i += 1
-                prev_pos = backbone_pos
-                continue
-
         print(f"  {backbone_pos:>8}  {i:>8}  {src_type:<20}  {content:<25}  {lbl_str:>6}  {active}")
         prev_pos = backbone_pos
-        shown += 1
         i += 1
-
-    if i < n_text:
-        print(f"  {'...':>8}  {'...':>8}  {'...':<20}  {'(truncated)':<25}")
 
     print(f"  {'─'*80}")
 
     # Summary
     print(f"\n  Summary:")
-    print(f"    Visual tokens:     positions [0 .. {n_visual-1}]  ({n_visual} tokens)")
-    print(f"    Text tokens:       positions [{n_visual} .. {n_visual+n_text-1}]  ({n_text} tokens)")
+    summary_vis_tok = n_visual if n_visual > 0 else int(h_vis * w_vis)
+    print(f"    Visual padding:    {summary_vis_tok} tokens inline over <|image_pad|>")
+    print(f"    Text tokens:       {n_text} tokens")
     print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*3} positions replaced")
-    print(f"      Original:  [<] [mask] [>]  → 3 text tokens")
-    print(f"      Replaced:  [region_rgb] [region_depth] [region_geo]  → 3 RTI embeddings")
-    print(f"    Total backbone:    {total_seq} positions = {n_visual} visual + {n_text} text")
-    print(f"    Labels:            offset by n_visual={n_visual} (logits[:, n_visual:, :] aligns with labels)")
+    print(f"        [<] [mask] [>]  → [region_rgb] [region_depth] [region_geo]")
+    print(f"    Total backbone:    {total_seq} positions")
     print(f"    Depth map:         {list(depth_maps_1b.shape)}")
     print()
 
@@ -560,9 +535,30 @@ def main():
     if target_size:
         pil_image = pil_image.resize(target_size, Image.LANCZOS)
 
-    # Build generation-format input_ids (direct tokenization, no chat template)
+    import re
+    question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
+
+    sys_str = (
+        "<|im_start|>system\n"
+        "You are an expert AI assistant for warehouse spatial reasoning. "
+        "Analyze the image and the specific object regions carefully. "
+        "First, output your step-by-step reasoning inside <think></think> tags. "
+        "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+    )
+    
+    h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+    h_vis, w_vis = h_p // 2, w_p // 2
+    num_visual_tokens = int(h_vis * w_vis)
+    
+    vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
+    user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+    eval_prompt = f"<|im_start|>assistant\n"
+    
+    full_prompt = sys_str + user_str + eval_prompt
+
+    # Build generation-format input_ids (ChatML formatting)
     gen_input_ids = pipeline.processor.tokenizer(
-        question, return_tensors="pt", padding=False
+        full_prompt, return_tensors="pt", padding=False
     ).input_ids.to(device=dev)
 
     # Find <mask> positions

@@ -6,7 +6,7 @@ PyTorch Dataset for the NVIDIA Warehouse dataset, adapted for the Micro
 architecture with batch_size > 1 support and Number Head fields.
 
 Key changes from v1 dataloader:
-    1. format_answer(): distance/count -> "category | <num>" (Number Head)
+    1. format_answer(): distance/count -> "category | <|num|>" (Number Head)
     2. Chain-of-thought: GPT reasoning wrapped in <think>...</think>
     3. No chat template: question tokenized directly, image processed separately
     4. collate_fn(): supports batch_size > 1 with padding
@@ -85,7 +85,7 @@ def format_answer(category: str, normalized_answer) -> str:
         left_right-> 'left_right | "left"' (LM Head, quoted string)
     """
     if category in ("distance", "count"):
-        return f"{category} | <num>"
+        return f"{category} | <|num|>"
     else:
         raw = str(normalized_answer)
         formatted = f'"{raw}"'
@@ -232,34 +232,15 @@ class SpatialVLMDataset(Dataset):
         target_text = format_answer(category, entry["normalized_answer"])
 
         # 6. Build full answer with <think> chain-of-thought
-        full_answer = f"<think>{gpt_reasoning}</think>{target_text}"
+        full_answer = f"<think>{gpt_reasoning}</think>{target_text}<|im_end|>\n"
 
         # 7. Determine numeric fields
         is_numeric = category in ("distance", "count")
         target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
 
-        # 8. Tokenize with the micro tokenizer (full vocab, no remapping needed)
-        q_ids = self.tokenizer.encode(question, add_special_tokens=False)
-        sep_ids = self.tokenizer.encode("\n", add_special_tokens=False)
-
-        # For numeric categories, encode answer WITHOUT "<num>" and manually append <|num|> token
-        # (BPE would encode "<num>" as regular tokens — we need the special <|num|> token ID)
-        if is_numeric:
-            # full_answer = "<think>...reasoning...</think>category | <num>"
-            # Encode everything up to "<num>", then append <|num|> special token
-            answer_text = full_answer.rsplit("<num>", 1)[0]  # e.g. "<think>...</think>distance | "
-            a_ids = self.tokenizer.encode(answer_text, add_special_tokens=False) + [self.num_token_id]
-        else:
-            a_ids = self.tokenizer.encode(full_answer, add_special_tokens=False)
-
-        all_ids    = q_ids + sep_ids + a_ids
-        input_ids  = torch.tensor(all_ids, dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-
-        # 9. Labels: question + separator = -100, answer = active
-        answer_start = len(q_ids) + len(sep_ids)
-        labels = input_ids.clone()
-        labels[:answer_start] = -100
+        # Mask replacement for Object Ref Grounding
+        import re
+        question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
 
         # 10. Process image separately (pixel_values + grid only)
         image_inputs = self.processor.image_processor(
@@ -267,6 +248,45 @@ class SpatialVLMDataset(Dataset):
         )
         pixel_values   = image_inputs["pixel_values"]
         image_grid_thw = image_inputs["image_grid_thw"]
+
+        sys_str = (
+            "<|im_start|>system\n"
+            "You are an expert AI assistant for warehouse spatial reasoning. "
+            "Analyze the image and the specific object regions carefully. "
+            "First, output your step-by-step reasoning inside <think></think> tags. "
+            "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+        )
+        
+        # Calculate visual tokens correctly for inline injection
+        h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+        h_vis, w_vis = h_p // 2, w_p // 2
+        num_visual_tokens = int(h_vis * w_vis)
+        
+        vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
+        user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+        eval_prompt = f"<|im_start|>assistant\n"
+        
+        q_ids = self.tokenizer.encode(sys_str + user_str + eval_prompt, add_special_tokens=False)
+
+        # For numeric categories, encode answer WITHOUT "<|num|>" and manually append <|num|> token
+        # (BPE would encode "<|num|>" as regular tokens — we need the special <|num|> token ID)
+        if is_numeric:
+            # full_answer = "<think>...reasoning...</think>category | <|num|><|im_end|>\n"
+            # Encode everything up to "<|num|>", then append <|num|> special token
+            answer_text = full_answer.rsplit("<|num|>", 1)[0]  # e.g. "<think>...</think>distance | "
+            a_tail = full_answer.rsplit("<|num|>", 1)[1]
+            a_ids = self.tokenizer.encode(answer_text, add_special_tokens=False) + [self.num_token_id] + self.tokenizer.encode(a_tail, add_special_tokens=False)
+        else:
+            a_ids = self.tokenizer.encode(full_answer, add_special_tokens=False)
+
+        all_ids    = q_ids + a_ids
+        input_ids  = torch.tensor(all_ids, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+
+        # 9. Labels: question + separator = -100, answer (+ EOS) = active
+        answer_start = len(q_ids)
+        labels = input_ids.clone()
+        labels[:answer_start] = -100
 
         # 11. Find <mask> positions in the token sequence
         mask_positions = find_mask_positions(input_ids.unsqueeze(0), self.tokenizer)
@@ -286,7 +306,7 @@ class SpatialVLMDataset(Dataset):
         if category in ("mcq", "left_right"):
             answer_str = f'"{raw_answer}"'
         elif is_numeric:
-            answer_str = f"<num>={raw_answer}"
+            answer_str = f"<|num|>={raw_answer}"
         else:
             answer_str = raw_answer
 
@@ -371,7 +391,7 @@ def collate_fn(batch: list[dict]) -> dict:
 
     # --- Pad variable-length text sequences ---
     max_text_len = max(d["input_ids"].shape[0] for d in batch)
-    pad_token_id = 0  # Qwen pad token
+    pad_token_id = 248044  # Qwen pad token (<|endoftext|>)
 
     input_ids     = torch.full((B, max_text_len), pad_token_id, dtype=torch.long)
     labels        = torch.full((B, max_text_len), -100, dtype=torch.long)
