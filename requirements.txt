@@ -13,7 +13,7 @@ torchaudio==2.10.0
 # --- Flash Attention 2 (prebuilt: cu12 + torch2.10 + cp312) ---
 flash_attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
-# --- Causal Conv1D: install separately (needs --no-build-isolation) ---
+# --- Causal Conv1D (prebuilt: cu12 + torch2.10 + cp312) ---
 causal_conv1d @ "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # --- HuggingFace stack ---
