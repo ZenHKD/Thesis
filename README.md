@@ -97,7 +97,7 @@ Thesis/
 ├── test_micro/
 │   ├── test_inference.py           # Inference test (Micro, cuda only)
 │   ├── test_backprop.py            # Backprop test (Micro, all components)
-│   ├── test_dataloader_new.py      # Dataloader test (batched RTI, decoded masks)
+│   ├── test_dataloader.py      # Dataloader test (batched RTI, decoded masks)
 │   └── test_pipeline_alignment.py  # Pipeline alignment test (Micro)
 ├── checkpoints/micro/              # Training checkpoints + training.csv (gitignored)
 ├── data/nvidia_warehouse_dataset/  # Dataset directory (gitignored)

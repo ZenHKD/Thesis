@@ -22,7 +22,7 @@ import re as _re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions
-from src.dataloader.dataloader_new import SpatialVLMDataset
+from src.dataloader.dataloader import SpatialVLMDataset
 
 # Paths
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

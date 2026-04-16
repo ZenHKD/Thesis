@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.dataloader.dataloader_new import SpatialVLMDataset, get_dataloader
+from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
 from model_micro.pipeline import SpatialVLM, print_vram_usage
 from model_micro.loss import SpatialLoss
 

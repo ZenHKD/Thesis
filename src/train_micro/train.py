@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.dataloader.dataloader_new import SpatialVLMDataset, get_dataloader
+from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
 from model_micro.pipeline import SpatialVLM, print_vram_usage
 from model_micro.loss import SpatialLoss
 from src.train_micro.val import validate

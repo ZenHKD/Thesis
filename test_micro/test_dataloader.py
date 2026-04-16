@@ -1,5 +1,5 @@
 """
-Test SpatialVLM Micro DataLoader (dataloader_new.py).
+Test SpatialVLM Micro DataLoader (dataloader.py).
 
 Verifies:
     1. Per-category sample loading (mcq, distance, count, left_right)
@@ -10,9 +10,9 @@ Verifies:
     6. Token ID ranges (all IDs should be within Qwen vocab)
 
 Usage:
-    python test_micro/test_dataloader_new.py
-    python test_micro/test_dataloader_new.py --batch-size 4
-    python test_micro/test_dataloader_new.py --resolution 320p
+    python test_micro/test_dataloader.py
+    python test_micro/test_dataloader.py --batch-size 4
+    python test_micro/test_dataloader.py --resolution 320p
 """
 
 import sys
@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformers import AutoProcessor
-from src.dataloader.dataloader_new import SpatialVLMDataset, get_dataloader
+from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "model_micro", "qwen3.5-micro")

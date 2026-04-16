@@ -297,7 +297,7 @@ Computed from: raw depth map + binary mask + soft2d mask
 
 ### RTI Batching Strategy (enables batch_size > 1)
 
-Implementation: `model_micro/rti.py` + `src/dataloader/dataloader_new.py`
+Implementation: `model_micro/rti.py` + `src/dataloader/dataloader.py`
 
 | Aspect | Detail |
 |--------|--------|

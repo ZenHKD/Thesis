@@ -18,7 +18,7 @@ Key changes from v1 dataloader:
 Splits: train (499K), val (1.9K), test (19K)
 
 Usage:
-    from src.dataloader.dataloader_new import SpatialVLMDataset, get_dataloader
+    from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
 
     dataset = SpatialVLMDataset("train", processor=pipeline.processor)
     loader  = get_dataloader(dataset, batch_size=8, shuffle=True)
@@ -47,6 +47,7 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
 from PIL import Image, ImageFilter
 import pycocotools.mask as mask_utils
 import random
@@ -238,11 +239,10 @@ class SpatialVLMDataset(Dataset):
         is_numeric = category in ("distance", "count")
         target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
 
-        # Mask replacement for Object Ref Grounding
-        import re
+        # 8. Mask replacement for Object Ref Grounding
         question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
 
-        # 10. Process image separately (pixel_values + grid only)
+        # 9. Process image separately (pixel_values + grid only)
         image_inputs = self.processor.image_processor(
             images=image, return_tensors="pt"
         )
@@ -257,7 +257,7 @@ class SpatialVLMDataset(Dataset):
             "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
         )
         
-        # Calculate visual tokens correctly for inline injection
+        # 10. Calculate visual tokens correctly for inline injection
         h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
         h_vis, w_vis = h_p // 2, w_p // 2
         num_visual_tokens = int(h_vis * w_vis)
@@ -268,7 +268,7 @@ class SpatialVLMDataset(Dataset):
         
         q_ids = self.tokenizer.encode(sys_str + user_str + eval_prompt, add_special_tokens=False)
 
-        # For numeric categories, encode answer WITHOUT "<|num|>" and manually append <|num|> token
+        # 11. For numeric categories, encode answer WITHOUT "<|num|>" and manually append <|num|> token
         # (BPE would encode "<|num|>" as regular tokens — we need the special <|num|> token ID)
         if is_numeric:
             # full_answer = "<think>...reasoning...</think>category | <|num|><|im_end|>\n"
@@ -283,12 +283,12 @@ class SpatialVLMDataset(Dataset):
         input_ids  = torch.tensor(all_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
 
-        # 9. Labels: question + separator = -100, answer (+ EOS) = active
+        # 12. Labels: question + separator = -100, answer (+ EOS) = active
         answer_start = len(q_ids)
         labels = input_ids.clone()
         labels[:answer_start] = -100
 
-        # 11. Find <mask> positions in the token sequence
+        # 13. Find <mask> positions in the token sequence
         mask_positions = find_mask_positions(input_ids.unsqueeze(0), self.tokenizer)
         rle_list = entry["rle"]
 
@@ -296,12 +296,12 @@ class SpatialVLMDataset(Dataset):
         mask_positions = mask_positions[:n]
         rle_list = rle_list[:n]
 
-        # 12. Find <|num|> token position (for Number Head)
+        # 14. Find <|num|> token position (for Number Head)
         num_token_pos = -1
         if is_numeric:
             num_token_pos = self._find_num_token_pos(input_ids)
 
-        # 13. Format answer for metadata
+        # 15. Format answer for metadata
         raw_answer = str(entry["normalized_answer"])
         if category in ("mcq", "left_right"):
             answer_str = f'"{raw_answer}"'
@@ -310,12 +310,8 @@ class SpatialVLMDataset(Dataset):
         else:
             answer_str = raw_answer
 
-        # 15. Pre-decode RLE masks + soft masks
-        # Must match rti.py: Relative Coverage Normalization + dynamic h_vis/w_vis
+        # 16. Pre-decode RLE masks + soft masks
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
-        # Dynamic grid: if merger stride=2 → //2, if stride=1 → same
-        # For current Qwen merger (stride=2), pixel_values patches = h_p*w_p
-        # and visual tokens N = (h_p//2) * (w_p//2)
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
         for rle_entry in rle_list:
@@ -336,8 +332,7 @@ class SpatialVLMDataset(Dataset):
             soft2d = torch.sigmoid(50.0 * (coverage - 0.3))
             decoded_masks.append({'binary': binary, 'soft2d': soft2d})
 
-        # 16. Raw RGB for RTI (0-1 float)
-        import torchvision.transforms.functional as TF
+        # 17. Raw RGB for RTI (0-1 float)
         pixel_values_rgb = TF.to_tensor(image)  # [3, H_orig, W_orig]
 
         return {
