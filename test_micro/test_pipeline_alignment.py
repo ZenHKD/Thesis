@@ -13,10 +13,10 @@ Integration test that loads REAL data and verifies:
 
   3. FORWARD PASS + LABEL ALIGNMENT
      Runs pipeline.forward() with real batch.
-     Shows per-token CE breakdown (uses final loop step logits).
+     Shows per-token CE breakdown.
 
   4. LOSS CHECK
-     Computes SpatialLoss (LoopLM per-step CE + entropy + SmoothL1).
+     Computes SpatialLoss (Standard CE + SmoothL1).
 
   5. INFERENCE
      Runs pipeline.generate() with dataloader tensors.
@@ -474,7 +474,7 @@ def main():
     # SECTION 4: Loss check
     # ------------------------------------------------------------------ #
     print(f"\n{'='*70}")
-    print("SECTION 4: LOSS CHECK (LoopLM: uniform CE + SmoothL1)")
+    print("SECTION 4: LOSS CHECK (Standard CE + SmoothL1)")
     print("=" * 70)
 
     criterion = SpatialLoss(alpha=0.1)

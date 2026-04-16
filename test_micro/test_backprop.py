@@ -345,8 +345,7 @@ def main():
 
         # Print aggregated decoder
         n_layers = sum(1 for n in backward_events if n.startswith("Decoder["))
-        n_loops = decoder_calls // max(n_layers, 1)
-        dec_label = f"Decoder ({n_layers}×{n_loops})"
+        dec_label = f"Decoder ({n_layers})"
         print(f"  {dec_label:25s} {decoder_fwd:>10.2f} {decoder_bwd:>10.2f} {decoder_vram:>10.2f}")
 
         # Per-layer detail
