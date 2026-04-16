@@ -132,5 +132,7 @@ python setup_nvidia_dataset.py
 - **SmolRGPT**: [arXiv 2509.15490](https://arxiv.org/abs/2509.15490) -- Region-level spatial reasoning for warehouse environments, submitted to ICCVW (primary inspiration for RTI)
 - **RegionGPT**: [CVPR 2024](https://arxiv.org/abs/2403.02330) -- Region understanding VLM with `<region>` token injection (foundation for RTI design)
 - **Qwen 3.5**: [Qwen Team](https://huggingface.co/Qwen/Qwen3.5-0.8B) -- Base VLM backbone
+- **Qwen-VL**: [arXiv 2308.12966](https://arxiv.org/abs/2308.12966) -- Visual grounding token boundary mapping (`<|object_ref_start|>`)
 - **DBNet++**: [TPAMI 2022](https://arxiv.org/abs/2202.10304) -- Differentiable Binarization (soft mask in RTI)
 - **xVal**: [NeurIPS 2023](https://arxiv.org/abs/2310.02989) -- A Continuous Numerical Tokenization (Number Head)
+- **Fast R-CNN**: [ICCV 2015](https://arxiv.org/abs/1504.08083) -- SmoothL1 evaluation metric for bounded geometric distance regression
