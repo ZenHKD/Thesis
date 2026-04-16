@@ -2,8 +2,8 @@
 SpatialVLM Micro Pruning Pipeline (No External Pruning Libs)
 - Vision: Keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
 - Decoder: Keep all 24 layers (single pass)
-- Vocab: FULL original vocabulary (248,320) + <num> token appended
-- Add <num> token at end of vocab (ID = 248,320)
+- Vocab: FULL original vocabulary (248,320) + <|num|> token appended
+- Add <|num|> token at end of vocab (ID = 248,320)
 """
 
 import json
@@ -27,10 +27,10 @@ COPY_FILES = ["preprocessor_config.json", "video_preprocessor_config.json", "cha
 # ============== TOKENIZER (no pruning) ==============
 
 def setup_tokenizer_with_num(tokenizer):
-    """Copy original tokenizer files and append <num> token.
+    """Copy original tokenizer files and append <|num|> token.
     
     No vocabulary pruning — keeps all 248,320 original tokens.
-    Only adds <num> at the end (ID = 248,320).
+    Only adds <|num|> at the end (ID = 248,320).
     
     Returns new_vocab_size.
     """
@@ -43,10 +43,10 @@ def setup_tokenizer_with_num(tokenizer):
 
     # len(tokenizer) is 248077 (base vocab + special tokens)
     # The original embedding matrix is size 248320 (padded for tensor cores)
-    num_token_id = 248077  # <num> gets the next contiguous ID (DO NOT USE 248044, IT OVERWRITES <|endoftext|>)
+    num_token_id = 248077  # <|num|> gets the next contiguous ID (DO NOT USE 248044, IT OVERWRITES <|endoftext|>)
     new_vocab_size = 248320  # the physical size of the embeddings
 
-    # Patch tokenizer_config.json: add <num> as added token
+    # Patch tokenizer_config.json: add <|num|> as added token
     tc_path = OUTPUT_PATH / "tokenizer_config.json"
     if tc_path.exists():
         with open(tc_path, "r", encoding="utf-8") as f:
@@ -69,7 +69,7 @@ def setup_tokenizer_with_num(tokenizer):
     
         with open(tc_path, "w", encoding="utf-8") as f:
             json.dump(tc, f, indent=2, ensure_ascii=False)
-        print(f"  Added <num> to tokenizer_config.json")
+        print(f"  Added <|num|> to tokenizer_config.json")
 
     # Patch tokenizer.json: sync added_tokens from tokenizer_config.json perfectly
     tj_path = OUTPUT_PATH / "tokenizer.json"
@@ -97,7 +97,7 @@ def setup_tokenizer_with_num(tokenizer):
 
 
     print(f"  Physical Embeddings Size: {new_vocab_size}")
-    print(f"  <num> token ID: {num_token_id}")
+    print(f"  <|num|> token ID: {num_token_id}")
     print(f"  Final vocab size: {new_vocab_size}")
 
     return new_vocab_size, num_token_id
@@ -153,11 +153,11 @@ def main():
     )
     print(f"  Loaded: {ORIGINAL_MODEL_PATH}")
 
-    # 2. Setup tokenizer with <num> token (no vocab pruning)
-    print("\n[2/6] Setting up tokenizer (full vocab + <num>)...")
+    # 2. Setup tokenizer with <|num|> token (no vocab pruning)
+    print("\n[2/6] Setting up tokenizer (full vocab + <|num|>)...")
     new_vocab_size, num_token_id = setup_tokenizer_with_num(tokenizer)
 
-    print(f"\n[3/6] Initializing <num> token embedding at index {num_token_id}...")
+    print(f"\n[3/6] Initializing <|num|> token embedding at index {num_token_id}...")
     # No need to resize, 248320 is already large enough to hold 248077
     with torch.no_grad():
         model.get_input_embeddings().weight[num_token_id].normal_(0.0, 0.02)

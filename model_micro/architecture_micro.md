@@ -5,14 +5,12 @@
 Surgically pruned from **Qwen 3.5 0.8B (853M)** — vision encoder pruned, decoder kept in full.
 Pretrained weights are transferred (not random init), then fine-tuned on the 499K warehouse dataset.
 
-| Cut | Original | Micro v2 | Savings |
+| Cut | Original | Micro  | Savings |
 |-----|----------|----------|---------| 
 | Vision ViT blocks | 12 | **4** | 56.7M |
 | Decoder layers | 24 | **24 (full, single pass)** | 0 |
 | Vocab / Embedding | 248,320 | **248,321 (full + `<num>`, TRAINABLE)** | 0 |
 | Context length | 262,144 | **512** | VRAM only |
-| GSA | — | **REMOVED** | — |
-| LoopLM | — | **REMOVED** | — |
 | RTI | mask_rgb + mask_depth + space | **mask_rgb + mask_depth + mask_geo (3 learned tokens)** | — |
 | Number Head | — | **+0.26M** (NEW, softplus) | — |
 | **Total** | **853M** | **~797M (~797M trainable)** | **~56M (7%)** |
@@ -39,15 +37,15 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 > **Depth**: ~78K RGB-D pairs — real depth sensor data available \
 > **Regions**: encoded as `<mask>` in question text, with per-region **RLE** in JSON \
-> **Vocab**: Full original vocabulary (248,321 = 248,320 + `<num>` token) \
+> **Vocab**: Full original vocabulary (248,320 = 248,076 + `<num>` token + `<PAD>` token) \
 > **CoT**: GPT reasoning wrapped in `<think>...</think>` as chain-of-thought training signal \
 > **Labels**: Question & answer tokenized separately then concatenated (BPE-safe boundary)
 
 ---
 
-## Qwen 3.5 Micro v2 Architecture
+## Qwen 3.5 Micro  Architecture
 
-| Spec | Original 0.8B | **Micro v2** |
+| Spec | Original 0.8B | **Micro ** |
 |------|-----------|-----------|
 | Type | VLM (Vision + Language) | Same |
 | LLM Hidden Dim | 1024 | **1024** (unchanged) |
@@ -56,10 +54,8 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Decoder Layers | 24 | **24 (full, single pass)** |
 | Layer Layout | 6 × (3 DeltaNet + 1 GatedAttn) | **6 × (3 DeltaNet + 1 GatedAttn)** (unchanged) |
 | FFN (SwiGLU) dim | 3584 | **3584** (unchanged) |
-| Vocab / Embedding | 248,320 | **248,321 (full + `<num>`)** |
+| Vocab / Embedding | 248,320 | **248,320 (full + `<num>`)** |
 | Context Length | 262,144 | **512** |
-| GSA | — | **REMOVED** |
-| LoopLM | — | **REMOVED** |
 | **RTI** | — | **3 learned tokens per `<mask>`** |
 | **Number Head** | — | **Linear(1024→256→1)** |
 
@@ -76,7 +72,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 ### VRAM Estimate (BF16 training)
 
-| | Original 0.8B | **Micro v2 ~797M** |
+| | Original 0.8B | **Micro  ~797M** |
 |---|---|---|
 | Model weights | ~1.7 GB | **~1.6 GB** |
 | KV cache (inference) | ~2 GB | **~0.04 GB** |
@@ -354,10 +350,10 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 
 Implementation: `model_micro/loss.py`
 
-`L = CE(label_smoothing=0.1) + α · L_SmoothL1`
+`L = CE(label_smoothing=0.0) + α · L_SmoothL1`
 
 Where:
-- **CE**: Cross-entropy loss on LM head output (single pass, no per-step weighting)
+- **CE**: Cross-entropy loss on LM head output (label smoothing disabled to prevent over regularization of 248K vocab)
 - **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
   - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
   - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
@@ -368,16 +364,21 @@ Where:
 
 ## Tokenization & Label Strategy (BPE-safe)
 
+### 1. Visual Grounding Tokens
+Before tokenization, all regional `<mask...>` tokens natively mapped into the prompt are explicitly wrapped inside Qwen-VL's visual grounding tokens:
+`<|object_ref_start|><mask...><|object_ref_end|>`
+This explicitly anchors the model's pre-trained attention heads to heavily associate the mask's physical embedding with exactly localized objects.
+
+### 2. Exact Boundary Concatenation
 Question and answer are **tokenized separately**, then their token IDs are **concatenated**.
 This guarantees exact label boundaries regardless of BPE context-dependent merging.
 
-```
-q_ids   = tokenizer.encode(question)          # [q1, q2, ..., qN]
-sep_ids = tokenizer.encode("\n")              # [sep]
-a_ids   = tokenizer.encode(full_answer)       # [a1, a2, ..., aM]
+```python
+q_ids   = tokenizer.encode(question_w_refs)           # [q1, q2, ..., qN]
+a_ids   = tokenizer.encode(full_answer_with_think)    # [a1, a2, ..., aM]
 
-input_ids = q_ids + sep_ids + a_ids           # exact concatenation
-labels    = [-100]*len(q_ids+sep_ids) + a_ids  # -100 for question, active for answer
+input_ids = q_ids + a_ids           # exact concatenation
+labels    = [-100]*len(q_ids) + a_ids  # -100 for question, active for answer
 ```
 
 ---
@@ -394,7 +395,7 @@ labels    = [-100]*len(q_ids+sep_ids) + a_ids  # -100 for question, active for a
 | RTI | ✅ **Trainable** | 5e-5 |
 | Number Head | ✅ **Trainable** | 5e-4 |
 
-**Loss**: `L = CE(label_smoothing=0.1) + α·L_SmoothL1` (α=0.1)
+**Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1` (α=0.1)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
 
@@ -414,17 +415,3 @@ labels    = [-100]*len(q_ids+sep_ids) + a_ids  # -100 for question, active for a
 > Total sequence (visual + CoT text): ~230–290 tokens. Fits in 512.
 
 ---
-
-## What Changed from v1 (Micro) to v2
-
-| Aspect | v1 (Micro) | v2 (Micro) |
-|--------|-----------|-----------|
-| **GSA** | 2 blocks, 16.9M params, 1330ms/step | **REMOVED** |
-| **LoopLM** | 8 layers × 3 loops | **REMOVED** |
-| **Decoder** | 8 layers (166M) | **24 layers, single pass (498M)** |
-| **RTI mask_rgb** | Gated attention pool over Vision Encoder output | **Raw RGB stats → Linear(20→1024)** |
-| **RTI 3rd token** | Frozen space embed (no information) | **Learned mask_geo (spatial context)** |
-| **RTI coupling** | Depends on Vision Encoder output | **Independent of Vision Encoder** |
-| **Total params** | ~482M | **~797M** |
-| **Loss** | `(1/T)·Σ CE^(t) + α·SmoothL1` | **`CE + α·SmoothL1`** |
-| **Speed** | ~2700ms/step (GSA bottleneck) | **~1400ms/step (estimated)** |

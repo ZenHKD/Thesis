@@ -112,8 +112,8 @@ class RTE(nn.Module):
     """Extract 3 learned region tokens per <mask> from raw inputs.
 
     Independent of Vision Encoder. Processes:
-        - Raw RGB image -> appearance features -> mask_rgb
-        - Raw depth map -> depth profile features -> mask_depth
+        - Raw RGB image + mask -> appearance features -> mask_rgb
+        - Raw depth map + mask -> depth profile features -> mask_depth
         - Raw depth map + mask -> spatial context -> mask_geo
 
     Learnable:
@@ -169,9 +169,9 @@ class RTE(nn.Module):
 
     def _rgb_features(
         self,
-        rgb_image:   torch.Tensor,      # [3, H, W] float (0-1)
-        binary_mask: np.ndarray,         # [H, W] bool
-        device:      torch.device = None,
+        rgb_image:   torch.Tensor,      # [3, H, W]
+        gray_image:  torch.Tensor,      # [H, W]
+        mask_t:      torch.Tensor,      # [H, W] bool
     ) -> torch.Tensor:                   # [12]
         """Extract RGB appearance features from masked region.
 
@@ -185,61 +185,47 @@ class RTE(nn.Module):
             color contrast      (1)  — std across channel means
             saturation          (1)  — (max_ch - min_ch) / (max_ch + eps)
         """
-        dev = device or rgb_image.device
+        dev   = rgb_image.device
         dtype = next(self.parameters()).dtype
 
-        mask_t = torch.from_numpy(binary_mask).to(device=dev, dtype=torch.bool)
+        if mask_t.sum() == 0:
+            return torch.zeros(self.RGB_FEAT_DIM, device=dev, dtype=dtype)
 
-        # Per-channel mean and std [6]
-        ch_means = []
-        ch_stds = []
-        for c in range(3):
-            vals = rgb_image[c][mask_t]
-            if vals.numel() == 0:
-                ch_means.append(torch.tensor(0.0, device=dev))
-                ch_stds.append(torch.tensor(0.0, device=dev))
-            else:
-                ch_means.append(vals.mean())
-                ch_stds.append(vals.std(correction=0).clamp(min=0))
+        # Vectorized channel stats [6]
+        vals = rgb_image[:, mask_t]  # [3, K]
+        ch_means = vals.mean(dim=1)  # [3]
+        ch_stds  = vals.std(dim=1, correction=0).clamp(min=0)  # [3]
 
-        # Luminance [4]
-        gray = rgb_image.mean(dim=0)  # [H, W]
-        gray_vals = gray[mask_t]
-        if gray_vals.numel() == 0:
-            lum_mean = torch.tensor(0.0, device=dev)
-            lum_std  = torch.tensor(0.0, device=dev)
-            lum_min  = torch.tensor(0.0, device=dev)
-            lum_max  = torch.tensor(0.0, device=dev)
-        else:
-            lum_mean = gray_vals.mean()
-            lum_std  = gray_vals.std(correction=0).clamp(min=0)
-            lum_min  = gray_vals.min()
-            lum_max  = gray_vals.max()
+        # Vectorized luminance stats [4]
+        gray_vals = gray_image[mask_t]  # [K]
+        lum_mean = gray_vals.mean()
+        lum_std  = gray_vals.std(correction=0).clamp(min=0)
+        lum_min  = gray_vals.min()
+        lum_max  = gray_vals.max()
 
         # Derived [2]
-        cm = torch.stack(ch_means)
-        color_contrast = cm.std(correction=0)
-        saturation = (cm.max() - cm.min()) / (cm.max() + 1e-8)
+        color_contrast = ch_means.std(correction=0)
+        saturation = (ch_means.max() - ch_means.min()) / (ch_means.max() + 1e-8)
 
-        features = torch.stack(
-            ch_means + ch_stds +
-            [lum_mean, lum_std, lum_min, lum_max, color_contrast, saturation]
-        )
+        features = torch.cat([
+            ch_means, ch_stds,
+            torch.stack([lum_mean, lum_std, lum_min, lum_max, color_contrast, saturation])
+        ])
         return features.to(dtype)  # [12]
 
     def _depth_features(
         self,
         depth_map:    torch.Tensor,      # [1, H, W]
-        binary_mask:  np.ndarray,         # [H, W] bool
-        soft2d:       torch.Tensor,       # [h_soft, w_soft]
+        mask_t:       torch.Tensor,       # [H, W] bool
+        soft2d_dev:   torch.Tensor,       # [h_soft, w_soft] ON DEVICE
         h_soft:       int,
         w_soft:       int,
     ) -> torch.Tensor:                   # [28]
         """Compute 28-dim depth statistics for masked region.
 
         Features (28-dim):
-            mean_d              (1)
-            std_d               (1)
+            mean_d              (1)  — average depth
+            std_d               (1)  — depth variation
             centroid cx, cy     (2)  — soft-mask weighted
             24 radial depth rays (24) — from centroid outward
         """
@@ -247,19 +233,16 @@ class RTE(nn.Module):
         dev     = depth_map.device
         dtype   = next(self.parameters()).dtype
 
-        bool_mask = torch.from_numpy(binary_mask).to(device=dev)
-
-        if bool_mask.sum() == 0:
+        if mask_t.sum() == 0:
             return torch.zeros(self.DEPTH_FEAT_DIM, device=dev, dtype=dtype)
 
-        soft2d_dev = soft2d.to(dev)
         soft_sum   = soft2d_dev.sum() + 1e-8
         grid_x     = torch.arange(w_soft, device=dev, dtype=soft2d_dev.dtype)
         grid_y     = torch.arange(h_soft, device=dev, dtype=soft2d_dev.dtype)
         cx_soft    = (soft2d_dev.sum(0) * grid_x).sum() / (soft_sum * w_soft)
         cy_soft    = (soft2d_dev.sum(1) * grid_y).sum() / (soft_sum * h_soft)
 
-        vals       = depth_map[:, bool_mask].float()
+        vals       = depth_map[:, mask_t].float()
         mean_d     = vals.mean(dim=1)                    # [1]
         std_d      = vals.std(dim=1, correction=0).clamp(min=0.0)  # [1]
 
@@ -281,8 +264,11 @@ class RTE(nn.Module):
 
     def _geo_features(
         self,
-        depth_map:    torch.Tensor,      # [H, W] (single sample, no batch dim)
-        binary_mask:  np.ndarray,         # [H, W] bool
+        depth_f:      torch.Tensor,      # [H, W] (single sample, float32)
+        mask_t:       torch.Tensor,       # [H, W] bool
+        global_mean:  torch.Tensor,
+        global_std:   torch.Tensor,
+        global_max:   torch.Tensor,
     ) -> torch.Tensor:                   # [16]
         """Compute spatial context features for masked region.
 
@@ -304,20 +290,12 @@ class RTE(nn.Module):
             dist_to_center      (1)  — centroid distance to image center
             depth_range_norm    (1)  — (region_max - region_min) / (global_max + eps)
         """
-        dev   = depth_map.device
+        dev   = depth_f.device
         dtype = next(self.parameters()).dtype
-        H, W  = depth_map.shape
-
-        mask_t = torch.from_numpy(binary_mask).to(device=dev, dtype=torch.bool)
+        H, W  = depth_f.shape
 
         if mask_t.sum() == 0:
             return torch.zeros(self.GEO_FEAT_DIM, device=dev, dtype=dtype)
-
-        # Global depth stats
-        depth_f = depth_map.float()
-        global_mean = depth_f.mean()
-        global_std  = depth_f.std(correction=0).clamp(min=0)
-        global_max  = depth_f.max().clamp(min=1e-8)
 
         # Region depth stats
         region_vals = depth_f[mask_t]
@@ -389,6 +367,12 @@ class RTE(nn.Module):
         all_dep_feats = []
         all_geo_feats = []
         mask_counts = []
+        
+        gray_images = rgb_images.mean(dim=1)  # [B, H, W]
+        depth_fs    = depth_maps.float()      # [B, H, W]
+        g_means     = depth_fs.mean(dim=(1, 2))
+        g_stds      = depth_fs.view(B, -1).std(dim=1, correction=0).clamp(min=0)
+        g_maxs      = depth_fs.view(B, -1).max(dim=1).values.clamp(min=1e-8)
 
         for b in range(B):
             masks_b = rle_list[b]
@@ -399,21 +383,25 @@ class RTE(nn.Module):
                 if dec_b is not None and m < len(dec_b):
                     binary = dec_b[m]['binary']
                     soft2d = dec_b[m]['soft2d']
+                    soft2d_dev = soft2d.to(dev) if torch.is_tensor(soft2d) else torch.from_numpy(soft2d).to(dev)
                 else:
                     binary, soft2d = self._rle_to_soft_mask(rle, h_soft, w_soft, device=dev)
+                    soft2d_dev = soft2d
+
+                mask_t = torch.from_numpy(binary).to(device=dev, dtype=torch.bool) if isinstance(binary, np.ndarray) else binary.to(device=dev, dtype=torch.bool)
 
                 # RGB features from raw image [12]
-                rgb_feat = self._rgb_features(rgb_images[b], binary, device=dev)
+                rgb_feat = self._rgb_features(rgb_images[b], gray_images[b], mask_t)
                 all_rgb_feats.append(rgb_feat)
 
                 # Depth features [28]
                 dep_feat = self._depth_features(
-                    depth_maps[b:b+1], binary, soft2d, h_soft, w_soft
+                    depth_maps[b:b+1], mask_t, soft2d_dev, h_soft, w_soft
                 )
                 all_dep_feats.append(dep_feat)
 
                 # Geo features [16]
-                geo_feat = self._geo_features(depth_maps[b], binary)
+                geo_feat = self._geo_features(depth_fs[b], mask_t, g_means[b], g_stds[b], g_maxs[b])
                 all_geo_feats.append(geo_feat)
 
             mask_counts.append(len(masks_b))

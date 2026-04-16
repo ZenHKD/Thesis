@@ -2,7 +2,7 @@
 MODULE: Number Head — xVal-style Regression for Distance & Count
 
 Position: After Decoder, parallel to LM Head
-Input:  hidden states at <num> token positions [B_num, 1024]
+Input:  hidden states at <|num|> token positions [B_num, 1024]
 Output: continuous scalar predictions [B_num] (non-negative)
 
 Used for:
@@ -25,10 +25,10 @@ import torch.nn.functional as F
 
 
 class NumberHead(nn.Module):
-    """Predicts continuous values from decoder hidden states at <num> positions.
+    """Predicts continuous values from decoder hidden states at <|num|> positions.
 
     Bypasses tokenization entirely — no digit tokens, no CE loss for numbers.
-    Instead, reads the hidden state at the <num> token and regresses a scalar.
+    Instead, reads the hidden state at the <|num|> token and regresses a scalar.
 
     Architecture:
         LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()
@@ -48,7 +48,7 @@ class NumberHead(nn.Module):
     def forward(self, h_num: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            h_num: [B_num, 1024] — hidden states at <num> token positions.
+            h_num: [B_num, 1024] — hidden states at <|num|> token positions.
                    B_num = number of numeric samples in the batch (distance + count).
                    May be 0 if no numeric samples in batch.
 

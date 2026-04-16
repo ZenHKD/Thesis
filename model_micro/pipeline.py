@@ -13,13 +13,13 @@ Architecture (~797M total, ~797M trainable):
        - LM Head (tied w/ embed, TRAINABLE): category + text answer
        - Number Head (xVal): distance/count regression (~0.26M)
 
-<num> token ID read from config (set by prune.py).
+<|num|> token ID read from config (set by prune.py).
 
 Output format (with chain-of-thought):
     <think>GPT reasoning</think>left_right | "left"
     <think>GPT reasoning</think>mcq | "2"
-    <think>GPT reasoning</think>distance | <num>
-    <think>GPT reasoning</think>count | <num>
+    <think>GPT reasoning</think>distance | <|num|>
+    <think>GPT reasoning</think>count | <|num|>
 """
 
 import re
@@ -37,6 +37,32 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_micro.rti import RTE
 from model_micro.num_head import NumberHead
+
+
+# ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+def _top_k_filter(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Zero out all logits except the top-k highest values."""
+    if top_k <= 0:
+        return logits
+    values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+    threshold = values[:, -1].unsqueeze(-1)
+    return logits.masked_fill(logits < threshold, float("-inf"))
+
+
+def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Nucleus (top-p) filtering: zero out logits below the cumulative p mass."""
+    if top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+    # Remove tokens whose cumulative probability exceeds top_p (shift right by 1)
+    sorted_remove = cum_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
+    sorted_logits[sorted_remove] = float("-inf")
+    # Re-scatter back to original order
+    return sorted_logits.scatter(1, sorted_idx, sorted_logits)
 
 # Default model path
 MODEL_NAME = os.path.join(
@@ -59,7 +85,7 @@ NUM_TOKEN_ID = _read_num_token_id()
 # Format: category | answer
 _OUTPUT_RE = re.compile(
     r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'(?P<answer>"left"|"right"|"\d+"|<num>|\d+\.\d+|\d+)',
+    r'(?P<answer>"left"|"right"|"\d+"|<\|num\|>|\d+\.\d+|\d+)',
     re.IGNORECASE,
 )
 
@@ -75,7 +101,7 @@ def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
     if tok_id not in find_mask_positions._cache:
         mask_id = tokenizer.encode("mask", add_special_tokens=False)[0]
         lt_ids = set()
-        for test in [" <", "  <"]:
+        for test in [" <", "  <", "<"]:
             enc = tokenizer.encode(test, add_special_tokens=False)
             if len(enc) == 1:
                 lt_ids.add(enc[0])
@@ -179,7 +205,7 @@ class SpatialVLM(nn.Module):
         embed = self.qwen.model.language_model.embed_tokens
         embed.weight.requires_grad = True
         print(f"  Embeddings: TRAINABLE ({embed.weight.shape[0]} tokens, requires_grad=True)")
-        print(f"  <num> token ID: {self.num_token_id}")
+        print(f"  <|num|> token ID: {self.num_token_id}")
 
         n_layers = len(list(self.qwen.model.language_model.layers))
         print(f"  Decoder: {n_layers} layers (single pass)")
@@ -272,7 +298,7 @@ class SpatialVLM(nn.Module):
 
         Returns:
             inputs_embeds: [B, T, 1024]
-            n_visual:      int (number of visual tokens)
+            n_visual:      int (0, since visual tokens are inline padded)
         """
         # Step 1: Vision Encoder + Merger -> [B, N, 1024]
         visual_tokens = self._get_visual_tokens(
@@ -301,10 +327,20 @@ class SpatialVLM(nn.Module):
                 mask_token_len=mask_token_len,
             )
 
-        # Step 4: Concat Fusion
-        inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
+        # Step 4: Inline Pad Replacement Fusion
+        img_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        B = text_embeds.shape[0]
+        
+        for b in range(B):
+            pad_indices = (input_ids[b] == img_pad_id).nonzero(as_tuple=True)[0]
+            if len(pad_indices) > 0:
+                n_vis = min(len(pad_indices), visual_tokens.shape[1])
+                text_embeds[b, pad_indices[:n_vis]] = visual_tokens[b, :n_vis]
 
-        return inputs_embeds, n_visual
+        inputs_embeds = text_embeds
+        n_visual_offset = 0
+
+        return inputs_embeds, n_visual_offset
 
     # ---- Backbone forward ----
 
@@ -483,11 +519,13 @@ class SpatialVLM(nn.Module):
         max_new_tokens:       int  = 150,
         do_sample:            bool = False,
         temperature:          float = 1.0,
+        top_p:                float = 0.9,
+        top_k:                int   = 50,
         repetition_penalty:   float = 1.2,
         decoded_masks:        list = None,
         **gen_kwargs,
     ) -> torch.Tensor:
-        """Autoregressive generation."""
+        """Autoregressive generation with top-p/top-k sampling and repetition penalty."""
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
         inputs_embeds, n_visual = self._build_inputs_embeds(
@@ -522,7 +560,10 @@ class SpatialVLM(nn.Module):
                         logits[b, -1, tok_id] *= repetition_penalty
 
         if do_sample and temperature > 0:
-            probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+            logits_s = logits[:, -1, :] / temperature
+            logits_s = _top_k_filter(logits_s, top_k)
+            logits_s = _top_p_filter(logits_s, top_p)
+            probs = torch.softmax(logits_s, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
         else:
             next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -552,7 +593,10 @@ class SpatialVLM(nn.Module):
                             logits[b, -1, tok_id] *= repetition_penalty
 
             if do_sample and temperature > 0:
-                probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+                logits_s = logits[:, -1, :] / temperature
+                logits_s = _top_k_filter(logits_s, top_k)
+                logits_s = _top_p_filter(logits_s, top_p)
+                probs = torch.softmax(logits_s, dim=-1)
                 next_tok = torch.multinomial(probs, num_samples=1)
             else:
                 next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -627,7 +671,7 @@ class SpatialVLM(nn.Module):
         )
         raw_output = self.processor.tokenizer.decode(
             output_ids[0], skip_special_tokens=False
-        ).replace("<|endoftext|>", "").replace("<|im_end|>", "").replace("<|num|>", "<num>").strip()
+        ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
 
         parsed = self.parse_output(raw_output)
         return {
@@ -711,7 +755,7 @@ if __name__ == "__main__":
     print(f"  Custom modules:   {total_custom:>12,} ({total_custom/1e6:.4f}M)")
     print(f"  Total unique:     {total_qwen + total_custom:>12,} ({(total_qwen + total_custom)/1e6:.4f}M)")
     print(f"\n  Vocab: {pipeline.qwen.model.language_model.embed_tokens.weight.shape[0]} (TRAINABLE)")
-    print(f"  <num> token ID: {pipeline.num_token_id}")
+    print(f"  <|num|> token ID: {pipeline.num_token_id}")
     print(f"  Trainable params: {sum(p.numel() for p in pipeline.parameters() if p.requires_grad)/1e6:.2f}M")
     n_layers = len(list(pipeline.qwen.model.language_model.layers))
     print(f"  Decoder: {n_layers} layers")
