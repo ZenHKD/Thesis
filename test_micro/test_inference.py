@@ -33,8 +33,39 @@ CKPT_DIR = os.path.join(ROOT, "checkpoints", "micro")
 # Checkpoint Loading
 # =========================================================================
 
+def _fix_checkpoint_state_dict(state_dict: dict) -> dict:
+    """Fix checkpoint state dict for loading into an uncompiled model.
+
+    Handles two issues:
+    1. torch.compile() wraps parameter names with `_orig_mod.` prefix — strip it.
+    2. save_checkpoint deduplicates tied tensors (embed_tokens ↔ lm_head share
+       the same memory pointer), so lm_head.weight is missing — restore it.
+    """
+    cleaned = {}
+    n_stripped = 0
+    for k, v in state_dict.items():
+        new_k = k.replace("._orig_mod.", ".").replace("_orig_mod.", "")
+        if new_k != k:
+            n_stripped += 1
+        cleaned[new_k] = v
+    if n_stripped > 0:
+        print(f"  [*] Stripped _orig_mod. prefix from {n_stripped} keys (torch.compile checkpoint)")
+
+    # Restore tied lm_head.weight from embed_tokens.weight if missing
+    embed_key = "qwen.model.language_model.embed_tokens.weight"
+    lm_head_key = "qwen.lm_head.weight"
+    if embed_key in cleaned and lm_head_key not in cleaned:
+        cleaned[lm_head_key] = cleaned[embed_key]
+        print(f"  [*] Restored tied weight: {lm_head_key} <- {embed_key}")
+
+    return cleaned
+
+
 def load_checkpoint_weights(pipeline, path: str):
-    """Load only model weights from a training checkpoint (no optimizer)."""
+    """Load only model weights from a training checkpoint (no optimizer).
+
+    Handles torch.compile() checkpoints by stripping `_orig_mod.` prefix.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint directory not found: {path}")
 
@@ -44,6 +75,7 @@ def load_checkpoint_weights(pipeline, path: str):
     if os.path.exists(model_path):
         from safetensors.torch import load_file
         model_state = load_file(model_path)
+        model_state = _fix_checkpoint_state_dict(model_state)
         missing, unexpected = pipeline.load_state_dict(model_state, strict=False)
         info = ("?", "?", "?")
         
@@ -58,7 +90,9 @@ def load_checkpoint_weights(pipeline, path: str):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found in {path}")
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        missing, unexpected = pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
+        model_state = ckpt["model_state_dict"]
+        model_state = _fix_checkpoint_state_dict(model_state)
+        missing, unexpected = pipeline.load_state_dict(model_state, strict=False)
         info = ckpt.get("step", "?"), ckpt.get("epoch", "?"), ckpt.get("loss", "?")
 
     if missing:
@@ -81,7 +115,7 @@ def load_checkpoint_weights(pipeline, path: str):
 # Inference Runner
 # =========================================================================
 
-def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float = 0.9, top_k: int = 50, max_new_tokens: int = 150) -> dict:
+def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float = 0.9, top_k: int = 50, max_new_tokens: int = 150, temperature: float = 1.0, repetition_penalty: float = 1.0) -> dict:
     """Run inference on a single dataloader sample.
 
     Uses pipeline.generate() which always runs T_max loops.
@@ -147,13 +181,19 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         decoded_masks=[decoded_masks],
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
+        temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
     )
-    raw_output = pipeline.processor.tokenizer.decode(
+    raw_full = pipeline.processor.tokenizer.decode(
         output_ids[0], skip_special_tokens=False
     ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
-    raw_output = _re.sub(r'<think>.*?</think>\s*', '', raw_output, flags=_re.DOTALL).strip()
+    
+    think_match = _re.search(r'<think>.*?</think>', raw_full, flags=_re.DOTALL)
+    think_str = think_match.group(0).strip() if think_match else ""
+    
+    raw_output = _re.sub(r'<think>.*?</think>\s*', '', raw_full, flags=_re.DOTALL).strip()
     parsed = pipeline.parse_output(raw_output)
 
     # Step 2: For numeric categories, get num_pred via forward pass
@@ -192,6 +232,7 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         "answer":     parsed["answer"],
         "num_pred":   num_pred_val,
         "raw":        raw_output,
+        "think":      think_str,
     }
 
 
@@ -216,9 +257,12 @@ def main():
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--max-new-tokens", type=int, default=150)
-    parser.add_argument("--do-sample",      action="store_true", help="Use sampling instead of greedy")
-    parser.add_argument("--top-p",          type=float, default=0.9, help="Top-p sampling")
-    parser.add_argument("--top-k",          type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--do-sample",      action="store_true", help="Use sampling (debug only) instead of greedy")
+    parser.add_argument("--temperature",    type=float, default=1.0, help="Temperature (only used with --do-sample)")
+    parser.add_argument("--top-p",          type=float, default=0.9, help="Top-p sampling (only used with --do-sample)")
+    parser.add_argument("--top-k",          type=int, default=50, help="Top-k sampling (only used with --do-sample)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Repetition penalty (1.0 = disabled, recommended for strict eval)")
     parser.add_argument("--num-samples",    type=int, default=5,
                         help="Number of samples to test (from start of split)")
     parser.add_argument("--sample-idx",     type=int, nargs="+", default=None,
@@ -348,7 +392,15 @@ def main():
 
         try:
             with torch.no_grad():
-                result = run_inference(pipeline, s, do_sample=args.do_sample, top_p=args.top_p, top_k=args.top_k, max_new_tokens=args.max_new_tokens)
+                result = run_inference(
+                    pipeline, s,
+                    do_sample=args.do_sample,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    max_new_tokens=args.max_new_tokens,
+                    repetition_penalty=args.repetition_penalty,
+                )
         except Exception as e:
             print(f"  Warning: Inference failed: {e}")
             import traceback
@@ -363,9 +415,15 @@ def main():
             if num_pred is not None:
                 try:
                     gt_num = float(gt_clean)
-                    rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
-                    match = rel_err < 0.10
-                    match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} rel_err={rel_err*100:.1f}%"
+                    if cat == "count":
+                        num_pred = round(num_pred)
+                        rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
+                        match = (num_pred == round(gt_num))
+                        match_detail = f"num_pred={num_pred} gt={round(gt_num)} (Exact Match)"
+                    else:
+                        rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
+                        match = rel_err < 0.10
+                        match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} rel_err={rel_err*100:.1f}%"
                 except (ValueError, TypeError):
                     match = False
                     match_detail = f"num_pred={num_pred:.2f} (GT not numeric)"
@@ -395,7 +453,8 @@ def main():
         if match:
             results_by_category[cat]["correct"] += 1
 
-        print(f"\n  Raw output:   {result['raw'][:150]}")
+        print(f"\n  Reasoning:    {result.get('think', '')}")
+        print(f"  Raw output:   {result['raw'][:150]}")
         print(f"  Parsed:       category={result['category']!r}  answer={result['answer']!r}")
         if num_pred is not None:
             print(f"  Number Head:  num_pred={num_pred:.4f}")
