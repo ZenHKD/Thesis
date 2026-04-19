@@ -117,8 +117,7 @@ def load_checkpoint_weights(pipeline, path: str):
 
 def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float = 0.9, top_k: int = 50, max_new_tokens: int = 150, temperature: float = 1.0, repetition_penalty: float = 1.0) -> dict:
     """Run inference on a single dataloader sample.
-
-    Uses pipeline.generate() which always runs T_max loops.
+    Uses pipeline.generate().
 
     For distance/count: also runs a forward pass to get num_pred from
     the Number Head.
