@@ -318,7 +318,6 @@ def main():
         decoder_fwd = 0.0
         decoder_bwd = 0.0
         decoder_vram = 0.0
-        decoder_calls = 0
         other_modules = []
         for name in backward_events:
             if name.startswith("Decoder["):
@@ -326,7 +325,6 @@ def main():
                 evts = backward_events[name]
                 if evts:
                     decoder_bwd += sum(s.elapsed_time(e) for s, e in evts)
-                    decoder_calls += len(evts)
                 decoder_vram += get_vram_mb(name)
             else:
                 other_modules.append(name)
@@ -355,8 +353,7 @@ def main():
                 evts = backward_events[name]
                 bwd_ms = sum(s.elapsed_time(e) for s, e in evts) if evts else 0.0
                 vram_mb = get_vram_mb(name)
-                calls = len(evts) if evts else 0
-                print(f"    {name:23s} {fwd_ms:>10.2f} {bwd_ms:>10.2f} {vram_mb:>10.2f}  ({calls} calls)")
+                print(f"    {name:23s} {fwd_ms:>10.2f} {bwd_ms:>10.2f} {vram_mb:>10.2f}")
     else:
         print("  [INFO] Timing profiler requires --device cuda.")
 
