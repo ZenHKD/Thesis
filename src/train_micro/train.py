@@ -43,7 +43,7 @@ from src.train_micro.val import validate
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CHECKPOINT_DIR = os.path.join(PROJECT_DIR, "checkpoints", "micro")
+CHECKPOINT_BASE = os.path.join(PROJECT_DIR, "checkpoints", "micro")
 
 
 # =========================================================================
@@ -99,9 +99,16 @@ def load_checkpoint(pipeline, optimizer, scheduler, path):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
 
-    # Load optimizer + scheduler
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    # Load optimizer + scheduler (skip if stage changed → different param groups)
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        print(f"  [*] Optimizer + scheduler restored")
+    except ValueError as e:
+        if "different number of parameter groups" in str(e):
+            print(f"  [!] Stage changed — optimizer/scheduler reset (fresh start for new stage)")
+        else:
+            raise
 
     print(f"  [*] Resumed from: {path} (step={ckpt['step']}, epoch={ckpt['epoch']})")
     return ckpt["step"], ckpt["epoch"]
@@ -121,12 +128,19 @@ def main():
     # Training
     parser.add_argument("--split",       default="train", choices=["train", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=2)
+    parser.add_argument("--stage",       type=int,   default=2, choices=[1, 2],
+                        help="Training stage: 1=freeze decoder (train vision+RTI+Embed+LM_Head+CustomHeads), "
+                             "2=full fine-tuning (all trainable)")
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
     parser.add_argument("--lr-backbone", type=float, default=1e-5)
-    parser.add_argument("--lr-custom",   type=float, default=5e-5)
+    parser.add_argument("--lr-rti",      type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-5)
+    parser.add_argument("--lr-c",        type=float, default=5e-5,
+                        help="Learning rate for Category Head")
     parser.add_argument("--alpha",       type=float, default=0.1,
                         help="Weight for SmoothL1 loss (α in L)")
+    parser.add_argument("--gamma",       type=float, default=1.0,
+                        help="Weight for CategoryCE loss (γ in L)")
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -140,7 +154,7 @@ def main():
                         help="Enable gradient checkpointing (saves VRAM, slower)")
     # Validation
     parser.add_argument("--val-split",   default="val")
-    parser.add_argument("--val-batch-size", type=int, default=4)
+    parser.add_argument("--val-batch-size", type=int, default=2)
     parser.add_argument("--val-max-samples", type=int, default=None,
                         help="Limit val samples (None = full val set)")
     parser.add_argument("--val-steps", type=int, default=1000,
@@ -149,6 +163,8 @@ def main():
     parser.add_argument("--log-steps",   type=int,   default=100)
     parser.add_argument("--save-steps",  type=int,   default=5000)
     parser.add_argument("--resume",      type=str,   default=None)
+    parser.add_argument("--init-weights", type=str,  default=None,
+                        help="Load model weights only (no optimizer/step). Use for stage transitions.")
     parser.add_argument("--num-workers", type=int,   default=2)
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile on the Qwen backbone")
@@ -161,8 +177,9 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+    CHECKPOINT_DIR = os.path.join(CHECKPOINT_BASE, f"stage{args.stage}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    csv_path = os.path.join(CHECKPOINT_DIR, "training.csv")
+    csv_path = os.path.join(CHECKPOINT_BASE, f"training_stage{args.stage}.csv")
 
     # ====================================================================
     # 1. LOAD MODEL
@@ -182,42 +199,66 @@ def main():
         print("  [*] Compiling Qwen backbone with torch.compile...")
         pipeline.qwen = torch.compile(pipeline.qwen)
 
+    # Load weights from a previous stage (no optimizer/step restore)
+    if args.init_weights:
+        wt_path = os.path.join(args.init_weights, "model.safetensors")
+        if os.path.exists(wt_path):
+            from safetensors.torch import load_file as _lf
+            pipeline.load_state_dict(_lf(wt_path), strict=False)
+            print(f"  [*] Loaded weights from: {wt_path}")
+        else:
+            raise FileNotFoundError(f"No model.safetensors in {args.init_weights}")
+
     # ====================================================================
     # 2. CONFIGURE TRAINABLE PARAMETERS (5 groups)
     # ====================================================================
     print(f"\n{'='*70}")
-    print("PARAMETER GROUPS")
+    if args.stage == 1:
+        print("PARAMETER GROUPS  [STAGE 1: Decoder FROZEN]")
+    else:
+        print("PARAMETER GROUPS  [STAGE 2: Full Fine-tuning]")
     print("=" * 70)
 
-    # Embeddings are TRAINABLE (full 248K vocab)
-    # All other parameters are trainable
-    for param in pipeline.parameters():
-        if param.requires_grad:
-            pass  # already set
+    # Stage 1: Freeze LLM decoder and final LayerNorm
+    #          Vision encoder, RTI, Custom Heads, Embeddings, and LM Head are trainable
+    # Stage 2: Everything is trainable
+    if args.stage == 1:
+        # Freeze decoder layers
+        for param in pipeline.qwen.model.language_model.layers.parameters():
+            param.requires_grad = False
+        # Freeze final layernorm
+        for param in pipeline.qwen.model.language_model.norm.parameters():
+            param.requires_grad = False
+        print("  [*] FROZEN: Decoder layers, LayerNorm")
+        print("  [*] TRAINABLE: Vision Encoder, RTI, NumberHead, CategoryHead, Embeddings, LM Head")
 
-    # Build 5 optimizer param groups
+    # Build optimizer param groups (only include params with requires_grad)
     vision_params = [p for p in pipeline.qwen.model.visual.parameters() if p.requires_grad]
     embed_params = [p for p in pipeline.qwen.model.language_model.embed_tokens.parameters() if p.requires_grad]
     decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
                      [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
-    rti_params = list(pipeline.region_token_extractor.parameters())
-    numhead_params = list(pipeline.num_head.parameters())
+    rti_params = [p for p in pipeline.region_token_extractor.parameters() if p.requires_grad]
+    numhead_params = [p for p in pipeline.num_head.parameters() if p.requires_grad]
+    cathead_params = [p for p in pipeline.cat_head.parameters() if p.requires_grad]
 
     groups = [
         ("Vision Encoder",  vision_params,  args.lr_vision),
         ("Embeddings",      embed_params,   args.lr_backbone),  
         ("Decoder",         decoder_params, args.lr_backbone),
-        ("RTI",             rti_params,     args.lr_custom),
+        ("RTI",             rti_params,     args.lr_rti),
         ("Number Head",     numhead_params, args.lr_numhead),
+        ("Category Head",   cathead_params, args.lr_c),
     ]
 
     for name, params, lr in groups:
         n = sum(p.numel() for p in params)
-        print(f"  {name:20s}: {n:>12,} ({n/1e6:.2f}M)  lr={lr}")
+        status = "FROZEN" if n == 0 else f"lr={lr}"
+        print(f"  {name:20s}: {n:>12,} ({n/1e6:.2f}M)  {status}")
 
     total_trainable = sum(p.numel() for p in pipeline.parameters() if p.requires_grad)
+    total_all = sum(p.numel() for p in pipeline.parameters())
     print(f"  {'─'*60}")
-    print(f"  {'Total trainable':20s}: {total_trainable:>12,} ({total_trainable/1e6:.2f}M)")
+    print(f"  {'Total trainable':20s}: {total_trainable:>12,} ({total_trainable/1e6:.2f}M) / {total_all/1e6:.0f}M")
     n_layers = len(list(pipeline.qwen.model.language_model.layers))
     print(f"  Decoder: {n_layers} layers (single pass)")
 
@@ -234,7 +275,7 @@ def main():
                    "320p": (512, 320)}[args.resolution]
 
     dataset = SpatialVLMDataset(
-        args.split, processor=processor, target_size=target_size,
+        args.split, processor=processor, target_size=target_size
     )
     loader = get_dataloader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -260,19 +301,17 @@ def main():
     # ====================================================================
     # 4. OPTIMIZER + SCHEDULER
     # ====================================================================
-    param_groups = [
-        {"params": vision_params,  "lr": args.lr_vision,   "name": "vision"},
-        {"params": embed_params,   "lr": args.lr_backbone,  "name": "embed"},
-        {"params": decoder_params, "lr": args.lr_backbone,  "name": "decoder"},
-        {"params": rti_params,     "lr": args.lr_custom,    "name": "rti"},
-        {"params": numhead_params, "lr": args.lr_numhead,   "name": "numhead"},
-    ]
+    # Only include non-empty param groups in optimizer
+    param_groups = []
+    for name, params, lr in groups:
+        if len(params) > 0:
+            param_groups.append({"params": params, "lr": lr, "name": name})
 
     optimizer = AdamW(param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(total_steps - args.warmup_steps, 1), eta_min=1e-6,
     )
-    criterion = SpatialLoss(alpha=args.alpha, label_smoothing=args.label_smoothing)
+    criterion = SpatialLoss(alpha=args.alpha, gamma=args.gamma, label_smoothing=args.label_smoothing)
     dev = pipeline.device
 
     # ====================================================================
@@ -292,8 +331,8 @@ def main():
     # 6. CSV LOG (with val_loss column)
     # ====================================================================
     csv_fields = [
-        "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1",
-        "lr_vision", "lr_decoder", "lr_custom", "lr_numhead",
+        "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1", "val_cat",
+        "lr_vision", "lr_decoder", "lr_rti", "lr_numhead", "lr_c",
         "grad_norm", "samples_per_sec",
     ]
 
@@ -319,11 +358,11 @@ def main():
     # 7. TRAINING LOOP
     # ====================================================================
     print(f"\n{'='*70}")
-    print("TRAINING")
+    print(f"TRAINING  [Stage {args.stage}]")
     print("=" * 70)
-    print(f"  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  "
-          f"lr_custom={args.lr_custom}  lr_numhead={args.lr_numhead}  embed={args.lr_backbone}")
-    print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}  alpha={args.alpha}")
+    print(f"  stage={args.stage}  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  "
+          f"lr_rti={args.lr_rti}  lr_numhead={args.lr_numhead}  lr_c={args.lr_c}")
+    print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}  alpha={args.alpha}  gamma={args.gamma}")
     print()
 
     pipeline.train()
@@ -377,6 +416,7 @@ def main():
                     mask_token_positions=batch["mask_positions"],
                     decoded_masks=batch["decoded_masks"],
                     num_token_positions=batch.get("num_token_positions"),
+                    cat_token_positions=batch.get("cat_token_positions"),
                     attention_mask=attention_mask,
                     use_gradient_checkpointing=args.grad_ckpt,
                     vision_requires_grad=True,
@@ -391,11 +431,15 @@ def main():
 
             logits = output["logits"]
             num_pred = output["num_pred"]
+            cat_logits = output.get("cat_logits", None)
 
             loss = criterion(
                 logits, labels,
                 num_pred, batch["target_num"].to(dev),
                 batch["is_numeric"].to(dev),
+                cat_logits=cat_logits,
+                cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
+                is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev),
             ) / args.grad_accum
             loss.backward()
 
@@ -409,10 +453,10 @@ def main():
             pbar.set_postfix({
                 "step": global_step,
                 "loss": f"{window_avg:.4f}",
-                "lr": f"{optimizer.param_groups[2]['lr']:.2e}",  # decoder lr
+                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",  # first active lr
             })
 
-            del logits, output, loss, pixel_values, pixel_values_rgb, depth_maps, num_pred
+            del logits, output, loss, pixel_values, pixel_values_rgb, depth_maps, num_pred, cat_logits
 
             # Optimizer step every grad_accum micro-steps
             if micro_step % args.grad_accum == 0:
@@ -441,11 +485,13 @@ def main():
                     samples_sec = (args.grad_accum * args.batch_size * args.log_steps) / elapsed
                     current_epoch = (global_step * effective_batch) / total_samples
 
-                    lr_v = optimizer.param_groups[0]["lr"]
-                    lr_e = optimizer.param_groups[1]["lr"]  # embed
-                    lr_d = optimizer.param_groups[2]["lr"]  # decoder
-                    lr_c = optimizer.param_groups[3]["lr"]  # rti
-                    lr_n = optimizer.param_groups[4]["lr"]  # numhead
+                    lrs = {pg["name"]: pg["lr"] for pg in optimizer.param_groups}
+                    lr_v = lrs.get("Vision Encoder", 0.0)
+                    lr_e = lrs.get("Embeddings", 0.0)
+                    lr_d = lrs.get("Decoder", 0.0)
+                    lr_rti = lrs.get("RTI", 0.0)
+                    lr_n = lrs.get("Number Head", 0.0)
+                    lr_c = lrs.get("Category Head", 0.0)
 
                     tqdm.write(
                         f"  step={global_step:>7d}  "
@@ -462,9 +508,9 @@ def main():
                         writer = csv.writer(f)
                         writer.writerow([
                             global_step, f"{current_epoch:.4f}",
-                            f"{window_avg:.6f}", "", "", "",  # val_loss, val_ce, val_sl1 empty
+                            f"{window_avg:.6f}", "", "", "", "",  # val_loss, val_ce, val_sl1, val_cat empty
                             f"{lr_v:.8f}", f"{lr_d:.8f}",
-                            f"{lr_c:.8f}", f"{lr_n:.8f}",
+                            f"{lr_rti:.8f}", f"{lr_n:.8f}", f"{lr_c:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
                         ])
 
@@ -482,6 +528,7 @@ def main():
                 if args.val_steps > 0 and global_step % args.val_steps == 0 and global_step > 0:
                     print(f"\n  [{'='*70}]")
                     print(f"  Running validation at step {global_step}...")
+                    torch.cuda.empty_cache()
 
                     val_results = validate(
                         pipeline, criterion, pipeline.processor,
@@ -497,11 +544,15 @@ def main():
                     pipeline.train()  # Switch back to train mode
 
                     current_epoch = (global_step * effective_batch) / total_samples
-                    lr_v = optimizer.param_groups[0]["lr"]
-                    lr_e = optimizer.param_groups[1]["lr"]  # embed
-                    lr_d = optimizer.param_groups[2]["lr"]  # decoder
-                    lr_c = optimizer.param_groups[3]["lr"]  # rti
-                    lr_n = optimizer.param_groups[4]["lr"]  # numhead
+                    lrs = {pg["name"]: pg["lr"] for pg in optimizer.param_groups}
+                    lr_v = lrs.get("Vision Encoder", 0.0)
+                    lr_e = lrs.get("Embeddings", 0.0)
+                    lr_d = lrs.get("Decoder", 0.0)
+                    lr_rti = lrs.get("RTI", 0.0)
+                    lr_n = lrs.get("Number Head", 0.0)
+                    lr_c = lrs.get("Category Head", 0.0)
+
+                    val_cat = val_results.get("val_cat", 0.0)
 
                     # Log to CSV with val_loss filled
                     with open(csv_path, "a", newline="") as f:
@@ -510,12 +561,13 @@ def main():
                             global_step, f"{current_epoch:.4f}",
                             f"{window_avg:.6f}",
                             f"{val_loss:.6f}", f"{val_ce:.6f}", f"{val_sl1:.6f}",
+                            f"{val_cat:.6f}",
                             f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
-                            f"{lr_c:.8f}", f"{lr_n:.8f}",
+                            f"{lr_rti:.8f}", f"{lr_n:.8f}", f"{lr_c:.8f}",
                             " ", " ",
                         ])
                     print(f"\nValidation complete: val_loss={val_loss:.4f} "
-                          f"(CE={val_ce:.4f}, SL1={val_sl1:.4f})")
+                          f"(CE={val_ce:.4f}, SL1={val_sl1:.4f}, Cat={val_cat:.4f})")
 
         # ==============================================================
         # END OF EPOCH 

@@ -122,7 +122,7 @@ def check_vocab_and_embedding(pipeline, input_ids, labels):
 # Section 3: Forward alignment
 # ---------------------------------------------------------------------------
 
-def print_forward_alignment(logits, labels, tokenizer, pipeline):
+def print_forward_alignment(logits, labels, tokenizer):
     """Show per-position alignment after RTI shortening + label trim + shift."""
     L_orig  = labels.shape[1]
     L_prime = logits.shape[1]
@@ -147,10 +147,8 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
     # Per-token breakdown
     vocab_size = logits.shape[2]
     print(f"  Vocab size: {vocab_size}")
-
-    print(f"\n  {'Pos':>5}  {'TokenID':>8}  {'Decoded':>14}  "
-          f"{'Pred':>8}  {'DecPred':>14}  {'P(target)':>10}  {'CE Loss':>9}  Match?")
-    print(f"  {'─'*101}")
+    print("\n    Pos   TokenID         Decoded      Pred         DecPred   P(target)    CE Loss  Match?")
+    print("  " + "─" * 120)
 
     logits_cpu = logits.cpu().float()
     per_token_losses = []
@@ -164,18 +162,20 @@ def print_forward_alignment(logits, labels, tokenizer, pipeline):
 
         pred_id = logit_vec.argmax().item()
         # Decode directly (native Qwen IDs, no remapping)
-        target_text = decode_token(tokenizer, token_id)
-        pred_text = decode_token(tokenizer, pred_id)
-        match = "[OK]" if pred_id == token_id else "[FAIL]"
+        dec_target = decode_token(tokenizer, token_id)
+        dec_pred = decode_token(tokenizer, pred_id)
+        match_str = "[OK]" if token_id == pred_id else "[FAIL]"
+        
+        # Optionally, limit print to last N to avoid huge terminal spam
+        if len(active_positions) < 60 or (t > active_positions[-60][0]):
+            print(f"  {t+1:>5}  {token_id:>8}  {dec_target:>14}  {pred_id:>8}  {dec_pred:>14}  {p_target:>8.6f}  {ce_loss:>9.4f}  {match_str}")
 
-        print(f"  {t:>5}  {token_id:>8}  {target_text:>14}  "
-              f"{pred_id:>8}  {pred_text:>14}  {p_target:>10.6f}  {ce_loss:>9.4f}  {match}")
+    print("  " + "─" * 120)
 
     if per_token_losses:
         avg = sum(per_token_losses) / len(per_token_losses)
-        print(f"  {'─'*101}")
-        print(f"  Average CE loss = {avg:.6f}")
-        print(f"  Expected (untrained) ≈ log({vocab_size}) = {math.log(vocab_size):.2f}")
+        print(f"  Average CE loss (raw)      = {avg:.6f}")
+        print(f"  Expected (untrained) ≈ log({logits.size(-1)}) = {math.log(logits.size(-1)):.2f}")
 
     return per_token_losses
 
@@ -236,7 +236,7 @@ def main():
     print(f"LOADING SAMPLE  (split={args.split}, idx={args.sample_idx}, res={args.resolution})")
     print("=" * 70)
 
-    dataset = SpatialVLMDataset(args.split, processor=processor, target_size=target_size)
+    dataset = SpatialVLMDataset(args.split, processor=processor, target_size=target_size, answer_weight=20.0)
     loader  = get_dataloader(dataset, batch_size=1, shuffle=False,
                              num_workers=0, pin_memory=False)
 
@@ -313,23 +313,33 @@ def main():
     t_grid, h_grid, w_grid = [int(x) for x in image_grid_thw_1b[0].tolist()]
     h_vis, w_vis = h_grid // 2, w_grid // 2  # after 2x2 merger
 
-    print(f"\n  ┌─────────────────────────────────────────────────────────────┐")
-    print(f"  │  BACKBONE INPUT:  inputs_embeds = [{B}, {total_seq}, {D}]")
-    print(f"  │")
-    print(f"  │  Vision Encoder + Merger + GSA:")
-    print(f"  │    pixel_values: {list(pixel_values_1b.shape)}")
-    print(f"  │    image_grid_thw: [{t_grid}, {h_grid}, {w_grid}]")
-    print(f"  │    after merger (2×2): [{t_grid}, {h_vis}, {w_vis}]")
-    print(f"  │    -> visual_tokens: [{B}, {n_visual}, {D}]")
-    print(f"  │")
-    print(f"  │  Text Embeddings + RTI:")
-    print(f"  │    input_ids: [{B}, {n_text}]")
-    print(f"  │    n_masks (RTI 3->3 replace): {n_masks}")
-    print(f"  │")
-    print(f"  │  Inline Padding Fusion:")
-    print(f"  │    Replaced <|image_pad|> tokens with visual embeddings")
-    print(f"  │    inputs_embeds = [{B}, {total_seq}, {D}]")
-    print(f"  └─────────────────────────────────────────────────────────────┘")
+    # Define the width
+    WIDTH = 64
+
+    def box_line(text=""):
+        """Pad text and wrap with box borders."""
+        # -4 accounts for "  │ " and " │" (the spaces and borders)
+        inner_width = WIDTH - 4
+        padded = text.ljust(inner_width)
+        return f"  │ {padded} │"
+
+    print(f"\n  ┌{'─' * (WIDTH - 2)}┐")
+    print(box_line(f"BACKBONE INPUT:  inputs_embeds = [{B}, {total_seq}, {D}]"))
+    print(box_line())
+    print(box_line("Vision Encoder + Merger:"))
+    print(box_line(f"  pixel_values: {list(pixel_values_1b.shape)}"))
+    print(box_line(f"  image_grid_thw: [{t_grid}, {h_grid}, {w_grid}]"))
+    print(box_line(f"  after merger (2×2): [{t_grid}, {h_vis}, {w_vis}]"))
+    print(box_line(f"  -> visual_tokens: [{B}, {n_visual}, {D}]"))
+    print(box_line())
+    print(box_line("Text Embeddings + RTI:"))
+    print(box_line(f"  input_ids: [{B}, {n_text}]"))
+    print(box_line(f"  n_masks (RTI 3->3 replace): {n_masks}"))
+    print(box_line())
+    print(box_line("Inline Padding Fusion:"))
+    print(box_line("  Replaced <|image_pad|> tokens with visual embeddings"))
+    print(box_line(f"  inputs_embeds = [{B}, {total_seq}, {D}]"))
+    print(f"  └{'─' * (WIDTH - 2)}┘")
 
     # Now print the full sequence map
     ids  = input_ids_1b[0].tolist()
@@ -460,15 +470,18 @@ def main():
             mask_token_positions=batch["mask_positions"],
             decoded_masks=batch["decoded_masks"],
             num_token_positions=batch.get("num_token_positions"),
+            cat_token_positions=batch.get("cat_token_positions"),
         )
 
     logits = output["logits"]
     num_pred = output["num_pred"]
+    cat_logits = output.get("cat_logits", None)
 
     print(f"  logits: {list(logits.shape)}")
     print(f"  num_pred: {num_pred.tolist()}")
+    print(f"  cat_logits: {[cl.shape if cl is not None else None for cl in cat_logits] if cat_logits else None}")
 
-    per_token_losses = print_forward_alignment(logits, labels.cpu(), tokenizer, pipeline)
+    per_token_losses = print_forward_alignment(logits, labels.cpu(), tokenizer)
 
     # ------------------------------------------------------------------ #
     # SECTION 4: Loss check
@@ -477,28 +490,35 @@ def main():
     print("SECTION 4: LOSS CHECK (Standard CE + SmoothL1)")
     print("=" * 70)
 
-    criterion = SpatialLoss(alpha=0.1)
+    # Disable label smoothing so we can perfectly match mathematical CE base calculation
+    criterion = SpatialLoss(alpha=0.1, gamma=0.5, label_smoothing=0.0)
     device = logits.device
     official_loss, components = criterion(
         logits,
         labels.to(device),
         num_pred.to(device).float(), batch["target_num"].to(device),
         batch["is_numeric"].to(device),
+        cat_logits=cat_logits,
+        cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(device),
+        is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(device),
         return_components=True,
     )
 
     print(f"\n  SpatialLoss output: {official_loss.item():.6f}")
-    print(f"  Components: ce={components['ce']:.6f}, sl1={components['sl1']:.6f}")
+    print(f"  Components: ce={components['ce']:.6f}, sl1={components['sl1']:.6f}, cat_ce={components.get('cat_ce', 0.0):.6f}")
     print(f"  CE per step: {components.get('ce_per_step', [])}")
-    if per_token_losses:
-        avg = sum(per_token_losses) / len(per_token_losses)
-        diff_check = abs(avg - official_loss.item())
-        # CE won't exactly match if SmoothL1 is nonzero
-        if batch["is_numeric"][0].item():
-            print(f"  (Contains SmoothL1 component — diff expected)")
-        else:
-            print(f"  Manual vs official diff: {diff_check:.8f}  "
-                  f"{'[MATCH]' if diff_check < 0.001 else '[MISMATCH!]'}")
+    
+    avg_raw = sum(per_token_losses) / len(per_token_losses) if per_token_losses else 0.0
+    print(f"  Manual CE (raw):      {avg_raw:.8f}")
+    
+    diff_check = abs(avg_raw - official_loss.item())
+    if batch["is_numeric"][0].item():
+        print(f"  (Contains SmoothL1 component — diff expected)")
+    elif batch.get("is_categorical", torch.zeros(1))[0].item():
+        print(f"  (Contains CatCE component — diff expected)")
+    else:
+        print(f"  Manual vs official diff: {diff_check:.8f}  "
+              f"{'[MATCH]' if diff_check < 0.01 else '[MISMATCH!]'}")
 
     is_finite = math.isfinite(official_loss.item())
     print(f"  Finite: {is_finite}")
@@ -536,14 +556,23 @@ def main():
         pil_image = pil_image.resize(target_size, Image.LANCZOS)
 
     import re
-    question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
+    mask_idx = [0]
+    def replace_mask(m):
+        i = mask_idx[0]
+        mask_idx[0] += 1
+        return f"[Region {i}]: <|object_ref_start|>{m.group(1)}<|object_ref_end|>"
+    question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
     sys_str = (
         "<|im_start|>system\n"
         "You are an expert AI assistant for warehouse spatial reasoning. "
         "Analyze the image and the specific object regions carefully. "
         "First, output your step-by-step reasoning inside <think></think> tags. "
-        "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+        "Then, output your answer using EXACTLY one of these formats:\n"
+        "  mcq | <|cat|>\n"
+        "  left_right | <|cat|>\n"
+        "  distance | <|num|>\n"
+        "  count | <|num|><|im_end|>\n"
     )
     
     h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
@@ -588,8 +617,8 @@ def main():
         )
 
     raw_output = pipeline.processor.tokenizer.decode(
-        output_ids[0], skip_special_tokens=True
-    ).strip()
+        output_ids[0], skip_special_tokens=False
+    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
     raw_output = re.sub(r'<think>.*?</think>\s*', '', raw_output, flags=re.DOTALL).strip()
     parsed = pipeline.parse_output(raw_output)
 

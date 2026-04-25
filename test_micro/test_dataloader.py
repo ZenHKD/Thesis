@@ -6,8 +6,9 @@ Verifies:
     2. Tensor shapes and dtypes
     3. Label masking (prompt = -100, answer = active)
     4. Numeric fields (is_numeric, target_num, num_token_pos)
-    5. Batched collation with variable-length padding
-    6. Token ID ranges (all IDs should be within Qwen vocab)
+    5. Categorical fields (is_categorical, target_cat_index, cat_token_pos)
+    6. Batched collation with variable-length padding
+    7. Token ID ranges (all IDs should be within Qwen vocab)
 
 Usage:
     python test_micro/test_dataloader.py
@@ -132,6 +133,26 @@ def main():
             else:
                 print(f"  [OK] is_numeric=False (text-only task)")
 
+        # Check categorical fields
+        is_cat = sample.get("is_categorical", False)
+        target_cat_idx = sample.get("target_cat_index", -1)
+        cat_pos = sample.get("cat_token_pos", -1)
+
+        if cat in ("mcq", "left_right"):
+            if not is_cat:
+                print(f"  [FAIL] is_categorical should be True for {cat}")
+                all_ok = False
+            else:
+                print(f"  [OK] is_categorical=True, target_cat_index={target_cat_idx}, cat_token_pos={cat_pos}")
+            if cat_pos == -1:
+                print(f"  [WARN] <|cat|> token not found in input_ids")
+        else:
+            if is_cat:
+                print(f"  [FAIL] is_categorical should be False for {cat}")
+                all_ok = False
+            else:
+                print(f"  [OK] is_categorical=False (non-categorical task)")
+
     # ------------------------------------------------------------------
     # Test DataLoader with batching
     # ------------------------------------------------------------------
@@ -163,6 +184,13 @@ def main():
         # Verify numeric fields
         assert batch["is_numeric"].shape == (B,), f"is_numeric shape: {batch['is_numeric'].shape}"
         assert batch["target_num"].shape == (B,), f"target_num shape: {batch['target_num'].shape}"
+
+        # Verify categorical fields
+        if "is_categorical" in batch:
+            assert batch["is_categorical"].shape == (B,), f"is_categorical shape: {batch['is_categorical'].shape}"
+            assert batch["target_cat_index"].shape == (B,), f"target_cat_index shape: {batch['target_cat_index'].shape}"
+            print(f"    is_categorical: {batch['is_categorical'].tolist()}")
+            print(f"    target_cat_index: {batch['target_cat_index'].tolist()}")
 
         cats_in_batch = batch["categories"]
         print(f"    Categories: {cats_in_batch}")

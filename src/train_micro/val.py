@@ -59,6 +59,7 @@ def validate(pipeline, criterion, processor, resolution="320p",
     total_loss_sum = 0.0
     total_ce_sum = 0.0
     total_sl1_sum = 0.0
+    total_cat_sum = 0.0
     n_batches = 0
 
     pbar = tqdm(loader, desc="Validation", leave=False)
@@ -82,6 +83,7 @@ def validate(pipeline, criterion, processor, resolution="320p",
                 mask_token_positions=batch["mask_positions"],
                 decoded_masks=batch["decoded_masks"],
                 num_token_positions=batch.get("num_token_positions"),
+                cat_token_positions=batch.get("cat_token_positions"),
                 attention_mask=attention_mask,
             )
         except RuntimeError as e:
@@ -92,30 +94,38 @@ def validate(pipeline, criterion, processor, resolution="320p",
 
         logits = output["logits"]
         num_pred = output["num_pred"]
+        cat_logits = output.get("cat_logits", None)
 
         loss, components = criterion(
             logits, labels,
             num_pred, batch["target_num"].to(dev),
             batch["is_numeric"].to(dev),
+            cat_logits=cat_logits,
+            cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
+            is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev),
             return_components=True,
         )
         total_loss_sum += loss.item()
         total_ce_sum += components['ce']
         total_sl1_sum += components['sl1']
+        total_cat_sum += components.get('cat_ce', 0.0)
         n_batches += 1
         pbar.set_postfix({
             "val_loss": f"{total_loss_sum / max(n_batches, 1):.4f}",
             "ce": f"{total_ce_sum / max(n_batches, 1):.4f}",
             "sl1": f"{total_sl1_sum / max(n_batches, 1):.4f}",
+            "cat": f"{total_cat_sum / max(n_batches, 1):.4f}",
         })
 
     avg_loss = total_loss_sum / max(n_batches, 1)
     avg_ce = total_ce_sum / max(n_batches, 1)
     avg_sl1 = total_sl1_sum / max(n_batches, 1)
+    avg_cat = total_cat_sum / max(n_batches, 1)
     return {
         "val_loss": avg_loss,
         "val_ce": avg_ce,
         "val_sl1": avg_sl1,
+        "val_cat": avg_cat,
         "n_samples": len(dataset),
         "n_batches": n_batches,
     }
@@ -132,7 +142,7 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution",  default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
-    parser.add_argument("--batch-size",  type=int, default=8)
+    parser.add_argument("--batch-size",  type=int, default=4)
     parser.add_argument("--split",       default="val",
                         choices=["val", "train_sample"])
     parser.add_argument("--max-samples", type=int, default=None)

@@ -56,7 +56,7 @@ import random
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from model_micro.pipeline import find_mask_positions, NUM_TOKEN_ID
+from model_micro.pipeline import find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
 
 # Paths
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nvidia_warehouse_dataset")
@@ -80,13 +80,15 @@ def format_answer(category: str, normalized_answer) -> str:
     Format: <category> | <value>
 
     Micro architecture changes:
-        distance -> "distance | <|num|>"    (Number Head predicts the value)
-        count    -> "count | <|num|>"       (Number Head predicts the value)
-        mcq      -> 'mcq | "5"'          (LM Head, quoted integer)
-        left_right-> 'left_right | "left"' (LM Head, quoted string)
+        distance  -> "distance | <|num|>"     (NumberHead predicts the value)
+        count     -> "count | <|num|>"        (NumberHead predicts the value)
+        mcq       -> "mcq | <|cat|>"          (CategoryHead selects region)
+        left_right-> "left_right | <|cat|>"   (CategoryHead determines direction)
     """
     if category in ("distance", "count"):
         return f"{category} | <|num|>"
+    elif category in ("mcq", "left_right"):
+        return f"{category} | <|cat|>"
     else:
         raw = str(normalized_answer)
         formatted = f'"{raw}"'
@@ -123,15 +125,22 @@ class SpatialVLMDataset(Dataset):
         self,
         split: str,
         processor,
-        max_samples: int | None = None,
         target_size: tuple[int, int] | None = None,
+        max_samples: int | None = None,
+        augment: bool = False,
+        answer_weight: float = 1.0,
     ):
         assert split in _SPLIT_CONFIG, f"Unknown split: {split}. Use: {list(_SPLIT_CONFIG.keys())}"
         cfg = _SPLIT_CONFIG[split]
 
         self.split = split
         self.processor = processor
-        self.tokenizer = processor.tokenizer  # single tokenizer (full vocab, no remapping)
+        self.tokenizer = processor.tokenizer
+        self.target_size = target_size
+
+        # Data augmentation (RGB only, no geometric transforms)
+        # Only active for training splits — val/test stay deterministic
+        self.augment = augment or (split in ("train", "train_sample"))
 
         self.json_path = os.path.join(ROOT, cfg["json"])
         self.image_dir = os.path.join(ROOT, cfg["dir"], "images")
@@ -143,14 +152,9 @@ class SpatialVLMDataset(Dataset):
         if max_samples is not None:
             self.data = self.data[:max_samples]
 
-        self.target_size = target_size
-
-        # Data augmentation (RGB only, no geometric transforms)
-        # Only active for training splits — val/test stay deterministic
-        self.augment = split in ("train", "train_sample")
-
-        # Cache <|num|> token ID
+        # Cache special token IDs
         self.num_token_id = NUM_TOKEN_ID
+        self.cat_token_id = CAT_TOKEN_ID
 
     def __len__(self) -> int:
         return len(self.data)
@@ -228,19 +232,46 @@ class SpatialVLMDataset(Dataset):
         # 4. Get GPT reasoning from dataset (chain-of-thought)
         gpt_reasoning = entry["conversations"][1]["value"]
 
-        # 5. Build target answer string (Micro: <|num|> for numeric)
+        # 5. Determine task type fields
         category = entry["category"]
-        target_text = format_answer(category, entry["normalized_answer"])
-
-        # 6. Build full answer with <think> chain-of-thought
-        full_answer = f"<think>{gpt_reasoning}</think>{target_text}<|im_end|>\n"
-
-        # 7. Determine numeric fields
         is_numeric = category in ("distance", "count")
+        is_categorical = category in ("mcq", "left_right")
         target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
+        
+        # For CategoryHead: target index = which mask is the answer
+        if is_categorical:
+            raw_answer = str(entry["normalized_answer"]).strip().strip('"').strip("'")
+            if category == "mcq":
+                target_cat_index = int(raw_answer)  # Region index (0-12)
+            elif category == "left_right":
+                # "left" -> 0 (first mask), "right" -> 1 (second mask)
+                target_cat_index = 0 if raw_answer == "left" else 1
+            else:
+                target_cat_index = -1
+        else:
+            target_cat_index = -1
+
+        # 6. Build components separately for weight isolation
+        # We append the category prefix to cot_str so it remains natively unweighted (1.0)
+        cot_str = f"<think>\n{gpt_reasoning}\n</think>\n\n{category} | "
+        
+        if is_numeric:
+            ans_text = ""
+        elif is_categorical:
+            ans_text = ""  # <|cat|> token will be inserted like <|num|>
+        else:
+            raw = str(entry["normalized_answer"])
+            ans_text = f'"{raw}"'
+
+        tail_str = "<|im_end|>\n"
 
         # 8. Mask replacement for Object Ref Grounding
-        question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
+        mask_idx = [0]
+        def replace_mask(match):
+            i = mask_idx[0]
+            mask_idx[0] += 1
+            return f"[Region {i}]: <|object_ref_start|>{match.group(1)}<|object_ref_end|>"
+        question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
         # 9. Process image separately (pixel_values + grid only)
         image_inputs = self.processor.image_processor(
@@ -254,7 +285,11 @@ class SpatialVLMDataset(Dataset):
             "You are an expert AI assistant for warehouse spatial reasoning. "
             "Analyze the image and the specific object regions carefully. "
             "First, output your step-by-step reasoning inside <think></think> tags. "
-            "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+            "Then, output your answer using EXACTLY one of these formats:\n"
+            "  mcq | <|cat|>\n"
+            "  left_right | <|cat|>\n"
+            "  distance | <|num|>\n"
+            "  count | <|num|><|im_end|>\n"
         )
         
         # 10. Calculate visual tokens correctly for inline injection
@@ -268,20 +303,23 @@ class SpatialVLMDataset(Dataset):
         
         q_ids = self.tokenizer.encode(sys_str + user_str + eval_prompt, add_special_tokens=False)
 
-        # 11. For numeric categories, encode answer WITHOUT "<|num|>" and manually append <|num|> token
-        # (BPE would encode "<|num|>" as regular tokens — we need the special <|num|> token ID)
-        if is_numeric:
-            # full_answer = "<think>...reasoning...</think>category | <|num|><|im_end|>\n"
-            # Encode everything up to "<|num|>", then append <|num|> special token
-            answer_text = full_answer.rsplit("<|num|>", 1)[0]  # e.g. "<think>...</think>distance | "
-            a_tail = full_answer.rsplit("<|num|>", 1)[1]
-            a_ids = self.tokenizer.encode(answer_text, add_special_tokens=False) + [self.num_token_id] + self.tokenizer.encode(a_tail, add_special_tokens=False)
-        else:
-            a_ids = self.tokenizer.encode(full_answer, add_special_tokens=False)
+        # 11. Encode separately to guarantee boundary mapping
+        cot_ids = self.tokenizer.encode(cot_str, add_special_tokens=False)
+        ans_ids = self.tokenizer.encode(ans_text, add_special_tokens=False)
+        tail_ids = self.tokenizer.encode(tail_str, add_special_tokens=False)
 
+        if is_numeric:
+            target_ids = [self.num_token_id] + tail_ids
+        elif is_categorical:
+            target_ids = [self.cat_token_id] + tail_ids
+        else:
+            target_ids = ans_ids + tail_ids
+
+        a_ids = cot_ids + target_ids
         all_ids    = q_ids + a_ids
         input_ids  = torch.tensor(all_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
+
 
         # 12. Labels: question + separator = -100, answer (+ EOS) = active
         answer_start = len(q_ids)
@@ -299,12 +337,17 @@ class SpatialVLMDataset(Dataset):
         # 14. Find <|num|> token position (for Number Head)
         num_token_pos = -1
         if is_numeric:
-            num_token_pos = self._find_num_token_pos(input_ids)
+            num_token_pos = self._find_token_pos(input_ids, self.num_token_id)
 
-        # 15. Format answer for metadata
+        # 15. Find <|cat|> token position (for Category Head)
+        cat_token_pos = -1
+        if is_categorical:
+            cat_token_pos = self._find_token_pos(input_ids, self.cat_token_id)
+
+        # 16. Format answer for metadata
         raw_answer = str(entry["normalized_answer"])
         if category in ("mcq", "left_right"):
-            answer_str = f'"{raw_answer}"'
+            answer_str = f"<|cat|>={raw_answer}"
         elif is_numeric:
             answer_str = f"<|num|>={raw_answer}"
         else:
@@ -342,6 +385,7 @@ class SpatialVLMDataset(Dataset):
             "depth_map":      depth_map,
             "input_ids":      input_ids,
             "labels":         labels,
+
             "attention_mask": attention_mask,
             "mask_positions": mask_positions,
             "rle_list":       rle_list,
@@ -350,20 +394,23 @@ class SpatialVLMDataset(Dataset):
             "answer":         answer_str,
             "image_name":     image_name,
             "is_numeric":     is_numeric,
+            "is_categorical": is_categorical,
             "target_num":     target_num,
+            "target_cat_index": target_cat_index,
             "num_token_pos":  num_token_pos,
+            "cat_token_pos":  cat_token_pos,
         }
 
-    def _find_num_token_pos(self, input_ids: torch.Tensor) -> int:
-        """Find position of <|num|> token in input_ids.
+    def _find_token_pos(self, input_ids: torch.Tensor, token_id: int) -> int:
+        """Find position of a special token in input_ids.
 
-        <|num|> token has a fixed ID in the vocab (appended by prune.py).
+        Searches from end since special tokens (<|num|>, <|cat|>) are in the answer portion.
         """
         ids_list = input_ids.tolist()
 
-        # Search from end (<|num|> is in the answer portion)
+        # Search from end
         for i in range(len(ids_list) - 1, -1, -1):
-            if ids_list[i] == self.num_token_id:
+            if ids_list[i] == token_id:
                 return i
 
         return -1
@@ -415,8 +462,11 @@ def collate_fn(batch: list[dict]) -> dict:
 
     # --- Numeric fields ---
     is_numeric = torch.tensor([d["is_numeric"] for d in batch], dtype=torch.bool)
+    is_categorical = torch.tensor([d["is_categorical"] for d in batch], dtype=torch.bool)
     target_num = torch.tensor([d["target_num"] for d in batch], dtype=torch.float32)
+    target_cat_index = torch.tensor([d["target_cat_index"] for d in batch], dtype=torch.long)
     num_token_positions = [d["num_token_pos"] for d in batch]
+    cat_token_positions = [d["cat_token_pos"] for d in batch]
 
     # --- Metadata ---
     categories  = [d["category"] for d in batch]
@@ -430,13 +480,17 @@ def collate_fn(batch: list[dict]) -> dict:
         "depth_maps":          depth_maps,
         "input_ids":           input_ids,
         "labels":              labels,
+
         "attention_mask":      attention_mask,
         "rle_list":            rle_list,
         "mask_positions":      mask_positions,
         "decoded_masks":       decoded_masks,
         "is_numeric":          is_numeric,
+        "is_categorical":      is_categorical,
         "target_num":          target_num,
+        "target_cat_index":    target_cat_index,
         "num_token_positions": num_token_positions,
+        "cat_token_positions": cat_token_positions,
         "categories":          categories,
         "answers":             answers,
         "image_names":         image_names,

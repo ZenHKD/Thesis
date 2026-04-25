@@ -106,6 +106,7 @@ def main():
         "Decoder (24 layers)": pipeline.qwen.model.language_model.layers,
         "RTI":             pipeline.region_token_extractor,
         "Number Head":     pipeline.num_head,
+        "Category Head":   pipeline.cat_head,
     }
 
     total_trainable = 0
@@ -245,6 +246,7 @@ def main():
         add_timing_hook(pipeline.qwen.lm_head, "LM Head")
         add_timing_hook(pipeline.region_token_extractor, "RTI")
         add_timing_hook(pipeline.num_head, "Number Head")
+        add_timing_hook(pipeline.cat_head, "Category Head")
 
     pipeline.train()
 
@@ -260,6 +262,7 @@ def main():
         mask_token_positions=batch["mask_positions"],
         decoded_masks=batch["decoded_masks"],
         num_token_positions=batch.get("num_token_positions"),
+        cat_token_positions=batch.get("cat_token_positions"),
         use_gradient_checkpointing=False,
         vision_requires_grad=True,
     )
@@ -268,15 +271,20 @@ def main():
 
     logits = output["logits"]
     num_pred = output["num_pred"]
+    cat_logits = output.get("cat_logits", None)
     print(f"  logits:          {list(logits.shape)}")
     print(f"  num_pred:        {num_pred.tolist()}")
+    print(f"  cat_logits:      {[cl.shape if cl is not None else None for cl in cat_logits] if cat_logits else None}")
 
-    # Loss (Uniform CE + SmoothL1)
-    criterion = SpatialLoss(alpha=0.1)
+    # Loss (Uniform CE + SmoothL1 + CategoryCE)
+    criterion = SpatialLoss(alpha=0.1, gamma=0.5)
     loss = criterion(
         logits, labels,
         num_pred, batch["target_num"].to(dev),
         batch["is_numeric"].to(dev),
+        cat_logits=cat_logits,
+        cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
+        is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev),
     )
     print(f"  Loss = {loss.item():.4f}")
     
@@ -391,6 +399,11 @@ def main():
     print("=" * 70)
     numhead_ok, numhead_issues = check_gradients(pipeline.num_head, "Number Head")
 
+    print(f"\n{'='*70}")
+    print("GRADIENT CHECK — Category Head")
+    print("=" * 70)
+    cathead_ok, cathead_issues = check_gradients(pipeline.cat_head, "Category Head")
+
     # ====================================================================
     # 6. SUMMARY
     # ====================================================================
@@ -400,6 +413,7 @@ def main():
 
     all_ok = True
     has_numeric = batch["is_numeric"].any().item()
+    has_categorical = batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).any().item()
     checks = [
         (vision_ok, "Vision Encoder has non-zero gradients"),
         (decoder_ok, "Decoder layers have non-zero gradients"),
@@ -407,9 +421,12 @@ def main():
         (rti_ok, "RTI has non-zero gradients"),
         (numhead_ok or not has_numeric,
          f"Number Head has gradients (has_numeric={has_numeric})"),
+        (cathead_ok or not has_categorical,
+         f"Category Head has gradients (has_categorical={has_categorical})"),
         (not (vision_issues or decoder_issues
               or rti_issues
-              or (numhead_issues and has_numeric)),
+              or (numhead_issues and has_numeric)
+              or (cathead_issues and has_categorical)),
          "No NaN/Inf in any gradients"),
         (torch.isfinite(loss).item(), f"Loss is finite ({loss.item():.4f})"),
     ]

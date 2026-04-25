@@ -21,7 +21,7 @@ import re as _re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions
+from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
 from src.dataloader.dataloader import SpatialVLMDataset
 
 # Paths
@@ -137,14 +137,23 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
     question = sample["_question"]
 
     import re
-    question = re.sub(r'(<mask.*?>)', r'<|object_ref_start|>\1<|object_ref_end|>', question)
+    mask_idx = [0]
+    def replace_mask(m):
+        i = mask_idx[0]
+        mask_idx[0] += 1
+        return f"[Region {i}]: <|object_ref_start|>{m.group(1)}<|object_ref_end|>"
+    question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
     sys_str = (
         "<|im_start|>system\n"
         "You are an expert AI assistant for warehouse spatial reasoning. "
         "Analyze the image and the specific object regions carefully. "
         "First, output your step-by-step reasoning inside <think></think> tags. "
-        "Finally, output your exact answer strictly using the format: 'category | value'.<|im_end|>\n"
+        "Then, output your answer using EXACTLY one of these formats:\n"
+        "  mcq | <|cat|>\n"
+        "  left_right | <|cat|>\n"
+        "  distance | <|num|>\n"
+        "  count | <|num|><|im_end|>\n"
     )
     
     h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
@@ -197,9 +206,13 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
 
     # Step 2: For numeric categories, get num_pred via forward pass
     num_pred_val = None
+    cat_pred_idx = None
 
     _clean_pattern = _re.compile(
         r'^<think>.+?</think>\s*(distance|count)\s*\|\s*<\|num\|>$', _re.DOTALL
+    )
+    _cat_pattern = _re.compile(
+        r'^<think>.+?</think>\s*(mcq|left_right)\s*\|\s*<\|cat\|>$', _re.DOTALL
     )
 
     # Check raw output before stripping think tags
@@ -207,10 +220,17 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         output_ids[0], skip_special_tokens=False
     ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
     is_clean = bool(_clean_pattern.match(raw_full))
+    is_cat_clean = bool(_cat_pattern.match(raw_full))
 
     if is_clean and parsed["category"] in ("distance", "count"):
-        full_input_ids = sample["input_ids"].unsqueeze(0).to(device=dev)
-        num_token_pos = sample.get("num_token_pos", -1)
+        full_generated_ids = torch.cat([input_ids, output_ids], dim=1)
+        gen_ids_list = full_generated_ids[0].tolist()
+        num_token_pos = -1
+        
+        for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
+            if gen_ids_list[idx_pos] == NUM_TOKEN_ID:
+                num_token_pos = idx_pos
+                break
 
         if num_token_pos >= 0:
             output = pipeline(
@@ -218,7 +238,7 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
                 pixel_values_rgb=pixel_values_rgb,
                 image_grid_thw=image_grid_thw,
                 depth_maps=depth_map,
-                input_ids=full_input_ids,
+                input_ids=full_generated_ids,
                 rle_list=[rle_list],
                 mask_token_positions=[mask_positions],
                 decoded_masks=[decoded_masks],
@@ -226,10 +246,37 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
             )
             num_pred_val = output["num_pred"][0].item()
 
+    elif is_cat_clean and parsed["category"] in ("mcq", "left_right"):
+        full_generated_ids = torch.cat([input_ids, output_ids], dim=1)
+        gen_ids_list = full_generated_ids[0].tolist()
+        cat_token_pos = -1
+        
+        for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
+            if gen_ids_list[idx_pos] == CAT_TOKEN_ID:
+                cat_token_pos = idx_pos
+                break
+
+        if cat_token_pos >= 0:
+            output = pipeline(
+                pixel_values=pixel_values,
+                pixel_values_rgb=pixel_values_rgb,
+                image_grid_thw=image_grid_thw,
+                depth_maps=depth_map,
+                input_ids=full_generated_ids,
+                rle_list=[rle_list],
+                mask_token_positions=[mask_positions],
+                decoded_masks=[decoded_masks],
+                cat_token_positions=[cat_token_pos],
+            )
+            cat_logits_out = output.get("cat_logits")
+            if cat_logits_out and cat_logits_out[0] is not None:
+                cat_pred_idx = cat_logits_out[0].argmax().item()
+
     return {
         "category":   parsed["category"],
         "answer":     parsed["answer"],
         "num_pred":   num_pred_val,
+        "cat_pred":   cat_pred_idx,
         "raw":        raw_output,
         "think":      think_str,
     }
@@ -378,6 +425,8 @@ def main():
         gt = s["answer"]
         if gt.startswith("<|num|>="):
             gt_clean = gt[8:]
+        elif gt.startswith("<|cat|>="):
+            gt_clean = gt[8:]
         else:
             gt_clean = gt.strip('"')
 
@@ -409,6 +458,7 @@ def main():
         # Compare answers
         pred_answer = str(result.get("answer", "")).strip('"')
         num_pred = result.get("num_pred")
+        cat_pred = result.get("cat_pred")
 
         if cat in ("distance", "count"):
             if num_pred is not None:
@@ -430,14 +480,32 @@ def main():
                 match = False
                 match_detail = f"text_answer={pred_answer!r} (no num_pred)"
         elif cat == "mcq":
-            try:
-                pred_int = round(float(pred_answer))
-                gt_int = round(float(gt_clean))
-                match = pred_int == gt_int
-                match_detail = f"pred={pred_int} gt={gt_int}"
-            except (ValueError, TypeError):
+            if cat_pred is not None:
+                try:
+                    gt_int = round(float(gt_clean))
+                    match = cat_pred == gt_int
+                    match_detail = f"cat_pred={cat_pred} gt={gt_int}"
+                except (ValueError, TypeError):
+                    match = False
+                    match_detail = f"cat_pred={cat_pred} (GT not numeric)"
+            else:
+                try:
+                    pred_int = round(float(pred_answer))
+                    gt_int = round(float(gt_clean))
+                    match = pred_int == gt_int
+                    match_detail = f"pred={pred_int} gt={gt_int} (text fallback)"
+                except (ValueError, TypeError):
+                    match = pred_answer == gt_clean
+                    match_detail = f"pred={pred_answer!r} gt={gt_clean!r} (text fallback)"
+        elif cat == "left_right":
+            if cat_pred is not None:
+                # cat_pred=0 → left, cat_pred=1 → right (based on mask order)
+                pred_lr = "left" if cat_pred == 0 else "right"
+                match = pred_lr == gt_clean
+                match_detail = f"cat_pred={cat_pred}→{pred_lr} gt={gt_clean}"
+            else:
                 match = pred_answer == gt_clean
-                match_detail = f"pred={pred_answer!r} gt={gt_clean!r}"
+                match_detail = f"pred={pred_answer!r} gt={gt_clean!r} (text fallback)"
         else:
             match = pred_answer == gt_clean
             match_detail = ""
@@ -457,6 +525,8 @@ def main():
         print(f"  Parsed:       category={result['category']!r}  answer={result['answer']!r}")
         if num_pred is not None:
             print(f"  Number Head:  num_pred={num_pred:.4f}")
+        if cat_pred is not None:
+            print(f"  Category Head: cat_pred={cat_pred}")
         print(f"  Ground truth: category={cat!r}  answer={gt!r}")
         print(f"  Match: {match_flag}  {match_detail}")
 
