@@ -9,10 +9,10 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 |-----|----------|----------|---------| 
 | Vision ViT blocks | 12 | **4** | 56.7M |
 | Decoder layers | 24 | **24 (full, single pass)** | 0 |
-| Vocab / Embedding | 248,320 | **248,321 (full + `<num>`, TRAINABLE)** | 0 |
+| Vocab / Embedding | 248,320 | **248,320 (full + `<num>`, TRAINABLE)** | 0 |
 | Context length | 262,144 | **512** | VRAM only |
 | RTI | mask_rgb + mask_depth + space | **mask_rgb + mask_depth + mask_geo (3 learned tokens)** | — |
-| Number Head | — | **+0.26M** (NEW, softplus) | — |
+| Number Head | — | **+0.66M** (NEW, softplus) | — |
 | **Total** | **853M** | **~797M (~797M trainable)** | **~56M (7%)** |
 
 > **Key**: `hidden_dim = 1024` is **unchanged** — all tensor shapes between modules stay identical.
@@ -57,7 +57,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Vocab / Embedding | 248,320 | **248,320 (full + `<num>`)** |
 | Context Length | 262,144 | **512** |
 | **RTI** | — | **3 learned tokens per `<mask>`** |
-| **Number Head** | — | **Linear(1024→256→1)** |
+| **Number Head** | — | **Linear(1024→512→256→1)** |
 
 ### Parameter Breakdown
 
@@ -67,7 +67,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Token Embeddings (tied w/ LM Head) | 254M | ✅ **Trainable** | 248,321 × 1024 (full vocab) |
 | Text Decoder (24 layers) | ~498M | ✅ Yes | 6 × (3 DeltaNet + 1 GatedAttn) |
 | RTI (3 learned tokens) | ~0.07M | ✅ Yes | rgb_proj + depth_proj + geo_proj |
-| Number Head | 0.26M | ✅ Yes | xVal-style regression (softplus) |
+| Number Head | ~0.66M | ✅ Yes | xVal-style regression (softplus) |
 | **Grand Total** | **~797M** | **~797M trainable** | |
 
 ### VRAM Estimate (BF16 training)
@@ -190,7 +190,7 @@ flowchart TB
 
     subgraph HEADS["Dual Output Heads"]
         LM["LM Head (tied w/ embed)\n→ category + text answer"]
-        NUM["Number Head (xVal)\nLinear(1024→256→1)\n→ scalar prediction"]
+        NUM["Number Head (xVal)\nLinear(1024→512→256→1)\n→ scalar prediction"]
     end
 
     RGB --> PE
@@ -226,7 +226,7 @@ flowchart TB
 | Custom Module | File | Position | Function | Params |
 |--------------|------|----------|----------|--------|
 | **RTI** | `rti.py` | Before Decoder | RGB + Depth + RLE → `[mask_rgb, mask_depth, mask_geo]` 3→3 injection | **~0.07M** |
-| **Number Head** | `num_head.py` | After Decoder | xVal-style distance/count regression | **~0.26M** |
+| **Number Head** | `num_head.py` | After Decoder | xVal-style distance/count regression | **~0.66M** |
 
 ### RTI Detail — 3 Learned Tokens per `<mask>` Region
 
@@ -310,9 +310,9 @@ Implementation: `model_micro/rti.py` + `src/dataloader/dataloader.py`
 
 Implementation: `model_micro/num_head.py`
 
-`LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> softplus()`
+`LayerNorm(1024) -> Linear(1024, 512) -> GELU -> Linear(512, 256) -> GELU -> Linear(256, 1) -> softplus()`
 
-Params: ~262K. Takes hidden state at `<num>` position, outputs non-negative scalar.
+Params: ~658K. Takes hidden state at `<num>` position, outputs non-negative scalar.
 `softplus(x) = log(1 + exp(x))` — smooth everywhere, always positive (no gradient discontinuity).
 
 **How it handles distance and count:**
@@ -332,10 +332,10 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 
 | Task | Training target |
 |------|-----------------|
-| mcq | `<think>The transporter [Region 1] is not transporting... pallet [Region 5] is closest.</think>mcq \| "5"` |
-| distance | `<think>The pallet [Region 0] and pallet [Region 1] are 9.81 meters apart.</think>distance \| <num>` |
-| count | `<think>The buffer region [Region 0] is filled with pallets [Region 3] [Region 9]... has 2 pallets.</think>count \| <num>` |
-| left_right | `<think>The pallet [Region 0] is situated on the right of pallet [Region 1].</think>left_right \| "right"` |
+| mcq | `<think>\n The transporter [Region 1] is not transporting... pallet [Region 5] is closest.\n</think>\n\n mcq \| <|cat|>` |
+| distance | `<think>\n The pallet [Region 0] and pallet [Region 1] are 9.81 meters apart.\n</think>\n\n distance \| <|num|>` |
+| count | `<think>\n The buffer region [Region 0] is filled with pallets [Region 3] [Region 9]... has 2 pallets.\n</think>\n\n count \| <|num|>` |
+| left_right | `<think>\n The pallet [Region 0] is situated on the right of pallet [Region 1].\n</think>\n\n left_right \| <|cat|>` |
 
 ### Dual output heads
 
@@ -346,7 +346,22 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 
 ---
 
-## Loss Function — CE + SmoothL1
+## Loss Function — Targeted Weighting (CE + SmoothL1)
+
+Implementation: `model_micro/loss.py` + `dataloader.py`
+
+### Targeted Answer Token Weighting (x20)
+
+The model natively suffers from classification bias (e.g., guessing Left/Right indiscriminately) because the length of the Chain-of-Thought (CoT) dilutes the Cross Entropy loss of the actual answer. To combat this, a targeted **loss multiplier** is implemented:
+
+- **CoT Reasoning Block** (`<think>...`): Weight = **x1.0**
+- **Category Prefix** (`"mcq | "`): Weight = **x1.0**
+- **Target Answer** (`"5"`, `"right"`): Weight = **x20.0** (Controlled by `--answer-weight`)
+- **End/Tail Tokens** (`<\|im_end\|>`, `\n`): Weight = **x1.0**
+
+By specifically isolating the `normalized_answer` portion of the target string, this ensures the model allocates ~50% of its gradient attention solely to getting the final categorical choice right, avoiding dilution from the 50+ reasoning tokens.
+
+### Dual Loss Calculation
 
 Implementation: `model_micro/loss.py`
 

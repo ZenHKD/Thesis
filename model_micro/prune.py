@@ -2,8 +2,9 @@
 SpatialVLM Micro Pruning Pipeline (No External Pruning Libs)
 - Vision: Keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
 - Decoder: Keep all 24 layers (single pass)
-- Vocab: FULL original vocabulary (248,320) + <|num|> token appended
-- Add <|num|> token at end of vocab (ID = 248,320)
+- Vocab: FULL original vocabulary (248,320) + <|num|> + <|cat|> tokens appended
+- Add <|num|> token (ID = 248077) for NumberHead
+- Add <|cat|> token (ID = 248078) for CategoryHead
 """
 
 import json
@@ -19,6 +20,7 @@ OUTPUT_PATH = Path(__file__).parent / "qwen3.5-micro"
 KEEP_VISION_BLOCKS = [8, 9, 10, 11]
 KEEP_DECODER_LAYERS = list(range(24))
 NUM_TOKEN = "<|num|>"
+CAT_TOKEN = "<|cat|>"
 
 # Copy these auxiliary files from original model
 COPY_FILES = ["preprocessor_config.json", "video_preprocessor_config.json", "chat_template.jinja"]
@@ -26,13 +28,13 @@ COPY_FILES = ["preprocessor_config.json", "video_preprocessor_config.json", "cha
 
 # ============== TOKENIZER (no pruning) ==============
 
-def setup_tokenizer_with_num(tokenizer):
-    """Copy original tokenizer files and append <|num|> token.
+def setup_tokenizer_with_special_tokens(tokenizer):
+    """Copy original tokenizer files and append <|num|> + <|cat|> tokens.
     
     No vocabulary pruning — keeps all 248,320 original tokens.
-    Only adds <|num|> at the end (ID = 248,320).
+    Adds <|num|> (ID=248077) and <|cat|> (ID=248078) at the end.
     
-    Returns new_vocab_size.
+    Returns new_vocab_size, num_token_id, cat_token_id.
     """
     # Copy ALL tokenizer files from original (fully intact)
     tok_files = ["vocab.json", "merges.txt", "tokenizer.json", "tokenizer_config.json"]
@@ -43,10 +45,17 @@ def setup_tokenizer_with_num(tokenizer):
 
     # len(tokenizer) is 248077 (base vocab + special tokens)
     # The original embedding matrix is size 248320 (padded for tensor cores)
-    num_token_id = 248077  # <|num|> gets the next contiguous ID (DO NOT USE 248044, IT OVERWRITES <|endoftext|>)
+    num_token_id = 248077  # <|num|> for NumberHead (distance + count)
+    cat_token_id = 248078  # <|cat|> for CategoryHead (mcq + left_right)
     new_vocab_size = 248320  # the physical size of the embeddings
 
-    # Patch tokenizer_config.json: add <|num|> as added token
+    # Define special tokens to add
+    special_tokens = [
+        (num_token_id, NUM_TOKEN),
+        (cat_token_id, CAT_TOKEN),
+    ]
+
+    # Patch tokenizer_config.json: add special tokens
     tc_path = OUTPUT_PATH / "tokenizer_config.json"
     if tc_path.exists():
         with open(tc_path, "r", encoding="utf-8") as f:
@@ -57,19 +66,20 @@ def setup_tokenizer_with_num(tokenizer):
         if "added_tokens_encoder" not in tc:
             tc["added_tokens_encoder"] = {}
         
-        tc["added_tokens_decoder"][str(num_token_id)] = {
-            "content": NUM_TOKEN,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "single_word": False,
-            "special": True
-        }
-        tc["added_tokens_encoder"][NUM_TOKEN] = num_token_id
+        for token_id, token_str in special_tokens:
+            tc["added_tokens_decoder"][str(token_id)] = {
+                "content": token_str,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "single_word": False,
+                "special": True
+            }
+            tc["added_tokens_encoder"][token_str] = token_id
     
         with open(tc_path, "w", encoding="utf-8") as f:
             json.dump(tc, f, indent=2, ensure_ascii=False)
-        print(f"  Added <|num|> to tokenizer_config.json")
+        print(f"  Added <|num|> and <|cat|> to tokenizer_config.json")
 
     # Patch tokenizer.json: sync added_tokens from tokenizer_config.json perfectly
     tj_path = OUTPUT_PATH / "tokenizer.json"
@@ -98,9 +108,10 @@ def setup_tokenizer_with_num(tokenizer):
 
     print(f"  Physical Embeddings Size: {new_vocab_size}")
     print(f"  <|num|> token ID: {num_token_id}")
+    print(f"  <|cat|> token ID: {cat_token_id}")
     print(f"  Final vocab size: {new_vocab_size}")
 
-    return new_vocab_size, num_token_id
+    return new_vocab_size, num_token_id, cat_token_id
 
 
 # ============== ARCHITECTURE PRUNING ==============
@@ -153,16 +164,17 @@ def main():
     )
     print(f"  Loaded: {ORIGINAL_MODEL_PATH}")
 
-    # 2. Setup tokenizer with <|num|> token (no vocab pruning)
-    print("\n[2/6] Setting up tokenizer (full vocab + <|num|>)...")
-    new_vocab_size, num_token_id = setup_tokenizer_with_num(tokenizer)
+    # 2. Setup tokenizer with <|num|> + <|cat|> tokens (no vocab pruning)
+    print("\n[2/6] Setting up tokenizer (full vocab + <|num|> + <|cat|>)...")
+    new_vocab_size, num_token_id, cat_token_id = setup_tokenizer_with_special_tokens(tokenizer)
 
-    print(f"\n[3/6] Initializing <|num|> token embedding at index {num_token_id}...")
-    # No need to resize, 248320 is already large enough to hold 248077
+    print(f"\n[3/6] Initializing special token embeddings...")
+    # No need to resize, 248320 is already large enough to hold 248077-248078
     with torch.no_grad():
-        model.get_input_embeddings().weight[num_token_id].normal_(0.0, 0.02)
-        if model.get_output_embeddings() is not None:
-            model.get_output_embeddings().weight[num_token_id].normal_(0.0, 0.02)
+        for tid in [num_token_id, cat_token_id]:
+            model.get_input_embeddings().weight[tid].normal_(0.0, 0.02)
+            if model.get_output_embeddings() is not None:
+                model.get_output_embeddings().weight[tid].normal_(0.0, 0.02)
 
     # 4. Prune architecture (vision + decoder only)
     print("\n[4/6] Pruning model architecture...")
@@ -188,6 +200,7 @@ def main():
     # Update the MODEL's internal config
     model.config.vocab_size = new_vocab_size
     model.config.num_token_id = num_token_id
+    model.config.cat_token_id = cat_token_id
     model.config.max_position_embeddings = 512
     if hasattr(model.config, "text_config"):
         model.config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
@@ -205,6 +218,7 @@ def main():
     # Also update standalone config
     config.vocab_size = new_vocab_size
     config.num_token_id = num_token_id
+    config.cat_token_id = cat_token_id
     config.max_position_embeddings = 512
     if hasattr(config, "text_config"):
         config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
@@ -232,6 +246,7 @@ def main():
         "original_vocab_size": tokenizer.vocab_size,
         "final_vocab_size": new_vocab_size,
         "num_token_id": num_token_id,
+        "cat_token_id": cat_token_id,
         "vocab_pruned": False,
         "kept_vision_blocks": KEEP_VISION_BLOCKS,
         "kept_decoder_layers": KEEP_DECODER_LAYERS,

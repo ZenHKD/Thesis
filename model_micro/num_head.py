@@ -12,11 +12,12 @@ Used for:
 Both tasks use SmoothL1 loss during training, which provides
 bounded gradients while still optimizing for the RMSE eval metric.
 
-Params: ~262K
+Params: ~658K
     LayerNorm(1024):     2 × 1024 =    2,048
-    Linear(1024, 256):   1024 × 256 = 262,144 + 256 = 262,400
+    Linear(1024, 512):   1024 × 512 = 524,288 + 512 = 524,800
+    Linear(512, 256):    512 × 256 = 131,072 + 256 = 131,328
     Linear(256, 1):      256 × 1 =    256 + 1 =       257
-    Total:               ~264,705 ≈ 0.26M
+    Total:               ~658,433 ≈ 0.66M
 """
 
 import torch
@@ -31,18 +32,21 @@ class NumberHead(nn.Module):
     Instead, reads the hidden state at the <|num|> token and regresses a scalar.
 
     Architecture:
-        LayerNorm(1024) -> Linear(1024, 256) -> GELU -> Linear(256, 1) -> .abs()
+        LayerNorm(1024) -> Linear(1024, 512) -> GELU -> Linear(512, 256) -> GELU -> Linear(256, 1) -> softplus()
     """
 
-    def __init__(self, hidden_dim: int = 1024, intermediate_dim: int = 256,
+    def __init__(self, hidden_dim: int = 1024, int1_dim: int = 512, int2_dim: int = 256,
                  dropout: float = 0.1):
         super().__init__()
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, intermediate_dim),
+            nn.Linear(hidden_dim, int1_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(intermediate_dim, 1),
+            nn.Linear(int1_dim, int2_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int2_dim, 1),
         )
 
     def forward(self, h_num: torch.Tensor) -> torch.Tensor:

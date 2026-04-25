@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_micro.rti import RTE
 from model_micro.num_head import NumberHead
+from model_micro.cat_head import CategoryHead
 
 
 # ---------------------------------------------------------------------------
@@ -70,22 +71,22 @@ MODEL_NAME = os.path.join(
     "qwen3.5-micro"
 )
 
-# NUM_TOKEN_ID
-def _read_num_token_id():
+# Special token IDs
+def _read_special_token_ids():
     config_path = os.path.join(MODEL_NAME, "config.json")
     if os.path.exists(config_path):
         with open(config_path) as f:
             cfg = json.load(f)
-        return cfg.get("num_token_id", 248044)
-    return 248044
+        return cfg.get("num_token_id", 248077), cfg.get("cat_token_id", 248078)
+    return 248077, 248078
 
-NUM_TOKEN_ID = _read_num_token_id()
+NUM_TOKEN_ID, CAT_TOKEN_ID = _read_special_token_ids()
 
 # Regex for structured output parsing
 # Format: category | answer
 _OUTPUT_RE = re.compile(
     r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
-    r'(?P<answer>"left"|"right"|"\d+"|<\|num\|>|\d+\.\d+|\d+)',
+    r'(?P<answer><\|num\|>|<\|cat\|>)',
     re.IGNORECASE,
 )
 
@@ -133,11 +134,12 @@ def print_vram_usage(label: str = ""):
 
 
 class SpatialVLM(nn.Module):
-    """Full pipeline: Qwen 3.5 VLM (vision pruned) + RTI + Number Head.
+    """Full pipeline: Qwen 3.5 VLM (vision pruned) + RTI + NumberHead + CategoryHead.
 
     Custom modules:
         self.region_token_extractor    - RegionTokenExtractor (~0.07M)
-        self.num_head                  - NumberHead (xVal)    (~0.26M)
+        self.num_head                  - NumberHead (xVal)    (~0.66M)
+        self.cat_head                  - CategoryHead (MCQ/LR)(~0.66M)
 
     Qwen built-in (from Qwen 3.5 0.8B):
         self.qwen.model.visual         - Vision Encoder (4 blocks)
@@ -158,19 +160,24 @@ class SpatialVLM(nn.Module):
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
         num_token_id = getattr(config, 'num_token_id', None)
-        if num_token_id is None:
+        cat_token_id = getattr(config, 'cat_token_id', None)
+        if num_token_id is None or cat_token_id is None:
             config_path = os.path.join(model_name, "config.json")
             if os.path.exists(config_path):
                 with open(config_path) as f:
                     raw_config = json.load(f)
-                num_token_id = raw_config.get("num_token_id", 248044)
+                num_token_id = num_token_id or raw_config.get("num_token_id", 248077)
+                cat_token_id = cat_token_id or raw_config.get("cat_token_id", 248078)
             else:
-                num_token_id = 248044
+                num_token_id = num_token_id or 248077
+                cat_token_id = cat_token_id or 248078
         self.num_token_id = num_token_id
+        self.cat_token_id = cat_token_id
 
         # Update module-level for dataloader access
-        global NUM_TOKEN_ID
+        global NUM_TOKEN_ID, CAT_TOKEN_ID
         NUM_TOKEN_ID = self.num_token_id
+        CAT_TOKEN_ID = self.cat_token_id
 
         print(f"Loading {model_name}...")
         self.qwen = AutoModelForImageTextToText.from_pretrained(
@@ -190,6 +197,7 @@ class SpatialVLM(nn.Module):
         # Custom Modules
         self.region_token_extractor = RTE(hidden_dim=1024)
         self.num_head = NumberHead(hidden_dim=1024)
+        self.cat_head = CategoryHead(hidden_dim=1024)
 
         self.decoder_dropout = nn.Dropout(dropout)
 
@@ -200,12 +208,14 @@ class SpatialVLM(nn.Module):
             device=qwen_device, dtype=qwen_dtype
         )
         self.num_head = self.num_head.to(device=qwen_device, dtype=qwen_dtype)
-        print(f"  Custom modules (RTI + NumHead) -> {qwen_device} ({qwen_dtype})")
+        self.cat_head = self.cat_head.to(device=qwen_device, dtype=qwen_dtype)
+        print(f"  Custom modules (RTI + NumHead + CatHead) -> {qwen_device} ({qwen_dtype})")
 
         embed = self.qwen.model.language_model.embed_tokens
         embed.weight.requires_grad = True
         print(f"  Embeddings: TRAINABLE ({embed.weight.shape[0]} tokens, requires_grad=True)")
         print(f"  <|num|> token ID: {self.num_token_id}")
+        print(f"  <|cat|> token ID: {self.cat_token_id}")
 
         n_layers = len(list(self.qwen.model.language_model.layers))
         print(f"  Decoder: {n_layers} layers (single pass)")
@@ -442,6 +452,7 @@ class SpatialVLM(nn.Module):
         mask_token_positions: list = None,
         decoded_masks:        list = None,
         num_token_positions:  list = None,
+        cat_token_positions:  list = None,
         attention_mask:       torch.Tensor = None,
         use_gradient_checkpointing: bool = False,
         vision_requires_grad: bool = False,
@@ -499,9 +510,45 @@ class SpatialVLM(nn.Module):
                 for k, b in enumerate(num_indices):
                     num_pred[b] = preds[k]
 
+        # Category Head (MCQ / Left-Right)
+        cat_logits_list = []  # list of [N_masks] tensors
+        if cat_token_positions is not None and mask_token_positions is not None:
+            for b, cat_pos in enumerate(cat_token_positions):
+                if cat_pos is not None and cat_pos >= 0:
+                    adj_cat_pos = n_visual + cat_pos
+                    if 0 <= adj_cat_pos < h_normed.shape[1]:
+                        h_cat = h_normed[b, adj_cat_pos, :]
+                    else:
+                        cat_logits_list.append(None)
+                        continue
+
+                    # Get hidden states at ALL mask positions for this sample
+                    # Concat all 3 RTI tokens per mask: [region_rgb, region_depth, region_geo]
+                    mask_pos_b = mask_token_positions[b]
+                    mask_token_len = 3  # <mask> = 3 BPE tokens: <, mask, >
+                    mask_hiddens = []
+                    for mp in mask_pos_b:
+                        token_hiddens = []
+                        for offset in range(mask_token_len):
+                            adj_mp = n_visual + mp + offset
+                            if 0 <= adj_mp < h_normed.shape[1]:
+                                token_hiddens.append(h_normed[b, adj_mp, :])
+                        if token_hiddens:
+                            # Concat: [3, 1024] -> [3072]
+                            mask_hiddens.append(torch.cat(token_hiddens, dim=0))
+                    if mask_hiddens:
+                        h_masks = torch.stack(mask_hiddens, dim=0)  # [N_masks, 3072]
+                        scores = self.cat_head(h_masks, h_cat)  # [N_masks]
+                        cat_logits_list.append(scores)
+                    else:
+                        cat_logits_list.append(None)
+                else:
+                    cat_logits_list.append(None)
+
         return {
             "logits": logits,
             "num_pred": num_pred,
+            "cat_logits": cat_logits_list,
         }
 
     # ---- Generate (inference) ----
@@ -730,10 +777,12 @@ if __name__ == "__main__":
         "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
         "RTI (Region Token Injector)":     pipeline.region_token_extractor,
         "Number Head (xVal regression)":   pipeline.num_head,
+        "Category Head (MCQ/LR class.)":   pipeline.cat_head,
     }
     custom_names = {
         "RTI (Region Token Injector)",
         "Number Head (xVal regression)",
+        "Category Head (MCQ/LR class.)",
     }
     tied_names = {"Qwen LM Head (tied->Embed)"}
 
@@ -756,6 +805,7 @@ if __name__ == "__main__":
     print(f"  Total unique:     {total_qwen + total_custom:>12,} ({(total_qwen + total_custom)/1e6:.4f}M)")
     print(f"\n  Vocab: {pipeline.qwen.model.language_model.embed_tokens.weight.shape[0]} (TRAINABLE)")
     print(f"  <|num|> token ID: {pipeline.num_token_id}")
+    print(f"  <|cat|> token ID: {pipeline.cat_token_id}")
     print(f"  Trainable params: {sum(p.numel() for p in pipeline.parameters() if p.requires_grad)/1e6:.2f}M")
     n_layers = len(list(pipeline.qwen.model.language_model.layers))
     print(f"  Decoder: {n_layers} layers")
