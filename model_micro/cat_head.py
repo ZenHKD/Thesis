@@ -48,7 +48,7 @@ class CategoryHead(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 1024, mask_dim: int = 3072,
-                 proj_dim: int = 256, dropout: float = 0.1):
+                 proj_dim: int = 256, dropout: float = 0.0):
         super().__init__()
         self.proj_dim = proj_dim
         self.scale = math.sqrt(proj_dim)

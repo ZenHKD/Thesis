@@ -12,8 +12,9 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Vocab / Embedding | 248,320 | **248,320 (full + `<num>`, TRAINABLE)** | 0 |
 | Context length | 262,144 | **512** | VRAM only |
 | RTI | mask_rgb + mask_depth + space | **mask_rgb + mask_depth + mask_geo (3 learned tokens)** | — |
+| Category Head | — | **+1.05M** (NEW, Bilinear) | — |
 | Number Head | — | **+0.66M** (NEW, softplus) | — |
-| **Total** | **853M** | **~797M (~797M trainable)** | **~56M (7%)** |
+| **Total** | **853M** | **~798M (~798M trainable)** | **~55M (6%)** |
 
 > **Key**: `hidden_dim = 1024` is **unchanged** — all tensor shapes between modules stay identical.
 
@@ -57,6 +58,7 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Vocab / Embedding | 248,320 | **248,320 (full + `<num>`)** |
 | Context Length | 262,144 | **512** |
 | **RTI** | — | **3 learned tokens per `<mask>`** |
+| **Category Head**| — | **Bilinear(1024→256)** |
 | **Number Head** | — | **Linear(1024→512→256→1)** |
 
 ### Parameter Breakdown
@@ -67,8 +69,9 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 | Token Embeddings (tied w/ LM Head) | 254M | ✅ **Trainable** | 248,321 × 1024 (full vocab) |
 | Text Decoder (24 layers) | ~498M | ✅ Yes | 6 × (3 DeltaNet + 1 GatedAttn) |
 | RTI (3 learned tokens) | ~0.07M | ✅ Yes | rgb_proj + depth_proj + geo_proj |
+| Category Head | ~1.05M | ✅ Yes | Bilinear attention (256-dim), dropout=0.0 |
 | Number Head | ~0.66M | ✅ Yes | xVal-style regression (softplus) |
-| **Grand Total** | **~797M** | **~797M trainable** | |
+| **Grand Total** | **~798M** | **~798M trainable** | |
 
 ### VRAM Estimate (BF16 training)
 
@@ -226,6 +229,7 @@ flowchart TB
 | Custom Module | File | Position | Function | Params |
 |--------------|------|----------|----------|--------|
 | **RTI** | `rti.py` | Before Decoder | RGB + Depth + RLE → `[mask_rgb, mask_depth, mask_geo]` 3→3 injection | **~0.07M** |
+| **Category Head** | `cat_head.py` | After Decoder | Bilinear attention for MCQ / Left-Right | **~1.05M** |
 | **Number Head** | `num_head.py` | After Decoder | xVal-style distance/count regression | **~0.66M** |
 
 ### RTI Detail — 3 Learned Tokens per `<mask>` Region
@@ -337,11 +341,12 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 | count | `<think>\n The buffer region [Region 0] is filled with pallets [Region 3] [Region 9]... has 2 pallets.\n</think>\n\n count \| <|num|>` |
 | left_right | `<think>\n The pallet [Region 0] is situated on the right of pallet [Region 1].\n</think>\n\n left_right \| <|cat|>` |
 
-### Dual output heads
+### Triple output heads
 
 | Head | What it learns | Active for |
 |------|---------------|------------|
 | **LM Head** | `<think>` reasoning + category + format | All tasks |
+| **Category Head**| Target mask selection (Bilinear Scoring) | mcq, left_right |
 | **Number Head** | Scalar from hidden state @ `<num>` position | distance, count |
 
 ---
@@ -361,18 +366,22 @@ The model natively suffers from classification bias (e.g., guessing Left/Right i
 
 By specifically isolating the `normalized_answer` portion of the target string, this ensures the model allocates ~50% of its gradient attention solely to getting the final categorical choice right, avoiding dilution from the 50+ reasoning tokens.
 
-### Dual Loss Calculation
+### Triple Loss Calculation
 
 Implementation: `model_micro/loss.py`
 
-`L = CE(label_smoothing=0.0) + α · L_SmoothL1`
+`L = CE(label_smoothing=0.0) + α · L_SmoothL1 + γ · L_Focal`
 
 Where:
 - **CE**: Cross-entropy loss on LM head output (label smoothing disabled to prevent over regularization of 248K vocab)
 - **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
   - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
   - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
+- **L_Focal**: Focal Loss on Category Head output (MCQ + left_right)
+  - Focal hyperparameters: `focal_alpha=0.25`, `focal_gamma=2.0` (these are internal to the focal loss formula, distinct from the overall loss weight γ)
+  - Uses detached hidden states (`h_cat.detach()`, `h_masks.detach()`) to isolate the Category Head and prevent gradient conflict with the LM Head CE loss.
 - **α**: Weight for SmoothL1 (default 0.1)
+- **γ**: Weight for Category Focal Loss (default 0.1)
 - **No label trimming**: 3→3 RTI preserves sequence length — labels and logits always align
 
 ---
@@ -408,9 +417,10 @@ labels    = [-100]*len(q_ids) + a_ids  # -100 for question, active for answer
 | Token Embeddings (248K, tied w/ LM Head) | ✅ **Trainable** | 1e-5 |
 | Text Decoder (24 layers) | ✅ **Trainable** | 1e-5 |
 | RTI | ✅ **Trainable** | 5e-5 |
-| Number Head | ✅ **Trainable** | 5e-4 |
+| Category Head | ✅ **Trainable** | 5e-4 |
+| Number Head | ✅ **Trainable** | 5e-5 |
 
-**Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1` (α=0.1)
+**Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1 + γ·L_Focal` (α=0.1, γ=0.1)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
 

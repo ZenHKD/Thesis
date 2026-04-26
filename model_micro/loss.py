@@ -117,7 +117,11 @@ class SpatialLoss(nn.Module):
                     
                     # Validate target index is within range
                     if target_b.item() < logits_b.shape[1]:
-                        cat_losses.append(F.cross_entropy(logits_b, target_b))
+                        # Focal loss implementation (alpha=0.25, gamma=2.0)
+                        ce_loss = F.cross_entropy(logits_b, target_b, reduction='none')
+                        pt = torch.exp(-ce_loss)
+                        f_loss = 0.25 * ((1 - pt) ** 2.0) * ce_loss
+                        cat_losses.append(f_loss.mean())
             
             if cat_losses:
                 loss_cat = torch.stack(cat_losses).mean()
@@ -128,6 +132,6 @@ class SpatialLoss(nn.Module):
             return total, {
                 'ce': loss_ce.item(),
                 'sl1': loss_sl1.item(),
-                'cat_ce': loss_cat.item(),
+                'cat': loss_cat.item(),
             }
         return total

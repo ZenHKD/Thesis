@@ -517,7 +517,7 @@ class SpatialVLM(nn.Module):
                 if cat_pos is not None and cat_pos >= 0:
                     adj_cat_pos = n_visual + cat_pos
                     if 0 <= adj_cat_pos < h_normed.shape[1]:
-                        h_cat = h_normed[b, adj_cat_pos, :]
+                        h_cat = h_normed[b, adj_cat_pos, :].detach()
                     else:
                         cat_logits_list.append(None)
                         continue
@@ -532,7 +532,7 @@ class SpatialVLM(nn.Module):
                         for offset in range(mask_token_len):
                             adj_mp = n_visual + mp + offset
                             if 0 <= adj_mp < h_normed.shape[1]:
-                                token_hiddens.append(h_normed[b, adj_mp, :])
+                                token_hiddens.append(h_normed[b, adj_mp, :].detach())
                         if token_hiddens:
                             # Concat: [3, 1024] -> [3072]
                             mask_hiddens.append(torch.cat(token_hiddens, dim=0))

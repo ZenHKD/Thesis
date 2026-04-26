@@ -135,11 +135,11 @@ def main():
     parser.add_argument("--lr-backbone", type=float, default=1e-5)
     parser.add_argument("--lr-rti",      type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-5)
-    parser.add_argument("--lr-c",        type=float, default=5e-5,
+    parser.add_argument("--lr-c",        type=float, default=5e-4,
                         help="Learning rate for Category Head")
     parser.add_argument("--alpha",       type=float, default=0.1,
                         help="Weight for SmoothL1 loss (α in L)")
-    parser.add_argument("--gamma",       type=float, default=1.0,
+    parser.add_argument("--gamma",       type=float, default=0.1,
                         help="Weight for CategoryCE loss (γ in L)")
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")

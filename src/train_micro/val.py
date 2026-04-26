@@ -61,6 +61,8 @@ def validate(pipeline, criterion, processor, resolution="320p",
     total_sl1_sum = 0.0
     total_cat_sum = 0.0
     n_batches = 0
+    n_num_batches = 0   # batches with numeric samples
+    n_cat_batches = 0   # batches with categorical samples
 
     pbar = tqdm(loader, desc="Validation", leave=False)
     for batch in pbar:
@@ -96,31 +98,49 @@ def validate(pipeline, criterion, processor, resolution="320p",
         num_pred = output["num_pred"]
         cat_logits = output.get("cat_logits", None)
 
+        is_numeric = batch["is_numeric"].to(dev)
+        is_categorical = batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev)
+
         loss, components = criterion(
             logits, labels,
             num_pred, batch["target_num"].to(dev),
-            batch["is_numeric"].to(dev),
+            is_numeric,
             cat_logits=cat_logits,
             cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
-            is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev),
+            is_categorical=is_categorical,
             return_components=True,
         )
         total_loss_sum += loss.item()
         total_ce_sum += components['ce']
-        total_sl1_sum += components['sl1']
-        total_cat_sum += components.get('cat_ce', 0.0)
+
+        # Only count sl1/cat towards their respective averages
+        # when the batch actually contains relevant samples
+        loss_cat = components.get('cat', 0.0)
+        sl1 = components['sl1']
+
+        if is_numeric.any():
+            total_sl1_sum += sl1
+            n_num_batches += 1
+
+        if is_categorical.any() and loss_cat > 0:
+            total_cat_sum += loss_cat
+            n_cat_batches += 1
+
         n_batches += 1
+
+        avg_cat_disp = total_cat_sum / max(n_cat_batches, 1)
+        avg_sl1_disp = total_sl1_sum / max(n_num_batches, 1)
         pbar.set_postfix({
             "val_loss": f"{total_loss_sum / max(n_batches, 1):.4f}",
             "ce": f"{total_ce_sum / max(n_batches, 1):.4f}",
-            "sl1": f"{total_sl1_sum / max(n_batches, 1):.4f}",
-            "cat": f"{total_cat_sum / max(n_batches, 1):.4f}",
+            "sl1": f"{avg_sl1_disp:.4f}",
+            "cat": f"{avg_cat_disp:.4f}",
         })
 
     avg_loss = total_loss_sum / max(n_batches, 1)
     avg_ce = total_ce_sum / max(n_batches, 1)
-    avg_sl1 = total_sl1_sum / max(n_batches, 1)
-    avg_cat = total_cat_sum / max(n_batches, 1)
+    avg_sl1 = total_sl1_sum / max(n_num_batches, 1)
+    avg_cat = total_cat_sum / max(n_cat_batches, 1)
     return {
         "val_loss": avg_loss,
         "val_ce": avg_ce,
@@ -128,6 +148,8 @@ def validate(pipeline, criterion, processor, resolution="320p",
         "val_cat": avg_cat,
         "n_samples": len(dataset),
         "n_batches": n_batches,
+        "n_num_batches": n_num_batches,
+        "n_cat_batches": n_cat_batches,
     }
 
 # =========================================================================
