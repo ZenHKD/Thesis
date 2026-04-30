@@ -307,8 +307,11 @@ class SpatialVLM(nn.Module):
         RTI uses 3 -> 3 replacement: sequence length is UNCHANGED.
 
         Returns:
-            inputs_embeds: [B, T, 1024]
-            n_visual:      int (0, since visual tokens are inline padded)
+            inputs_embeds:  [B, T, 1024]
+            n_visual:       int (0, since visual tokens are inline padded)
+            region_tokens:  list[list[tuple]] — RTI projected tokens per sample/mask
+                            region_tokens[b][m] = (rgb [1,1024], dep [1,1024], geo [1,1024])
+                            None if no RTI was computed.
         """
         # Step 1: Vision Encoder + Merger -> [B, N, 1024]
         visual_tokens = self._get_visual_tokens(
@@ -322,6 +325,7 @@ class SpatialVLM(nn.Module):
         text_embeds = embed(input_ids)
 
         # Step 3: RTI (Independent of Vision Encoder)
+        region_tokens = None
         if (rle_list is not None and mask_token_positions is not None
                 and any(len(rl) > 0 for rl in rle_list)):
             region_tokens = self.region_token_extractor(
@@ -350,7 +354,7 @@ class SpatialVLM(nn.Module):
         inputs_embeds = text_embeds
         n_visual_offset = 0
 
-        return inputs_embeds, n_visual_offset
+        return inputs_embeds, n_visual_offset, region_tokens
 
     # ---- Backbone forward ----
 
@@ -464,7 +468,7 @@ class SpatialVLM(nn.Module):
                 'logits':   [B, L, V] — text logits
                 'num_pred': [B]       — Number Head predictions
         """
-        inputs_embeds, n_visual = self._build_inputs_embeds(
+        inputs_embeds, n_visual, region_tokens = self._build_inputs_embeds(
             pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
             vision_requires_grad=vision_requires_grad,
@@ -511,31 +515,31 @@ class SpatialVLM(nn.Module):
                     num_pred[b] = preds[k]
 
         # Category Head (MCQ / Left-Right)
+        # Uses DIRECT RTI features as mask keys (clean, discriminative)
+        # instead of decoder layer-24 hidden states (diluted by LM objective)
         cat_logits_list = []  # list of [N_masks] tensors
-        if cat_token_positions is not None and mask_token_positions is not None:
+        if cat_token_positions is not None and region_tokens is not None:
             for b, cat_pos in enumerate(cat_token_positions):
                 if cat_pos is not None and cat_pos >= 0:
                     adj_cat_pos = n_visual + cat_pos
                     if 0 <= adj_cat_pos < h_normed.shape[1]:
-                        h_cat = h_normed[b, adj_cat_pos, :].detach()
+                        h_cat = h_normed[b, adj_cat_pos, :]  # query from decoder (has reasoning context)
                     else:
                         cat_logits_list.append(None)
                         continue
 
-                    # Get hidden states at ALL mask positions for this sample
-                    # Concat all 3 RTI tokens per mask: [region_rgb, region_depth, region_geo]
-                    mask_pos_b = mask_token_positions[b]
-                    mask_token_len = 3  # <mask> = 3 BPE tokens: <, mask, >
+                    # Build mask representations from DIRECT RTI features
+                    # region_tokens[b][m] = (rgb [1,1024], dep [1,1024], geo [1,1024])
                     mask_hiddens = []
-                    for mp in mask_pos_b:
-                        token_hiddens = []
-                        for offset in range(mask_token_len):
-                            adj_mp = n_visual + mp + offset
-                            if 0 <= adj_mp < h_normed.shape[1]:
-                                token_hiddens.append(h_normed[b, adj_mp, :].detach())
-                        if token_hiddens:
-                            # Concat: [3, 1024] -> [3072]
-                            mask_hiddens.append(torch.cat(token_hiddens, dim=0))
+                    if b < len(region_tokens):
+                        for m, (rgb, dep, geo) in enumerate(region_tokens[b]):
+                            rti_concat = torch.cat([
+                                rgb.squeeze(0),   # [1024]
+                                dep.squeeze(0),   # [1024]
+                                geo.squeeze(0),   # [1024]
+                            ], dim=0)             # [3072]
+                            mask_hiddens.append(rti_concat)
+
                     if mask_hiddens:
                         h_masks = torch.stack(mask_hiddens, dim=0)  # [N_masks, 3072]
                         scores = self.cat_head(h_masks, h_cat)  # [N_masks]
@@ -575,7 +579,7 @@ class SpatialVLM(nn.Module):
         """Autoregressive generation with top-p/top-k sampling and repetition penalty."""
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
-        inputs_embeds, n_visual = self._build_inputs_embeds(
+        inputs_embeds, n_visual, _region_tokens = self._build_inputs_embeds(
             pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
         )

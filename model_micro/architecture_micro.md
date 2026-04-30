@@ -349,6 +349,11 @@ This is chain-of-thought distillation: the model learns spatial reasoning from G
 | **Category Head**| Target mask selection (Bilinear Scoring) | mcq, left_right |
 | **Number Head** | Scalar from hidden state @ `<num>` position | distance, count |
 
+**Category Head data flow:**
+- **Query (`h_cat`)**: Hidden state at `<|cat|>` position from **decoder layer 24** — carries full reasoning context
+- **Keys (`h_masks`)**: **Direct RTI projected tokens** `[rgb_token | dep_token | geo_token]` = `[3072]` per mask — clean, discriminative spatial features, NOT contaminated by 24 layers of language modeling attention
+- Gradients flow back to RTI projectors (rgb_proj, depth_proj, geo_proj) for better region representations
+
 ---
 
 ## Loss Function — Targeted Weighting (CE + SmoothL1)
@@ -379,9 +384,8 @@ Where:
   - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
 - **L_Focal**: Focal Loss on Category Head output (MCQ + left_right)
   - Focal hyperparameters: `focal_alpha=0.25`, `focal_gamma=2.0` (these are internal to the focal loss formula, distinct from the overall loss weight γ)
-  - Uses detached hidden states (`h_cat.detach()`, `h_masks.detach()`) to isolate the Category Head and prevent gradient conflict with the LM Head CE loss.
 - **α**: Weight for SmoothL1 (default 0.1)
-- **γ**: Weight for Category Focal Loss (default 0.1)
+- **γ**: Weight for Category Focal Loss (default 1.0)
 - **No label trimming**: 3→3 RTI preserves sequence length — labels and logits always align
 
 ---
@@ -420,7 +424,7 @@ labels    = [-100]*len(q_ids) + a_ids  # -100 for question, active for answer
 | Category Head | ✅ **Trainable** | 5e-4 |
 | Number Head | ✅ **Trainable** | 5e-5 |
 
-**Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1 + γ·L_Focal` (α=0.1, γ=0.1)
+**Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1 + γ·L_Focal` (α=0.1, γ=2.0)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
 
