@@ -60,6 +60,10 @@ def validate(pipeline, criterion, processor, resolution="320p",
     total_ce_sum = 0.0
     total_sl1_sum = 0.0
     total_cat_sum = 0.0
+    total_cat_correct = 0
+    total_cat_samples = 0
+    total_num_correct = 0
+    total_num_samples = 0
     n_batches = 0
     n_num_batches = 0   # batches with numeric samples
     n_cat_batches = 0   # batches with categorical samples
@@ -100,13 +104,14 @@ def validate(pipeline, criterion, processor, resolution="320p",
 
         is_numeric = batch["is_numeric"].to(dev)
         is_categorical = batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev)
+        target_cat = batch.get("target_cat_index", torch.zeros(1)).to(dev)
 
         loss, components = criterion(
             logits, labels,
             num_pred, batch["target_num"].to(dev),
             is_numeric,
             cat_logits=cat_logits,
-            cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
+            cat_targets=target_cat,
             is_categorical=is_categorical,
             return_components=True,
         )
@@ -121,31 +126,60 @@ def validate(pipeline, criterion, processor, resolution="320p",
         if is_numeric.any():
             total_sl1_sum += sl1
             n_num_batches += 1
+            # Calculate numeric accuracy (within 10% relative error)
+            for b in range(num_pred.shape[0]):
+                if is_numeric[b]:
+                    pred_val = num_pred[b].item()
+                    gt_val = batch["target_num"][b].item()
+                    if abs(gt_val) > 1e-6:
+                        rel_err = abs(pred_val - gt_val) / abs(gt_val)
+                        if rel_err <= 0.10:
+                            total_num_correct += 1
+                    else:
+                        # For targets near zero, use absolute error < 0.5
+                        if abs(pred_val - gt_val) < 0.5:
+                            total_num_correct += 1
+                    total_num_samples += 1
 
         if is_categorical.any() and loss_cat > 0:
             total_cat_sum += loss_cat
             n_cat_batches += 1
+            # Calculate accuracy for this batch
+            for b in range(len(cat_logits)):
+                if is_categorical[b] and cat_logits[b] is not None:
+                    pred_idx = torch.argmax(cat_logits[b]).item()
+                    if pred_idx == target_cat[b].item():
+                        total_cat_correct += 1
+                    total_cat_samples += 1
 
         n_batches += 1
 
         avg_cat_disp = total_cat_sum / max(n_cat_batches, 1)
         avg_sl1_disp = total_sl1_sum / max(n_num_batches, 1)
+        avg_cat_acc_disp = (total_cat_correct / max(total_cat_samples, 1)) * 100
+        avg_num_acc_disp = (total_num_correct / max(total_num_samples, 1)) * 100
         pbar.set_postfix({
             "val_loss": f"{total_loss_sum / max(n_batches, 1):.4f}",
             "ce": f"{total_ce_sum / max(n_batches, 1):.4f}",
             "sl1": f"{avg_sl1_disp:.4f}",
             "cat": f"{avg_cat_disp:.4f}",
+            "cat_acc": f"{avg_cat_acc_disp:.1f}%",
+            "num_acc": f"{avg_num_acc_disp:.1f}%",
         })
 
     avg_loss = total_loss_sum / max(n_batches, 1)
     avg_ce = total_ce_sum / max(n_batches, 1)
     avg_sl1 = total_sl1_sum / max(n_num_batches, 1)
     avg_cat = total_cat_sum / max(n_cat_batches, 1)
+    avg_cat_acc = (total_cat_correct / max(total_cat_samples, 1)) * 100
+    avg_num_acc = (total_num_correct / max(total_num_samples, 1)) * 100
     return {
         "val_loss": avg_loss,
         "val_ce": avg_ce,
         "val_sl1": avg_sl1,
         "val_cat": avg_cat,
+        "val_cat_acc": avg_cat_acc,
+        "val_num_acc": avg_num_acc,
         "n_samples": len(dataset),
         "n_batches": n_batches,
         "n_num_batches": n_num_batches,

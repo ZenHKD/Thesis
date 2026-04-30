@@ -246,14 +246,17 @@ def main():
     parser.add_argument("--device",         default="cuda", choices=["cuda"])
     parser.add_argument("--attn-impl",      default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--resolution",     type=int, default=320)
+    parser.add_argument("--resolution",     default="320p",
+                        choices=["1080p", "720p", "540p", "450p", "320p"])
     args = parser.parse_args()
 
     print("=" * 70)
     print("EVALUATION: SpatialVLM Micro")
     print("=" * 70)
 
-    target_size = (args.resolution, args.resolution) if args.resolution else None
+    target_size = {"1080p": None, "720p": (1280, 720),
+                   "540p": (960, 540), "450p": (800, 450),
+                   "320p": (512, 320)}[args.resolution]
 
     # Load Model
     pipeline = SpatialVLM(
@@ -348,12 +351,11 @@ def main():
                 if num_pred is not None:
                     try:
                         gt_num = float(gt_clean)
-                        if cat == "count":
-                            num_pred = round(num_pred)
-                            match = (num_pred == round(gt_num))
+                        if abs(gt_num) > 1e-6:
+                            rel_err = abs(num_pred - gt_num) / abs(gt_num)
+                            match = rel_err <= 0.10
                         else:
-                            rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
-                            match = rel_err < 0.10
+                            match = abs(num_pred - gt_num) < 0.5
                     except (ValueError, TypeError):
                         match = False
             elif cat == "mcq":

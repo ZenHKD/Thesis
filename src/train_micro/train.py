@@ -135,12 +135,12 @@ def main():
     parser.add_argument("--lr-backbone", type=float, default=1e-5)
     parser.add_argument("--lr-rti",      type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-5)
-    parser.add_argument("--lr-c",        type=float, default=5e-4,
+    parser.add_argument("--lr-c",        type=float, default=1e-4,
                         help="Learning rate for Category Head")
     parser.add_argument("--alpha",       type=float, default=0.1,
                         help="Weight for SmoothL1 loss (α in L)")
-    parser.add_argument("--gamma",       type=float, default=0.1,
-                        help="Weight for CategoryCE loss (γ in L)")
+    parser.add_argument("--gamma",       type=float, default=1.0,
+                        help="Weight for Category Focal Loss (γ in L)")
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -331,7 +331,8 @@ def main():
     # 6. CSV LOG (with val_loss column)
     # ====================================================================
     csv_fields = [
-        "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1", "val_cat",
+        "step", "epoch", "avg_loss", "val_loss", "val_ce", "val_sl1",
+        "val_cat", "val_cat_acc", "val_num_acc",
         "lr_vision", "lr_decoder", "lr_rti", "lr_numhead", "lr_c",
         "grad_norm", "samples_per_sec",
     ]
@@ -508,7 +509,7 @@ def main():
                         writer = csv.writer(f)
                         writer.writerow([
                             global_step, f"{current_epoch:.4f}",
-                            f"{window_avg:.6f}", "", "", "", "",  # val_loss, val_ce, val_sl1, val_cat empty
+                            f"{window_avg:.6f}", "", "", "", "", "", "",  # val_loss..val_num_acc empty
                             f"{lr_v:.8f}", f"{lr_d:.8f}",
                             f"{lr_rti:.8f}", f"{lr_n:.8f}", f"{lr_c:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
@@ -553,6 +554,8 @@ def main():
                     lr_c = lrs.get("Category Head", 0.0)
 
                     val_cat = val_results.get("val_cat", 0.0)
+                    val_cat_acc = val_results.get("val_cat_acc", 0.0)
+                    val_num_acc = val_results.get("val_num_acc", 0.0)
 
                     # Log to CSV with val_loss filled
                     with open(csv_path, "a", newline="") as f:
@@ -561,13 +564,14 @@ def main():
                             global_step, f"{current_epoch:.4f}",
                             f"{window_avg:.6f}",
                             f"{val_loss:.6f}", f"{val_ce:.6f}", f"{val_sl1:.6f}",
-                            f"{val_cat:.6f}",
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}",
+                            f"{val_cat:.6f}", f"{val_cat_acc:.2f}", f"{val_num_acc:.2f}",
+                            f"{lr_v:.8f}", f"{lr_d:.8f}",
                             f"{lr_rti:.8f}", f"{lr_n:.8f}", f"{lr_c:.8f}",
-                            " ", " ",
+                            "", "",
                         ])
                     print(f"\nValidation complete: val_loss={val_loss:.4f} "
-                          f"(CE={val_ce:.4f}, SL1={val_sl1:.4f}, Cat={val_cat:.4f})")
+                          f"(CE={val_ce:.4f}, SL1={val_sl1:.4f}, Cat={val_cat:.4f}, "
+                          f"CatAcc={val_cat_acc:.1f}%, NumAcc={val_num_acc:.1f}%)")
 
         # ==============================================================
         # END OF EPOCH 
