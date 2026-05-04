@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--attn-impl",   default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
-    parser.add_argument("--split",       default="train", choices=["train", "train_sample"])
+    parser.add_argument("--split",       default="train", choices=["train", "train_balanced", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=2)
     parser.add_argument("--stage",       type=int,   default=2, choices=[1, 2],
                         help="Training stage: 1=freeze decoder (train vision+RTI+Embed+LM_Head+CustomHeads), "

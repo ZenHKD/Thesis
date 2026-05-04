@@ -289,10 +289,10 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
 def main():
     parser = argparse.ArgumentParser(description="Test SpatialVLM Micro inference")
     parser.add_argument("--checkpoint",     type=str, default=None,
-                        help="Path to full checkpoint dir (e.g. checkpoints/micro/epoch_1)")
+                        help="Path to full checkpoint dir (e.g. checkpoints/micro/stage2/epoch_2)")
     parser.add_argument("--step",           type=int, default=None,
                         help="Legacy: Checkpoint step to load (e.g. 20000). None = untrained.")
-    parser.add_argument("--split",          default="train_sample",
+    parser.add_argument("--split",          default="val",
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--device",         default="cuda", choices=["cuda"],
                         help="Device to run on (only cuda is supported)")
@@ -464,15 +464,16 @@ def main():
             if num_pred is not None:
                 try:
                     gt_num = float(gt_clean)
+                    # Round for count (always integer)
                     if cat == "count":
                         num_pred = round(num_pred)
-                        rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
-                        match = (num_pred == round(gt_num))
-                        match_detail = f"num_pred={num_pred} gt={round(gt_num)} (Exact Match)"
-                    else:
-                        rel_err = abs(num_pred - gt_num) / (abs(gt_num) + 1e-6)
-                        match = rel_err < 0.10
+                    if abs(gt_num) > 1e-6:
+                        rel_err = abs(num_pred - gt_num) / abs(gt_num)
+                        match = rel_err <= 0.10
                         match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} rel_err={rel_err*100:.1f}%"
+                    else:
+                        match = abs(num_pred - gt_num) < 0.5
+                        match_detail = f"num_pred={num_pred:.2f} gt={gt_num:.2f} abs_err={abs(num_pred-gt_num):.4f} (near-zero)"
                 except (ValueError, TypeError):
                     match = False
                     match_detail = f"num_pred={num_pred:.2f} (GT not numeric)"

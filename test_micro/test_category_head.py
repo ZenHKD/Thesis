@@ -244,7 +244,7 @@ def check_hidden_states(pipeline, batch):
         orig_text_embeds = embed_layer(input_ids).clone()  # [B, L, D]
 
         # Step 1: Build inputs_embeds (WITH RTI injection)
-        inputs_embeds, n_visual = pipeline._build_inputs_embeds(
+        inputs_embeds, n_visual, region_tokens = pipeline._build_inputs_embeds(
             pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
             rle_list=batch["rle_list"],
             mask_token_positions=batch["mask_positions"],
@@ -286,8 +286,8 @@ def check_hidden_states(pipeline, batch):
 
     all_ok = True
 
-    # Check 2a: h_cat extraction
-    print(f"\n  --- h_cat (query context) ---")
+    # Check 2a: h_cat extraction (still from decoder output — needs reasoning context)
+    print(f"\n  --- h_cat (query context, from decoder layer 24) ---")
     if cat_pos is not None and cat_pos >= 0:
         adj_cat = n_visual + cat_pos
         if 0 <= adj_cat < T:
@@ -307,33 +307,30 @@ def check_hidden_states(pipeline, batch):
     else:
         print(f"  [SKIP] No <|cat|> token (not categorical)")
 
-    # Check 2b: h_masks extraction (concat 3 RTI tokens per mask)
-    print(f"\n  --- h_masks (candidate keys, 3-token concat) ---")
-    mask_token_len = len(pipeline.processor.tokenizer.encode("<mask>", add_special_tokens=False))
+    # Check 2b: h_masks from DIRECT RTI features (NOT decoder hidden states)
+    print(f"\n  --- h_masks (from DIRECT RTI features, NOT decoder output) ---")
     mask_hiddens = []
-    for i, mp in enumerate(mask_positions):
-        token_hiddens = []
-        for offset in range(mask_token_len):
-            adj_mp = n_visual + mp + offset
-            if 0 <= adj_mp < T:
-                token_hiddens.append(h_normed[0, adj_mp, :])
-        if token_hiddens:
-            h_mask = torch.cat(token_hiddens, dim=0)  # [3072]
-            norm_m = h_mask.float().norm().item()
-            print(f"  Mask {i}: concat {len(token_hiddens)} tokens (pos {mp}..{mp+mask_token_len-1}), "
-                  f"dim={h_mask.shape[0]}, norm={norm_m:.4f}")
-            mask_hiddens.append(h_mask)
+    if region_tokens is not None and len(region_tokens) > 0 and len(region_tokens[0]) > 0:
+        for i, (rgb, dep, geo) in enumerate(region_tokens[0]):
+            rti_concat = torch.cat([
+                rgb.squeeze(0),   # [1024]
+                dep.squeeze(0),   # [1024]
+                geo.squeeze(0),   # [1024]
+            ], dim=0)             # [3072]
+            norm_m = rti_concat.float().norm().item()
+            print(f"  Mask {i}: RTI direct [rgb|dep|geo], dim={rti_concat.shape[0]}, norm={norm_m:.4f}")
+            mask_hiddens.append(rti_concat)
 
             if norm_m < 1e-6:
                 print(f"  [FAIL] h_mask[{i}] is all zeros!")
                 all_ok = False
-        else:
-            print(f"  [FAIL] Mask {i}: no valid positions in range [0, {T})")
-            all_ok = False
+    else:
+        print(f"  [FAIL] No region_tokens available!")
+        all_ok = False
 
     # Check 2c: Are h_masks distinguishable from each other?
     if len(mask_hiddens) >= 2:
-        print(f"\n  --- Mask Pairwise Cosine Similarity ---")
+        print(f"\n  --- Mask Pairwise Cosine Similarity (RTI direct) ---")
         for i in range(len(mask_hiddens)):
             for j in range(i + 1, len(mask_hiddens)):
                 cos_sim = F.cosine_similarity(
@@ -343,19 +340,17 @@ def check_hidden_states(pipeline, batch):
                 status = "[WARN: very similar]" if cos_sim > 0.99 else "[OK: distinguishable]"
                 print(f"  cos(mask_{i}, mask_{j}) = {cos_sim:.6f}  {status}")
 
-    # Check 2d: h_cat (1024) vs h_masks (3072) — skipped, different dimensions after concat
-
-    return all_ok, h_normed, n_visual
+    return all_ok, region_tokens, h_normed, n_visual
 
 
 # =========================================================================
 # Section 3: CategoryHead Forward
 # =========================================================================
 
-def check_cat_head_forward(pipeline, h_normed, n_visual, batch):
-    """Run CategoryHead and verify output."""
+def check_cat_head_forward(pipeline, region_tokens, h_normed, n_visual, batch):
+    """Run CategoryHead using direct RTI features (matching pipeline.forward())."""
     print(f"\n{'='*70}")
-    print("SECTION 3: CATEGORY HEAD FORWARD")
+    print("SECTION 3: CATEGORY HEAD FORWARD (Direct RTI Features)")
     print("=" * 70)
 
     cat_pos = batch.get("cat_token_positions", [None])[0]
@@ -370,30 +365,30 @@ def check_cat_head_forward(pipeline, h_normed, n_visual, batch):
     all_ok = True
     T = h_normed.shape[1]
 
-    # Extract h_cat and h_masks (3-token concat per mask)
+    # Extract h_cat from decoder output (needs reasoning context)
     adj_cat = n_visual + cat_pos
     h_cat = h_normed[0, adj_cat, :]
 
-    mask_token_len = 3
+    # Build h_masks from DIRECT RTI features (NOT decoder hidden states)
     mask_hiddens = []
-    for mp in mask_positions:
-        token_hiddens = []
-        for offset in range(mask_token_len):
-            adj_mp = n_visual + mp + offset
-            if 0 <= adj_mp < T:
-                token_hiddens.append(h_normed[0, adj_mp, :])
-        if token_hiddens:
-            mask_hiddens.append(torch.cat(token_hiddens, dim=0))
+    if region_tokens is not None and len(region_tokens) > 0:
+        for m, (rgb, dep, geo) in enumerate(region_tokens[0]):
+            rti_concat = torch.cat([
+                rgb.squeeze(0),
+                dep.squeeze(0),
+                geo.squeeze(0),
+            ], dim=0)
+            mask_hiddens.append(rti_concat)
 
     if not mask_hiddens:
-        print("  [FAIL] No valid mask hiddens!")
+        print("  [FAIL] No valid mask hiddens from RTI!")
         return False
 
-    h_masks = torch.stack(mask_hiddens, dim=0)  # [N_masks, 1024]
+    h_masks = torch.stack(mask_hiddens, dim=0)  # [N_masks, 3072]
     N_masks = h_masks.shape[0]
 
-    print(f"  h_masks shape: [{N_masks}, {h_masks.shape[1]}]")
-    print(f"  h_cat shape:   [{h_cat.shape[0]}]")
+    print(f"  h_masks shape: [{N_masks}, {h_masks.shape[1]}] (from RTI direct)")
+    print(f"  h_cat shape:   [{h_cat.shape[0]}] (from decoder layer 24)")
     print(f"  Category:      {category}")
     print(f"  target_index:  {target_cat}")
 
@@ -438,8 +433,8 @@ def check_cat_head_forward(pipeline, h_normed, n_visual, batch):
         
         print(f"\n  --- Gradient Check ---")
         print(f"  CE Loss:            {loss.item():.6f}")
-        print(f"  Grad flows to h_masks: {'[OK]' if has_grad_masks else '[FAIL]'}")
-        print(f"  Grad flows to h_cat:   {'[OK]' if has_grad_cat else '[FAIL]'}")
+        print(f"  Grad flows to h_masks (RTI): {'[OK]' if has_grad_masks else '[FAIL]'}")
+        print(f"  Grad flows to h_cat (decoder):   {'[OK]' if has_grad_cat else '[FAIL]'}")
         
         if has_grad_masks:
             grad_norms = h_masks_grad.grad.float().norm(dim=1)
@@ -530,13 +525,13 @@ def check_full_forward(pipeline, batch, criterion):
             print(f"  total_loss:  {loss.item():.6f}")
             print(f"  CE:          {components['ce']:.6f}")
             print(f"  SL1:         {components['sl1']:.6f}")
-            print(f"  Cat CE:      {components['cat_ce']:.6f}")
+            print(f"  Cat Loss:    {components.get('cat', 0.0):.6f}")
             
-            if components['cat_ce'] == 0.0 and is_cat:
-                print(f"  [FAIL] Cat CE is 0 for a categorical sample!")
+            if components.get('cat', 0.0) == 0.0 and is_cat:
+                print(f"  [FAIL] Cat Loss is 0 for a categorical sample!")
                 all_ok = False
             else:
-                print(f"  [OK] Cat CE is non-zero")
+                print(f"  [OK] Cat Loss is non-zero")
     else:
         if cat_logits is None or len(cat_logits) == 0 or cat_logits[0] is None:
             print(f"  [OK] Not categorical, cat_logits correctly empty/None")
@@ -637,11 +632,11 @@ def main():
             overall_ok = overall_ok and ok1
             continue
 
-        # Section 2: Hidden states
-        ok2, h_normed, n_visual = check_hidden_states(pipeline, batch)
+        # Section 2: Hidden states + RTI features
+        ok2, region_tokens, h_normed, n_visual = check_hidden_states(pipeline, batch)
 
-        # Section 3: CategoryHead forward
-        ok3 = check_cat_head_forward(pipeline, h_normed, n_visual, batch)
+        # Section 3: CategoryHead forward (using direct RTI features)
+        ok3 = check_cat_head_forward(pipeline, region_tokens, h_normed, n_visual, batch)
 
         # Section 4: Full pipeline forward + loss
         ok4 = check_full_forward(pipeline, batch, criterion)

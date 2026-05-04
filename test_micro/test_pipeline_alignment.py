@@ -298,7 +298,7 @@ def main():
 
     # Build inputs_embeds (visual + text with RTI)
     with torch.no_grad():
-        inputs_embeds, n_visual = pipeline._build_inputs_embeds(
+        inputs_embeds, n_visual, _region_tokens = pipeline._build_inputs_embeds(
             pixel_values_1b, pixel_values_rgb_1b, image_grid_thw_1b, depth_maps_1b, input_ids_1b,
             rle_list=batch["rle_list"],
             mask_token_positions=batch["mask_positions"],
@@ -505,7 +505,7 @@ def main():
     )
 
     print(f"\n  SpatialLoss output: {official_loss.item():.6f}")
-    print(f"  Components: ce={components['ce']:.6f}, sl1={components['sl1']:.6f}, cat_ce={components.get('cat_ce', 0.0):.6f}")
+    print(f"  Components: ce={components['ce']:.6f}, sl1={components['sl1']:.6f}, cat={components.get('cat', 0.0):.6f}")
     print(f"  CE per step: {components.get('ce_per_step', [])}")
     
     avg_raw = sum(per_token_losses) / len(per_token_losses) if per_token_losses else 0.0

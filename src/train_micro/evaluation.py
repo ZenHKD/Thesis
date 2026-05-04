@@ -2,7 +2,7 @@
 Evaluate SpatialVLM Micro on a full dataset split.
 
 Usage:
-    python src/train_micro/evaluation.py --checkpoint checkpoints/micro/epoch_2 --split val
+    python src/train_micro/evaluation.py --checkpoint checkpoints/micro/stage2/epoch_2 --split val
 """
 
 import sys
@@ -315,6 +315,10 @@ def main():
     categories = ["count", "distance", "mcq", "left_right"]
     confusion_matrix = {t: {p: 0 for p in categories + ["unknown"]} for t in categories}
 
+    # Multi-threshold tracking for numeric categories
+    num_thresholds = [0.10, 0.15, 0.20]
+    num_thresh_results = {t: {cat: {"correct": 0, "total": 0} for cat in ["count", "distance"]} for t in num_thresholds}
+
     for idx, s in enumerate(tqdm(samples, desc="Inference Progress")):
         cat = s["category"]
         gt = s["answer"]
@@ -351,11 +355,24 @@ def main():
                 if num_pred is not None:
                     try:
                         gt_num = float(gt_clean)
+                        # Round for count (always integer)
+                        if cat == "count":
+                            num_pred = round(num_pred)
                         if abs(gt_num) > 1e-6:
                             rel_err = abs(num_pred - gt_num) / abs(gt_num)
                             match = rel_err <= 0.10
+                            # Track multi-threshold
+                            for t in num_thresholds:
+                                if rel_err <= t:
+                                    num_thresh_results[t][cat]["correct"] += 1
+                                num_thresh_results[t][cat]["total"] += 1
                         else:
-                            match = abs(num_pred - gt_num) < 0.5
+                            near_match = abs(num_pred - gt_num) < 0.5
+                            match = near_match
+                            for t in num_thresholds:
+                                if near_match:
+                                    num_thresh_results[t][cat]["correct"] += 1
+                                num_thresh_results[t][cat]["total"] += 1
                     except (ValueError, TypeError):
                         match = False
             elif cat == "mcq":
@@ -404,6 +421,21 @@ def main():
             acc = r["correct"] / max(r["total"], 1) * 100
             print(f"  {cat:<12}  {r['correct']:>8}  {r['total']:>6}  {acc:>7.1f}%")
 
+    # Multi-threshold numeric accuracy
+    print(f"\n{'='*70}")
+    print(f"NUMERIC ACCURACY BY THRESHOLD")
+    print(f"{'='*70}")
+    print(f"  {'Category':<12}  {'@10%':>8}  {'@15%':>8}  {'@20%':>8}  {'Total':>6}")
+    print(f"  {'-'*50}")
+    for num_cat in ["count", "distance"]:
+        accs = []
+        for t in num_thresholds:
+            r = num_thresh_results[t][num_cat]
+            acc = r["correct"] / max(r["total"], 1) * 100
+            accs.append(f"{acc:>7.1f}%")
+        total = num_thresh_results[num_thresholds[0]][num_cat]["total"]
+        print(f"  {num_cat:<12}  {'  '.join(accs)}  {total:>6}")
+
     print(f"\n{'='*70}")
     print(f"CATEGORY CONFUSION MATRIX (Row=GT, Col=Pred)")
     print(f"{'='*70}")
@@ -419,6 +451,72 @@ def main():
 
     print("\n")
     print_vram_usage("final")
+
+    # ================================================================
+    # Save results to file
+    # ================================================================
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_path = os.path.join(args.checkpoint, f"result_{args.split}_{timestamp}.txt")
+    
+    lines = []
+    lines.append("=" * 70)
+    lines.append("EVALUATION RESULT")
+    lines.append("=" * 70)
+    lines.append(f"  Checkpoint:  {os.path.abspath(args.checkpoint)}")
+    lines.append(f"  Split:       {args.split}")
+    lines.append(f"  Resolution:  {args.resolution}")
+    lines.append(f"  Timestamp:   {timestamp}")
+    lines.append(f"  Samples:     {N}")
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("OVERALL")
+    lines.append("=" * 70)
+    lines.append(f"  Correct: {correct}/{N} ({correct/max(N,1)*100:.1f}%)")
+    lines.append("")
+
+    if results_by_category:
+        lines.append("=" * 70)
+        lines.append("PER-CATEGORY ACCURACY")
+        lines.append("=" * 70)
+        lines.append(f"  {'Category':<12}  {'Correct':>8}  {'Total':>6}  {'Accuracy':>8}")
+        lines.append(f"  {'-'*40}")
+        for cat in sorted(results_by_category.keys()):
+            r = results_by_category[cat]
+            acc = r["correct"] / max(r["total"], 1) * 100
+            lines.append(f"  {cat:<12}  {r['correct']:>8}  {r['total']:>6}  {acc:>7.1f}%")
+        lines.append("")
+
+    # Multi-threshold numeric accuracy in file
+    lines.append("=" * 70)
+    lines.append("NUMERIC ACCURACY BY THRESHOLD")
+    lines.append("=" * 70)
+    lines.append(f"  {'Category':<12}  {'@10%':>8}  {'@15%':>8}  {'@20%':>8}  {'Total':>6}")
+    lines.append(f"  {'-'*50}")
+    for num_cat in ["count", "distance"]:
+        accs = []
+        for t in num_thresholds:
+            r = num_thresh_results[t][num_cat]
+            acc = r["correct"] / max(r["total"], 1) * 100
+            accs.append(f"{acc:>7.1f}%")
+        total = num_thresh_results[num_thresholds[0]][num_cat]["total"]
+        lines.append(f"  {num_cat:<12}  {'  '.join(accs)}  {total:>6}")
+    lines.append("")
+
+    lines.append("=" * 70)
+    lines.append("CONFUSION MATRIX (Row=GT, Col=Pred)")
+    lines.append("=" * 70)
+    cm_header = f"  {'GT / Pred':<12} | " + " | ".join(f"{c:>10}" for c in categories + ["unknown"])
+    lines.append(cm_header)
+    lines.append("  " + "-" * len(cm_header))
+    for gt_cat in categories:
+        row_counts = [confusion_matrix[gt_cat][p] for p in categories + ["unknown"]]
+        row_str = f"  {gt_cat:<12} | " + " | ".join(f"{count:>10}" for count in row_counts)
+        lines.append(row_str)
+
+    with open(result_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\n  Results saved to: {result_path}")
 
 if __name__ == "__main__":
     main()

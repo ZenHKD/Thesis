@@ -63,10 +63,11 @@ ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nvidia_wareh
 MODEL_MICRO_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "model_micro", "qwen3.5-micro")
 
 _SPLIT_CONFIG = {
-    "train":        {"json": "train.json",        "dir": "train"},
-    "val":          {"json": "val.json",           "dir": "val"},
-    "test":         {"json": "test.json",          "dir": "test"},
-    "train_sample": {"json": "train_sample/train_sample.json", "dir": "train_sample"},
+    "train":          {"json": "train.json",          "dir": "train"},
+    "train_balanced": {"json": "train_balanced.json", "dir": "train"},
+    "val":            {"json": "val.json",            "dir": "val"},
+    "test":           {"json": "test.json",           "dir": "test"},
+    "train_sample":   {"json": "train_sample/train_sample.json", "dir": "train_sample"},
 }
 
 
