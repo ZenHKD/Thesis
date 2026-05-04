@@ -12,7 +12,7 @@
 
 ### Micro model, see `model_micro/`
 
-Pruned from **Qwen 3.5 0.8B** (853M): Vision Encoder (12 -> 4 blocks), Backbone (full 24 layers, **single-pass** — no looping). **Full original vocabulary** (248,076 + `<num>` = 248,077 tokens -> remain 248,320 tokens (padded)). Adds **Number Head** for direct numeric regression on `distance` and `count` tasks. Two parallel input streams: visual (Vision Encoder -> 160 tokens) and region (RTI, independent of Vision Encoder -> 3 learned tokens per `<mask>`). Full fine-tuning (~797M trainable parameters).
+Pruned from **Qwen 3.5 0.8B** (853M): Vision Encoder (12 -> 4 blocks), Backbone (full 24 layers, **single-pass** — no looping). **Full original vocabulary** (248,076 + `<num>` = 248,077 tokens -> remain 248,320 tokens (padded)). Adds **Number Head** for direct numeric regression and **Category Head** (Bilinear) for MCQ/left-right classification. Two parallel input streams: visual (Vision Encoder -> 160 tokens) and region (RTI, independent of Vision Encoder -> 3 learned tokens per `<mask>`). 2-stage fine-tuning (~797M parameters).
 
 ```text
 Stream 1 (Visual)
@@ -21,30 +21,30 @@ RGB Image --------> [Vision Encoder] --> [Merger] ======> visual tokens [160, 10
                                                                  ||
 Stream 2 (Region)                                                ||
 RGB Image --------> [RTI: Region Token Injection]                ||
-Depth Map --------> (Independent of Vision Encoder)              ||
-RLE Masks --------> (mask_rgb + mask_depth + mask_geo)           ||
+Depth Map -------->  (Independent of Vision Encoder)             ||
+RLE Masks -------->  (mask_rgb + mask_depth + mask_geo)          ||
                                                     |            ||
                                                     v            ||
-Question* --------> [Token Embedding] =========> [Inject] ==> [Concat Fusion]
-(*w/ <mask...>)    (Full 248,320 vocab)       (3->3 Replace)     ||
+Question* --------> [Token Embedding] ==========> [Inject] ==> [Concat Fusion]
+(*w/ <mask..>)    (Full 248,320 vocab)       (3->3 Replace)     ||
                                                                  vv
                                                    [Qwen Backbone] 24 layers (single pass)
                                                    (6 × [3 DeltaNet + 1 GatedAttn])
                                                                  ||
-                                             +===================++===================+
-                                             v                                        v
-                                         [LM Head]                            [Number Head] (xVal)
-                                             |                                        |
-                                             v                                        v
-                                      Structured Output                       Numeric Prediction
-                                 <think>reasoning</think>                   distance (m) / count (n)
-                                      category | answer
-                                             |                                        |
-                                             v                                        v
-                                   L_CE (label_smooth=0.0)                  L_SmoothL1 (regression)
-                                             |                                        |
-                                             +----------------- L_total --------------+
-                                                          L = L_CE + α·L_SmoothL1
+                                +==================+=============++==============+
+                                v                  v                             v
+                            [LM Head]        [Category Head]               [Number Head]
+                                |            (Bilinear Attn)                     |
+                                v                  v                             v
+                           Structured          MCQ/LR pred               Numeric Prediction
+                     <think>reasoning</think>      |                      distance / count
+                        category | answer          |                             |
+                                 |                 |                             |
+                                 v                 v                             v
+                               L_CE             L_Focal                   L_SmoothL1 (dynamic β)
+                                 |                 |                             |
+                                 +------------------L_total ---------------------+
+                                            L = L_CE + α·L_SmoothL1 + γ·L_Focal
 ```
 
 **Key differences from original model:**
@@ -54,9 +54,10 @@ Question* --------> [Token Embedding] =========> [Inject] ==> [Concat Fusion]
 | Decoder | 24 layers | **24 layers, single pass** |
 | RTI tokens | - | **mask_rgb + mask_depth + mask_geo** |
 | RTI coupling | - | **Independent (raw RGB+Depth+RLE)** |
+| Category Head | - | **Bilinear attention (MCQ + left_right)** |
+| Number Head | - | **xVal regression (distance + count)** |
 | Output format | Direct answer | **`<think>CoT</think>` + structured answer** |
 | Trainable params | ~853M | **~797M** |
-
 
 ## Dataset
 
@@ -66,9 +67,13 @@ Question* --------> [Token Embedding] =========> [Inject] ==> [Concat Fusion]
 
 | Split | QA Pairs | RGB-D pairs |
 |-------|----------|-------------|
-| Train | **499K** | ~78K |
+| Train (original) | **499K** | ~78K |
+| Train (balanced) | **204K** | ~72K |
 | Val   | 1.9K | — |
 | Test  | 19K | — |
+
+> Balanced data addresses severe within-category imbalance (count=3: 47%, MCQ idx 0/1/2: 92%)
+> via stratified down/upsampling. See `data/balance_train_data.py`.
 
 ## Project Structure
 
@@ -80,7 +85,8 @@ Thesis/
 │   ├── pipeline.py                 # Micro pipeline (single-pass, no GSA/LoopLM)
 │   ├── rti.py                      # RTI (independent of Vision Encoder, batched)
 │   ├── num_head.py                 # Number Head (xVal-style softplus regression)
-│   ├── loss.py                     # Combined CE + SmoothL1 loss
+│   ├── cat_head.py                 # Category Head (Bilinear attention)
+│   ├── loss.py                     # Combined CE + SmoothL1 + Focal loss
 │   ├── prune.py                    # Pruning script (Qwen 3.5 0.8B -> Micro)
 │   ├── architecture_micro.md       # Detailed Micro architecture documentation
 │   └── qwen3.5-micro/              # Micro model weights (gitignored)
@@ -92,18 +98,19 @@ Thesis/
 ├── analysis/                       # Question type analysis (train + val + test)
 ├── src/
 │   ├── dataloader/                 # Dataset loader (batched RTI, decoded masks)
-│   ├── train_micro/                # Micro training + validation (train.py, val.py)
+│   └── train_micro/                # Training + validation + evaluation
+│       ├── train.py                # 2-stage training (Stage 1: frozen decoder, Stage 2: full)
+│       ├── val.py                  # Validation (teacher-forced metrics)
+│       └── evaluation.py           # Inference evaluation (autoregressive, multi-threshold)
 ├── test_micro/
-│   ├── test_inference.py           # Inference test (Micro, cuda only)
-│   ├── test_backprop.py            # Backprop test (Micro, all components)
+│   ├── test_inference.py           # Inference test (per-sample debug output)
+│   ├── test_backprop.py            # Backprop test (all components)
 │   ├── test_dataloader.py          # Dataloader test (batched RTI, decoded masks)
-│   └── test_pipeline_alignment.py  # Pipeline alignment test (Micro)
+│   └── test_pipeline_alignment.py  # Pipeline alignment test
+├── data/
+│   ├── balance_train_data.py       # Data balancing script (stratified down/upsampling)
+│   └── nvidia_warehouse_dataset/   # Dataset directory (gitignored)
 ├── checkpoints/micro/              # Training checkpoints + training.csv (gitignored)
-├── data/nvidia_warehouse_dataset/  # Dataset directory (gitignored)
-├── count_qwen3_5_params.py         # Parameter counting script
-├── Qwen3.5-0.8B.txt                # Parameter breakdown output
-├── setup_nvidia_dataset.py         # Dataset download script
-├── .env                            # HF_TOKEN (gitignored)
 └── README.md
 ```
 
