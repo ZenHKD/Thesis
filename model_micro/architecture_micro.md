@@ -24,7 +24,8 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 
 | Split | QA Pairs | RGB-D pairs |
 |-------|----------|-------------|
-| Train | **499K** | ~78K |
+| Train (original) | **499K** | ~78K |
+| Train (balanced) | **204K** | ~72K |
 | Test  | 19K | — |
 | Val   | 1.9K | — |
 
@@ -41,6 +42,18 @@ Pretrained weights are transferred (not random init), then fine-tuned on the 499
 > **Vocab**: Full original vocabulary (248,320 = 248,076 + `<num>` token + `<PAD>` token) \
 > **CoT**: GPT reasoning wrapped in `<think>...</think>` as chain-of-thought training signal \
 > **Labels**: Question & answer tokenized separately then concatenated (BPE-safe boundary)
+
+### Balanced Training Data (`train_balanced.json`)
+
+Original dataset has severe within-category imbalance (count=3 dominates 47%, MCQ index 0/1/2 dominates 92%).
+Balanced version applies stratified down/upsampling while preserving 92.6% of unique images:
+
+| Category | Original | Balanced | Strategy |
+|----------|----------|----------|----------|
+| distance | 246K (49%) | **51K (25%)** | Stratified 2m bins, cap 8K/bin |
+| left_right | 69K (14%) | **69K (34%)** | Keep as-is (already balanced) |
+| count | 73K (15%) | **60K (29%)** | 15K per value (1/2/3/4) |
+| mcq | 111K (22%) | **24K (12%)** | Tiered: 0-2→4K, 3-4→3K, 5-6→2K, 7→keep, 8-12→200-500 |
 
 ---
 
@@ -191,8 +204,9 @@ flowchart TB
         DEC["24 Layers (single pass)\n6 × (3 DeltaNet + 1 GatedAttn)\nhidden=1024, FFN=3584"]
     end
 
-    subgraph HEADS["Dual Output Heads"]
-        LM["LM Head (tied w/ embed)\n→ category + text answer"]
+    subgraph HEADS["Triple Output Heads"]
+        LM["LM Head (tied w/ embed)\n→ CoT + category text"]
+        CATH["Category Head (Bilinear)\nquery: h_cat, keys: RTI tokens\n→ MCQ / left_right"]
         NUM["Number Head (xVal)\nLinear(1024→512→256→1)\n→ scalar prediction"]
     end
 
@@ -208,7 +222,9 @@ flowchart TB
     CAT --> DEC
 
     DEC --> LM
+    DEC -->|"hidden @ &lt;cat&gt;"| CATH
     DEC -->|"hidden @ &lt;num&gt;"| NUM
+    MRGB & MDEP & MGEO -->|"RTI tokens as keys"| CATH
 
     style INPUT fill:#1a1a2e,stroke:#e94560,color:#fff
     style STREAM1 fill:#0a1628,stroke:#0f3460,color:#fff
@@ -380,8 +396,9 @@ Implementation: `model_micro/loss.py`
 Where:
 - **CE**: Cross-entropy loss on LM head output (label smoothing disabled to prevent over regularization of 248K vocab)
 - **L_SmoothL1**: SmoothL1 (Huber) on Number Head output vs ground truth (distance + count)
-  - Bounded gradients (max 1.0 per sample) — eliminates gradient spikes from large targets
-  - β=1.0: quadratic for |error| < 1, linear for |error| ≥ 1
+  - **Dynamic Beta**: `β = |target| × 0.05` — L2 zone scales with target magnitude
+  - count=1 → β=0.05, count=3 → β=0.15, distance=10m → β=0.50
+  - Small targets get tight L2 zones (precise), large targets get wider zones (forgiving)
 - **L_Focal**: Focal Loss on Category Head output (MCQ + left_right)
   - Focal hyperparameters: `focal_alpha=0.25`, `focal_gamma=2.0` (these are internal to the focal loss formula, distinct from the overall loss weight γ)
 - **α**: Weight for SmoothL1 (default 0.1)
@@ -411,9 +428,25 @@ labels    = [-100]*len(q_ids) + a_ids  # -100 for question, active for answer
 
 ---
 
-## Training Strategy — Full Fine-tuning
+## Training Strategy — 2-Stage Fine-tuning
 
-**All components trainable.**
+### Stage 1: Freeze Decoder
+
+Train Vision Encoder, RTI, Embeddings, LM Head, and Custom Heads while keeping the 24-layer decoder frozen.
+Goal: align vision/region representations with the decoder's existing language capabilities.
+
+| Component | Status | LR |
+|-----------|--------|-----|
+| Vision Encoder (4 ViT blocks) | ✅ **Trainable** | 5e-5 |
+| Token Embeddings (248K, tied w/ LM Head) | ✅ **Trainable** | 1e-5 |
+| Text Decoder (24 layers) | ❄️ **Frozen** | — |
+| RTI | ✅ **Trainable** | 5e-5 |
+| Category Head | ✅ **Trainable** | 5e-4 |
+| Number Head | ✅ **Trainable** | 5e-5 |
+
+### Stage 2: Full Fine-tuning
+
+All components trainable. Initialized from Stage 1 weights.
 
 | Component | Status | LR |
 |-----------|--------|-----|
@@ -427,6 +460,8 @@ labels    = [-100]*len(q_ids) + a_ids  # -100 for question, active for answer
 **Loss**: `L = CE(label_smoothing=0.0) + α·L_SmoothL1 + γ·L_Focal` (α=0.1, γ=2.0)
 
 **Optimizer**: AdamW with cosine LR scheduler, warmup steps = 500
+
+**Data**: `train_balanced.json` (204K samples, stratified balanced)
 
 ---
 
