@@ -567,8 +567,7 @@ def main():
         "<|im_start|>system\n"
         "You are an expert AI assistant for warehouse spatial reasoning. "
         "Analyze the image and the specific object regions carefully. "
-        "First, output your step-by-step reasoning inside <think></think> tags. "
-        "Then, output your answer using EXACTLY one of these formats:\n"
+        "Output your answer using EXACTLY one of these formats:\n"
         "  mcq | <|cat|>\n"
         "  left_right | <|cat|>\n"
         "  distance | <|num|>\n"
@@ -598,11 +597,7 @@ def main():
     n = min(len(mask_positions), len(rle_list[0]))
     mask_positions = mask_positions[:n]
 
-    # GT thinking (chain-of-thought reasoning from dataset)
-    gt_thinking = entry["conversations"][1]["value"] if len(entry.get("conversations", [])) > 1 else "(none)"
-
     print(f"  Question:     {question}")
-    print(f"  GT thinking:  {gt_thinking}")
     print(f"  GT answer:    {batch['answers'][0]}")
     print(f"  n_masks:      {n}")
 
@@ -619,7 +614,6 @@ def main():
     raw_output = pipeline.processor.tokenizer.decode(
         output_ids[0], skip_special_tokens=False
     ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
-    raw_output = re.sub(r'<think>.*?</think>\s*', '', raw_output, flags=re.DOTALL).strip()
     parsed = pipeline.parse_output(raw_output)
 
     print(f"\n  Raw output:    {raw_output!r}")

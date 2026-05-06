@@ -7,7 +7,7 @@ architecture with batch_size > 1 support and Number Head fields.
 
 Key changes from v1 dataloader:
     1. format_answer(): distance/count -> "category | <|num|>" (Number Head)
-    2. Chain-of-thought: GPT reasoning wrapped in <think>...</think>
+    2. Direct output: no chain-of-thought, answer only
     3. No chat template: question tokenized directly, image processed separately
     4. collate_fn(): supports batch_size > 1 with padding
     5. Separate tokenization: question & answer tokenized independently
@@ -226,14 +226,11 @@ class SpatialVLMDataset(Dataset):
         depth_np = np.array(depth_pil, dtype=np.float32)
         depth_map = torch.from_numpy(depth_np)
 
-        # 3. Parse question
+        # 3. Parse question (conversations[0] = user question, [1] = GPT answer — no longer used)
         question_raw = entry["conversations"][0]["value"]
         question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
 
-        # 4. Get GPT reasoning from dataset (chain-of-thought)
-        gpt_reasoning = entry["conversations"][1]["value"]
-
-        # 5. Determine task type fields
+        # 4. Determine task type fields
         category = entry["category"]
         is_numeric = category in ("distance", "count")
         is_categorical = category in ("mcq", "left_right")
@@ -252,9 +249,8 @@ class SpatialVLMDataset(Dataset):
         else:
             target_cat_index = -1
 
-        # 6. Build components separately for weight isolation
-        # We append the category prefix to cot_str so it remains natively unweighted (1.0)
-        cot_str = f"<think>\n{gpt_reasoning}\n</think>\n\n{category} | "
+        # 5. Build answer string (no CoT — direct output)
+        cot_str = f"{category} | "
         
         if is_numeric:
             ans_text = ""
@@ -266,7 +262,7 @@ class SpatialVLMDataset(Dataset):
 
         tail_str = "<|im_end|>\n"
 
-        # 8. Mask replacement for Object Ref Grounding
+        # 6. Mask replacement for Object Ref Grounding
         mask_idx = [0]
         def replace_mask(match):
             i = mask_idx[0]
@@ -274,7 +270,7 @@ class SpatialVLMDataset(Dataset):
             return f"[Region {i}]: <|object_ref_start|>{match.group(1)}<|object_ref_end|>"
         question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
-        # 9. Process image separately (pixel_values + grid only)
+        # 7. Process image separately (pixel_values + grid only)
         image_inputs = self.processor.image_processor(
             images=image, return_tensors="pt"
         )
@@ -285,15 +281,14 @@ class SpatialVLMDataset(Dataset):
             "<|im_start|>system\n"
             "You are an expert AI assistant for warehouse spatial reasoning. "
             "Analyze the image and the specific object regions carefully. "
-            "First, output your step-by-step reasoning inside <think></think> tags. "
-            "Then, output your answer using EXACTLY one of these formats:\n"
+            "Output your answer using EXACTLY one of these formats:\n"
             "  mcq | <|cat|>\n"
             "  left_right | <|cat|>\n"
             "  distance | <|num|>\n"
             "  count | <|num|><|im_end|>\n"
         )
         
-        # 10. Calculate visual tokens correctly for inline injection
+        # 8. Calculate visual tokens correctly for inline injection
         h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
         h_vis, w_vis = h_p // 2, w_p // 2
         num_visual_tokens = int(h_vis * w_vis)
@@ -304,7 +299,7 @@ class SpatialVLMDataset(Dataset):
         
         q_ids = self.tokenizer.encode(sys_str + user_str + eval_prompt, add_special_tokens=False)
 
-        # 11. Encode separately to guarantee boundary mapping
+        # 9. Encode separately to guarantee boundary mapping
         cot_ids = self.tokenizer.encode(cot_str, add_special_tokens=False)
         ans_ids = self.tokenizer.encode(ans_text, add_special_tokens=False)
         tail_ids = self.tokenizer.encode(tail_str, add_special_tokens=False)
@@ -322,12 +317,12 @@ class SpatialVLMDataset(Dataset):
         attention_mask = torch.ones_like(input_ids)
 
 
-        # 12. Labels: question + separator = -100, answer (+ EOS) = active
+        # 10. Labels: question + separator = -100, answer (+ EOS) = active
         answer_start = len(q_ids)
         labels = input_ids.clone()
         labels[:answer_start] = -100
 
-        # 13. Find <mask> positions in the token sequence
+        # 11. Find <mask> positions in the token sequence
         mask_positions = find_mask_positions(input_ids.unsqueeze(0), self.tokenizer)
         rle_list = entry["rle"]
 
@@ -335,17 +330,17 @@ class SpatialVLMDataset(Dataset):
         mask_positions = mask_positions[:n]
         rle_list = rle_list[:n]
 
-        # 14. Find <|num|> token position (for Number Head)
+        # 12. Find <|num|> token position (for Number Head)
         num_token_pos = -1
         if is_numeric:
             num_token_pos = self._find_token_pos(input_ids, self.num_token_id)
 
-        # 15. Find <|cat|> token position (for Category Head)
+        # 13. Find <|cat|> token position (for Category Head)
         cat_token_pos = -1
         if is_categorical:
             cat_token_pos = self._find_token_pos(input_ids, self.cat_token_id)
 
-        # 16. Format answer for metadata
+        # 14. Format answer for metadata
         raw_answer = str(entry["normalized_answer"])
         if category in ("mcq", "left_right"):
             answer_str = f"<|cat|>={raw_answer}"
@@ -354,7 +349,7 @@ class SpatialVLMDataset(Dataset):
         else:
             answer_str = raw_answer
 
-        # 16. Pre-decode RLE masks + soft masks
+        # 15. Pre-decode RLE masks + soft masks
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
@@ -376,7 +371,7 @@ class SpatialVLMDataset(Dataset):
             soft2d = torch.sigmoid(50.0 * (coverage - 0.3))
             decoded_masks.append({'binary': binary, 'soft2d': soft2d})
 
-        # 17. Raw RGB for RTI (0-1 float)
+        # 16. Raw RGB for RTI (0-1 float)
         pixel_values_rgb = TF.to_tensor(image)  # [3, H_orig, W_orig]
 
         return {

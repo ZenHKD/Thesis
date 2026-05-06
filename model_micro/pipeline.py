@@ -1,25 +1,28 @@
 """
 MODULE: Full Pipeline — SpatialVLM Micro (Training)
 
-Architecture (~797M total, ~797M trainable):
+Architecture (~801M total, ~801M trainable):
     1. Qwen 3.5 Vision Encoder (pruned: 4 ViT blocks, 44M)
        4 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
     2. RTI: Region-Level Token Injection (batched) (~0.07M)
        Each <mask> -> [mask_rgb | mask_depth | mask_geo] (3 -> 3 tokens × 1024-dim)
        Independent of Vision Encoder.
-    3. Concat Fusion: [visual_tokens | text+region_tokens]
-    4. Qwen 3.5 Backbone (full: 24 layers, single pass, 498M)
-    5. Dual Heads:
-       - LM Head (tied w/ embed, TRAINABLE): category + text answer
-       - Number Head (xVal): distance/count regression (~0.26M)
+    3. Mask Cross-Attention: self-attention among masks (~3.4M)
+       Encodes pairwise relationships between masks.
+    4. Concat Fusion: [visual_tokens | text+region_tokens]
+    5. Qwen 3.5 Backbone (full: 24 layers, single pass, 498M)
+    6. Triple Heads:
+       - LM Head (tied w/ embed, TRAINABLE): category text
+       - Number Head: cross-attention w/ RTI (~0.79M)
+       - Category Head: bilinear w/ cross-attended RTI (~0.40M)
 
 <|num|> token ID read from config (set by prune.py).
 
-Output format (with chain-of-thought):
-    <think>GPT reasoning</think>left_right | "left"
-    <think>GPT reasoning</think>mcq | "2"
-    <think>GPT reasoning</think>distance | <|num|>
-    <think>GPT reasoning</think>count | <|num|>
+Output format (direct, no chain-of-thought):
+    left_right | <|cat|>
+    mcq | <|cat|>
+    distance | <|num|>
+    count | <|num|>
 """
 
 import re
@@ -38,32 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model_micro.rti import RTE
 from model_micro.num_head import NumberHead
 from model_micro.cat_head import CategoryHead
+from model_micro.mask_cross_attention import MaskCrossAttention
 
-
-# ---------------------------------------------------------------------------
-# Sampling helpers
-# ---------------------------------------------------------------------------
-
-def _top_k_filter(logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Zero out all logits except the top-k highest values."""
-    if top_k <= 0:
-        return logits
-    values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-    threshold = values[:, -1].unsqueeze(-1)
-    return logits.masked_fill(logits < threshold, float("-inf"))
-
-
-def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """Nucleus (top-p) filtering: zero out logits below the cumulative p mass."""
-    if top_p >= 1.0:
-        return logits
-    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-    # Remove tokens whose cumulative probability exceeds top_p (shift right by 1)
-    sorted_remove = cum_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
-    sorted_logits[sorted_remove] = float("-inf")
-    # Re-scatter back to original order
-    return sorted_logits.scatter(1, sorted_idx, sorted_logits)
 
 # Default model path
 MODEL_NAME = os.path.join(
@@ -196,8 +175,9 @@ class SpatialVLM(nn.Module):
 
         # Custom Modules
         self.region_token_extractor = RTE(hidden_dim=1024)
-        self.num_head = NumberHead(hidden_dim=1024)
-        self.cat_head = CategoryHead(hidden_dim=1024)
+        self.mask_cross_attn = MaskCrossAttention(input_dim=3072, hidden_dim=512)
+        self.num_head = NumberHead(hidden_dim=1024, mask_feat_dim=512)
+        self.cat_head = CategoryHead(hidden_dim=1024, mask_feat_dim=512)
 
         self.decoder_dropout = nn.Dropout(dropout)
 
@@ -207,9 +187,10 @@ class SpatialVLM(nn.Module):
         self.region_token_extractor = self.region_token_extractor.to(
             device=qwen_device, dtype=qwen_dtype
         )
+        self.mask_cross_attn = self.mask_cross_attn.to(device=qwen_device, dtype=qwen_dtype)
         self.num_head = self.num_head.to(device=qwen_device, dtype=qwen_dtype)
         self.cat_head = self.cat_head.to(device=qwen_device, dtype=qwen_dtype)
-        print(f"  Custom modules (RTI + NumHead + CatHead) -> {qwen_device} ({qwen_dtype})")
+        print(f"  Custom modules (RTI + MaskCrossAttn + NumHead + CatHead) -> {qwen_device} ({qwen_dtype})")
 
         embed = self.qwen.model.language_model.embed_tokens
         embed.weight.requires_grad = True
@@ -494,55 +475,58 @@ class SpatialVLM(nn.Module):
         text_h = h_normed[:, n_visual:, :]
         logits = self.qwen.lm_head(text_h)
 
-        # Number Head
+        # Build cross-attended RTI for all samples in batch
         B = input_ids.shape[0]
+        cross_rti_batch = []  # list of [N_masks, 512] or None per sample
+        if region_tokens is not None:
+            for b in range(B):
+                if b < len(region_tokens) and region_tokens[b]:
+                    rti_concat_list = []
+                    for rgb, dep, geo in region_tokens[b]:
+                        rti_concat = torch.cat([
+                            rgb.squeeze(0),   # [1024]
+                            dep.squeeze(0),   # [1024]
+                            geo.squeeze(0),   # [1024]
+                        ], dim=0)             # [3072]
+                        rti_concat_list.append(rti_concat)
+                    rti_stack = torch.stack(rti_concat_list)  # [N_masks, 3072]
+                    cross_rti = self.mask_cross_attn(rti_stack)  # [N_masks, 512]
+                    cross_rti_batch.append(cross_rti)
+                else:
+                    cross_rti_batch.append(None)
+        else:
+            cross_rti_batch = [None] * B
+
+        # Number Head (cross-attention: h_num query -> cross-attended RTI keys)
         num_pred = torch.zeros(B, device=h_normed.device, dtype=h_normed.dtype)
 
         if num_token_positions is not None:
             num_hidden_list = []
+            num_rti_list = []
             num_indices = []
             for b, pos in enumerate(num_token_positions):
                 if pos is not None and pos >= 0:
                     adjusted_pos = n_visual + pos
-                    if 0 <= adjusted_pos < h_normed.shape[1]:
+                    if 0 <= adjusted_pos < h_normed.shape[1] and cross_rti_batch[b] is not None:
                         num_hidden_list.append(h_normed[b, adjusted_pos, :])
+                        num_rti_list.append(cross_rti_batch[b])
                         num_indices.append(b)
 
             if num_hidden_list:
                 h_num = torch.stack(num_hidden_list, dim=0)
-                preds = self.num_head(h_num)
+                preds = self.num_head(h_num, num_rti_list)
                 for k, b in enumerate(num_indices):
                     num_pred[b] = preds[k]
 
-        # Category Head (MCQ / Left-Right)
-        # Uses DIRECT RTI features as mask keys (clean, discriminative)
-        # instead of decoder layer-24 hidden states (diluted by LM objective)
+        # Category Head (bilinear: h_cat query -> cross-attended RTI keys)
         cat_logits_list = []  # list of [N_masks] tensors
-        if cat_token_positions is not None and region_tokens is not None:
+        if cat_token_positions is not None:
             for b, cat_pos in enumerate(cat_token_positions):
                 if cat_pos is not None and cat_pos >= 0:
                     adj_cat_pos = n_visual + cat_pos
-                    if 0 <= adj_cat_pos < h_normed.shape[1]:
-                        h_cat = h_normed[b, adj_cat_pos, :]  # query from decoder (has reasoning context)
-                    else:
-                        cat_logits_list.append(None)
-                        continue
-
-                    # Build mask representations from DIRECT RTI features
-                    # region_tokens[b][m] = (rgb [1,1024], dep [1,1024], geo [1,1024])
-                    mask_hiddens = []
-                    if b < len(region_tokens):
-                        for m, (rgb, dep, geo) in enumerate(region_tokens[b]):
-                            rti_concat = torch.cat([
-                                rgb.squeeze(0),   # [1024]
-                                dep.squeeze(0),   # [1024]
-                                geo.squeeze(0),   # [1024]
-                            ], dim=0)             # [3072]
-                            mask_hiddens.append(rti_concat)
-
-                    if mask_hiddens:
-                        h_masks = torch.stack(mask_hiddens, dim=0)  # [N_masks, 3072]
-                        scores = self.cat_head(h_masks, h_cat)  # [N_masks]
+                    if 0 <= adj_cat_pos < h_normed.shape[1] and cross_rti_batch[b] is not None:
+                        h_cat = h_normed[b, adj_cat_pos, :]  # query from decoder
+                        scores = self.cat_head(cross_rti_batch[b], h_cat)  # [N_masks]
                         cat_logits_list.append(scores)
                     else:
                         cat_logits_list.append(None)
@@ -567,16 +551,12 @@ class SpatialVLM(nn.Module):
         input_ids:            torch.Tensor,
         rle_list:             list = None,
         mask_token_positions: list = None,
-        max_new_tokens:       int  = 150,
-        do_sample:            bool = False,
-        temperature:          float = 1.0,
-        top_p:                float = 0.9,
-        top_k:                int   = 50,
+        max_new_tokens:       int  = 20,
         repetition_penalty:   float = 1.2,
         decoded_masks:        list = None,
         **gen_kwargs,
     ) -> torch.Tensor:
-        """Autoregressive generation with top-p/top-k sampling and repetition penalty."""
+        """Autoregressive generation with repetition penalty."""
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
         inputs_embeds, n_visual, _region_tokens = self._build_inputs_embeds(
@@ -591,7 +571,7 @@ class SpatialVLM(nn.Module):
 
         eos_id = self.processor.tokenizer.eos_token_id
         cache = Qwen3_5DynamicCache(config=lm.config)
-        attn_mask = torch.ones(B, T, dtype=torch.long, device=dev)
+        attn_mask = gen_kwargs.get("attention_mask", torch.ones(B, T, dtype=torch.long, device=dev))
 
         cache_position = torch.arange(T, device=dev)
         hidden = self._backbone_forward(
@@ -610,14 +590,7 @@ class SpatialVLM(nn.Module):
                     else:
                         logits[b, -1, tok_id] *= repetition_penalty
 
-        if do_sample and temperature > 0:
-            logits_s = logits[:, -1, :] / temperature
-            logits_s = _top_k_filter(logits_s, top_k)
-            logits_s = _top_p_filter(logits_s, top_p)
-            probs = torch.softmax(logits_s, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-        else:
-            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         generated = [next_tok]
         all_generated = next_tok.clone()
@@ -628,9 +601,12 @@ class SpatialVLM(nn.Module):
 
             tok_embed = embed(next_tok)
             step_cache_pos = torch.tensor([T + step], device=dev)
+            
+            attn_mask = torch.cat([attn_mask, torch.ones(B, 1, dtype=torch.long, device=dev)], dim=1)
 
             hidden = self._backbone_forward(
                 tok_embed, past_key_values=cache, cache_position=step_cache_pos,
+                attention_mask=attn_mask,
             )
             hidden_norm = lm.norm(hidden)
             logits = self.qwen.lm_head(hidden_norm)
@@ -643,14 +619,7 @@ class SpatialVLM(nn.Module):
                         else:
                             logits[b, -1, tok_id] *= repetition_penalty
 
-            if do_sample and temperature > 0:
-                logits_s = logits[:, -1, :] / temperature
-                logits_s = _top_k_filter(logits_s, top_k)
-                logits_s = _top_p_filter(logits_s, top_p)
-                probs = torch.softmax(logits_s, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1)
-            else:
-                next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
             generated.append(next_tok)
             all_generated = torch.cat([all_generated, next_tok], dim=1)
@@ -662,11 +631,9 @@ class SpatialVLM(nn.Module):
     def parse_output(text: str) -> dict:
         """Parse structured LM output -> {category, answer}.
 
-        Expected format: <think>reasoning</think>category | value
-        Strips <think>...</think> before parsing.
+        Expected format: category | value
         """
-        # Strip chain-of-thought reasoning
-        clean = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+        clean = text.strip()
         m = _OUTPUT_RE.search(clean)
         if m:
             category = m.group("category").strip().lower()
@@ -780,12 +747,14 @@ if __name__ == "__main__":
         "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
         "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
         "RTI (Region Token Injector)":     pipeline.region_token_extractor,
-        "Number Head (xVal regression)":   pipeline.num_head,
+        "Mask Cross-Attention":            pipeline.mask_cross_attn,
+        "Number Head (RTI cross-attn)":    pipeline.num_head,
         "Category Head (MCQ/LR class.)":   pipeline.cat_head,
     }
     custom_names = {
         "RTI (Region Token Injector)",
-        "Number Head (xVal regression)",
+        "Mask Cross-Attention",
+        "Number Head (RTI cross-attn)",
         "Category Head (MCQ/LR class.)",
     }
     tied_names = {"Qwen LM Head (tied->Embed)"}

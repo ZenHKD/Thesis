@@ -106,11 +106,11 @@ def main():
         decoded_answer = tokenizer.decode(active_ids, skip_special_tokens=False)
         print(f"  Decoded answer: {decoded_answer}")
 
-        # Verify label boundary: answer should start with <think>
-        if decoded_answer.strip().startswith("<think>"):
-            print(f"  [OK] Label boundary correct (starts with <think>)")
+        # Verify label boundary: answer should start with the category name
+        if decoded_answer.strip().startswith(cat):
+            print(f"  [OK] Label boundary correct (starts with category '{cat}')")
         else:
-            print(f"  [FAIL] Label boundary wrong: answer starts with '{decoded_answer[:30]}'")
+            print(f"  [FAIL] Label boundary wrong: answer starts with '{decoded_answer[:30]}', expected '{cat}'")
             all_ok = False
 
         # Check numeric fields

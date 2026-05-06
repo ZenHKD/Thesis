@@ -127,7 +127,7 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
     parser.add_argument("--split",       default="train", choices=["train", "train_balanced", "train_sample"])
-    parser.add_argument("--epochs",      type=int,   default=2)
+    parser.add_argument("--epochs",      type=int,   default=1)
     parser.add_argument("--stage",       type=int,   default=2, choices=[1, 2],
                         help="Training stage: 1=freeze decoder (train vision+RTI+Embed+LM_Head+CustomHeads), "
                              "2=full fine-tuning (all trainable)")
@@ -135,9 +135,9 @@ def main():
     parser.add_argument("--lr-backbone", type=float, default=1e-5)
     parser.add_argument("--lr-rti",      type=float, default=5e-5)
     parser.add_argument("--lr-numhead",  type=float, default=5e-5)
-    parser.add_argument("--lr-c",        type=float, default=1e-4,
+    parser.add_argument("--lr-c",        type=float, default=5e-5,
                         help="Learning rate for Category Head")
-    parser.add_argument("--alpha",       type=float, default=0.1,
+    parser.add_argument("--alpha",       type=float, default=1.0,
                         help="Weight for SmoothL1 loss (α in L)")
     parser.add_argument("--gamma",       type=float, default=1.0,
                         help="Weight for Category Focal Loss (γ in L)")
@@ -196,8 +196,11 @@ def main():
     print_vram_usage("after model load")
 
     if args.compile:
-        print("  [*] Compiling Qwen backbone with torch.compile...")
+        print("  [*] Compiling Qwen backbone and custom heads with torch.compile...")
         pipeline.qwen = torch.compile(pipeline.qwen)
+        pipeline.mask_cross_attn = torch.compile(pipeline.mask_cross_attn)
+        pipeline.cat_head = torch.compile(pipeline.cat_head)
+        pipeline.num_head = torch.compile(pipeline.num_head)
 
     # Load weights from a previous stage (no optimizer/step restore)
     if args.init_weights:
@@ -230,14 +233,15 @@ def main():
         for param in pipeline.qwen.model.language_model.norm.parameters():
             param.requires_grad = False
         print("  [*] FROZEN: Decoder layers, LayerNorm")
-        print("  [*] TRAINABLE: Vision Encoder, RTI, NumberHead, CategoryHead, Embeddings, LM Head")
+        print("  [*] TRAINABLE: Vision Encoder, RTI, MaskCrossAttn, NumHead, CatHead, Embeddings, LM Head")
 
     # Build optimizer param groups (only include params with requires_grad)
     vision_params = [p for p in pipeline.qwen.model.visual.parameters() if p.requires_grad]
     embed_params = [p for p in pipeline.qwen.model.language_model.embed_tokens.parameters() if p.requires_grad]
     decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
                      [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
-    rti_params = [p for p in pipeline.region_token_extractor.parameters() if p.requires_grad]
+    rti_params = [p for p in pipeline.region_token_extractor.parameters() if p.requires_grad] + \
+                 [p for p in pipeline.mask_cross_attn.parameters() if p.requires_grad]
     numhead_params = [p for p in pipeline.num_head.parameters() if p.requires_grad]
     cathead_params = [p for p in pipeline.cat_head.parameters() if p.requires_grad]
 
@@ -245,7 +249,7 @@ def main():
         ("Vision Encoder",  vision_params,  args.lr_vision),
         ("Embeddings",      embed_params,   args.lr_backbone),  
         ("Decoder",         decoder_params, args.lr_backbone),
-        ("RTI",             rti_params,     args.lr_rti),
+        ("RTI+MaskCrossAttn", rti_params,   args.lr_rti),
         ("Number Head",     numhead_params, args.lr_numhead),
         ("Category Head",   cathead_params, args.lr_c),
     ]
@@ -490,7 +494,7 @@ def main():
                     lr_v = lrs.get("Vision Encoder", 0.0)
                     lr_e = lrs.get("Embeddings", 0.0)
                     lr_d = lrs.get("Decoder", 0.0)
-                    lr_rti = lrs.get("RTI", 0.0)
+                    lr_rti = lrs.get("RTI+MaskCrossAttn", 0.0)
                     lr_n = lrs.get("Number Head", 0.0)
                     lr_c = lrs.get("Category Head", 0.0)
 
@@ -549,7 +553,7 @@ def main():
                     lr_v = lrs.get("Vision Encoder", 0.0)
                     lr_e = lrs.get("Embeddings", 0.0)
                     lr_d = lrs.get("Decoder", 0.0)
-                    lr_rti = lrs.get("RTI", 0.0)
+                    lr_rti = lrs.get("RTI+MaskCrossAttn", 0.0)
                     lr_n = lrs.get("Number Head", 0.0)
                     lr_c = lrs.get("Category Head", 0.0)
 

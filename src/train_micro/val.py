@@ -229,7 +229,7 @@ def main():
             pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
         print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    criterion = SpatialLoss(alpha=0.1)
+    criterion = SpatialLoss(alpha=1.0, gamma=1.0)
 
     results = validate(
         pipeline, criterion, pipeline.processor,

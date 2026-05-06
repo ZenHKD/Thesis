@@ -115,7 +115,7 @@ def load_checkpoint_weights(pipeline, path: str):
 # Inference Runner
 # =========================================================================
 
-def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float = 0.9, top_k: int = 50, max_new_tokens: int = 150, temperature: float = 1.0, repetition_penalty: float = 1.0) -> dict:
+def run_inference(pipeline, sample: dict, max_new_tokens: int = 20, repetition_penalty: float = 1.0) -> dict:
     """Run inference on a single dataloader sample.
     Uses pipeline.generate().
 
@@ -148,8 +148,7 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         "<|im_start|>system\n"
         "You are an expert AI assistant for warehouse spatial reasoning. "
         "Analyze the image and the specific object regions carefully. "
-        "First, output your step-by-step reasoning inside <think></think> tags. "
-        "Then, output your answer using EXACTLY one of these formats:\n"
+        "Output your answer using EXACTLY one of these formats:\n"
         "  mcq | <|cat|>\n"
         "  left_right | <|cat|>\n"
         "  distance | <|num|>\n"
@@ -188,20 +187,13 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         mask_token_positions=[mask_positions],
         decoded_masks=[decoded_masks],
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
         repetition_penalty=repetition_penalty,
     )
     raw_full = pipeline.processor.tokenizer.decode(
         output_ids[0], skip_special_tokens=False
     ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
     
-    think_match = _re.search(r'<think>.*?</think>', raw_full, flags=_re.DOTALL)
-    think_str = think_match.group(0).strip() if think_match else ""
-    
-    raw_output = _re.sub(r'<think>.*?</think>\s*', '', raw_full, flags=_re.DOTALL).strip()
+    raw_output = raw_full.strip()
     parsed = pipeline.parse_output(raw_output)
 
     # Step 2: For numeric categories, get num_pred via forward pass
@@ -209,16 +201,13 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
     cat_pred_idx = None
 
     _clean_pattern = _re.compile(
-        r'^<think>.+?</think>\s*(distance|count)\s*\|\s*<\|num\|>$', _re.DOTALL
+        r'^(distance|count)\s*\|\s*<\|num\|>$'
     )
     _cat_pattern = _re.compile(
-        r'^<think>.+?</think>\s*(mcq|left_right)\s*\|\s*<\|cat\|>$', _re.DOTALL
+        r'^(mcq|left_right)\s*\|\s*<\|cat\|>$'
     )
 
-    # Check raw output before stripping think tags
-    raw_full = pipeline.processor.tokenizer.decode(
-        output_ids[0], skip_special_tokens=False
-    ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
+    # Check raw output for clean format
     is_clean = bool(_clean_pattern.match(raw_full))
     is_cat_clean = bool(_cat_pattern.match(raw_full))
 
@@ -278,7 +267,6 @@ def run_inference(pipeline, sample: dict, do_sample: bool = False, top_p: float 
         "num_pred":   num_pred_val,
         "cat_pred":   cat_pred_idx,
         "raw":        raw_output,
-        "think":      think_str,
     }
 
 
@@ -302,11 +290,7 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
-    parser.add_argument("--max-new-tokens", type=int, default=150)
-    parser.add_argument("--do-sample",      action="store_true", help="Use sampling (debug only) instead of greedy")
-    parser.add_argument("--temperature",    type=float, default=1.0, help="Temperature (only used with --do-sample)")
-    parser.add_argument("--top-p",          type=float, default=0.9, help="Top-p sampling (only used with --do-sample)")
-    parser.add_argument("--top-k",          type=int, default=50, help="Top-k sampling (only used with --do-sample)")
+    parser.add_argument("--max-new-tokens", type=int, default=20)
     parser.add_argument("--repetition-penalty", type=float, default=1.0,
                         help="Repetition penalty (1.0 = disabled, recommended for strict eval)")
     parser.add_argument("--num-samples",    type=int, default=5,
@@ -422,13 +406,8 @@ def main():
 
     for i, s in enumerate(samples):
         cat = s["category"]
-        gt = s["answer"]
-        if gt.startswith("<|num|>="):
-            gt_clean = gt[8:]
-        elif gt.startswith("<|cat|>="):
-            gt_clean = gt[8:]
-        else:
-            gt_clean = gt.strip('"')
+        gt = str(s.get("answer", ""))
+        gt_clean = gt.strip('"')
 
         print(f"\n{'--'*35}")
         print(f"  Sample [{s['idx']}]: {s['image_name']}  |  "
@@ -442,10 +421,6 @@ def main():
             with torch.no_grad():
                 result = run_inference(
                     pipeline, s,
-                    do_sample=args.do_sample,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
                     max_new_tokens=args.max_new_tokens,
                     repetition_penalty=args.repetition_penalty,
                 )
@@ -521,8 +496,7 @@ def main():
         if match:
             results_by_category[cat]["correct"] += 1
 
-        print(f"\n  Reasoning:    {result.get('think', '')}")
-        print(f"  Raw output:   {result['raw'][:150]}")
+        print(f"\n  Raw output:   {result['raw'][:150]}")
         print(f"  Parsed:       category={result['category']!r}  answer={result['answer']!r}")
         if num_pred is not None:
             print(f"  Number Head:  num_pred={num_pred:.4f}")
