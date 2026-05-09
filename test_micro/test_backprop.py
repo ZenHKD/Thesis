@@ -105,7 +105,6 @@ def main():
         "Embeddings":      pipeline.qwen.model.language_model.embed_tokens,
         "Decoder (24 layers)": pipeline.qwen.model.language_model.layers,
         "RTI":             pipeline.region_token_extractor,
-        "Mask Cross Attn": pipeline.mask_cross_attn,
         "Number Head":     pipeline.num_head,
         "Category Head":   pipeline.cat_head,
     }
@@ -246,7 +245,7 @@ def main():
             add_timing_hook(layer, f"Decoder[{i}]")
         add_timing_hook(pipeline.qwen.lm_head, "LM Head")
         add_timing_hook(pipeline.region_token_extractor, "RTI")
-        add_timing_hook(pipeline.mask_cross_attn, "Mask Cross Attn")
+
         add_timing_hook(pipeline.num_head, "Number Head")
         add_timing_hook(pipeline.cat_head, "Category Head")
 
@@ -397,11 +396,6 @@ def main():
     rti_ok, rti_issues = check_gradients(pipeline.region_token_extractor, "RTI")
 
     print(f"\n{'='*70}")
-    print("GRADIENT CHECK — Mask Cross Attn")
-    print("=" * 70)
-    mca_ok, mca_issues = check_gradients(pipeline.mask_cross_attn, "Mask Cross Attn")
-
-    print(f"\n{'='*70}")
     print("GRADIENT CHECK — Number Head")
     print("=" * 70)
     numhead_ok, numhead_issues = check_gradients(pipeline.num_head, "Number Head")
@@ -426,13 +420,12 @@ def main():
         (decoder_ok, "Decoder layers have non-zero gradients"),
         (embed_ok, "Embeddings are TRAINABLE (have gradients)"),
         (rti_ok, "RTI has non-zero gradients"),
-        (mca_ok, "Mask Cross Attn has non-zero gradients"),
         (numhead_ok or not has_numeric,
          f"Number Head has gradients (has_numeric={has_numeric})"),
         (cathead_ok or not has_categorical,
          f"Category Head has gradients (has_categorical={has_categorical})"),
         (not (vision_issues or decoder_issues
-              or rti_issues or mca_issues
+              or rti_issues
               or (numhead_issues and has_numeric)
               or (cathead_issues and has_categorical)),
          "No NaN/Inf in any gradients"),

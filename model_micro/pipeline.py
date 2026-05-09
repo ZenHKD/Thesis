@@ -1,20 +1,18 @@
 """
 MODULE: Full Pipeline — SpatialVLM Micro (Training)
 
-Architecture (~801M total, ~801M trainable):
+Architecture (~798M total):
     1. Qwen 3.5 Vision Encoder (pruned: 4 ViT blocks, 44M)
        4 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
     2. RTI: Region-Level Token Injection (batched) (~0.07M)
        Each <mask> -> [mask_rgb | mask_depth | mask_geo] (3 -> 3 tokens × 1024-dim)
        Independent of Vision Encoder.
-    3. Mask Cross-Attention: self-attention among masks (~3.4M)
-       Encodes pairwise relationships between masks.
-    4. Concat Fusion: [visual_tokens | text+region_tokens]
-    5. Qwen 3.5 Backbone (full: 24 layers, single pass, 498M)
-    6. Triple Heads:
-       - LM Head (tied w/ embed, TRAINABLE): category text
-       - Number Head: cross-attention w/ RTI (~0.79M)
-       - Category Head: bilinear w/ cross-attended RTI (~0.40M)
+    3. Concat Fusion: [visual_tokens | text+region_tokens]
+    4. Qwen 3.5 Backbone (full: 24 layers, single pass, 498M)
+    5. Triple Heads:
+       - LM Head (tied w/ embed): category text
+       - Number Head: Multi-Head Cross-Attention → Regression (~1.45M)
+       - Category Head: Bilinear Scoring (~1.06M)
 
 <|num|> token ID read from config (set by prune.py).
 
@@ -41,7 +39,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model_micro.rti import RTE
 from model_micro.num_head import NumberHead
 from model_micro.cat_head import CategoryHead
-from model_micro.mask_cross_attention import MaskCrossAttention
 
 
 # Default model path
@@ -175,9 +172,8 @@ class SpatialVLM(nn.Module):
 
         # Custom Modules
         self.region_token_extractor = RTE(hidden_dim=1024)
-        self.mask_cross_attn = MaskCrossAttention(input_dim=3072, hidden_dim=512)
-        self.num_head = NumberHead(hidden_dim=1024, mask_feat_dim=512)
-        self.cat_head = CategoryHead(hidden_dim=1024, mask_feat_dim=512)
+        self.num_head = NumberHead(hidden_dim=1024, mask_feat_dim=3072)
+        self.cat_head = CategoryHead(hidden_dim=1024, mask_feat_dim=3072)
 
         self.decoder_dropout = nn.Dropout(dropout)
 
@@ -187,10 +183,9 @@ class SpatialVLM(nn.Module):
         self.region_token_extractor = self.region_token_extractor.to(
             device=qwen_device, dtype=qwen_dtype
         )
-        self.mask_cross_attn = self.mask_cross_attn.to(device=qwen_device, dtype=qwen_dtype)
         self.num_head = self.num_head.to(device=qwen_device, dtype=qwen_dtype)
         self.cat_head = self.cat_head.to(device=qwen_device, dtype=qwen_dtype)
-        print(f"  Custom modules (RTI + MaskCrossAttn + NumHead + CatHead) -> {qwen_device} ({qwen_dtype})")
+        print(f"  Custom modules (RTI + NumHead + CatHead) -> {qwen_device} ({qwen_dtype})")
 
         embed = self.qwen.model.language_model.embed_tokens
         embed.weight.requires_grad = True
@@ -475,9 +470,9 @@ class SpatialVLM(nn.Module):
         text_h = h_normed[:, n_visual:, :]
         logits = self.qwen.lm_head(text_h)
 
-        # Build cross-attended RTI for all samples in batch
+        # Build raw RTI features for all samples in batch
         B = input_ids.shape[0]
-        cross_rti_batch = []  # list of [N_masks, 512] or None per sample
+        raw_rti_batch = []  # list of [N_masks, 3072] or None per sample
         if region_tokens is not None:
             for b in range(B):
                 if b < len(region_tokens) and region_tokens[b]:
@@ -490,14 +485,13 @@ class SpatialVLM(nn.Module):
                         ], dim=0)             # [3072]
                         rti_concat_list.append(rti_concat)
                     rti_stack = torch.stack(rti_concat_list)  # [N_masks, 3072]
-                    cross_rti = self.mask_cross_attn(rti_stack)  # [N_masks, 512]
-                    cross_rti_batch.append(cross_rti)
+                    raw_rti_batch.append(rti_stack)
                 else:
-                    cross_rti_batch.append(None)
+                    raw_rti_batch.append(None)
         else:
-            cross_rti_batch = [None] * B
+            raw_rti_batch = [None] * B
 
-        # Number Head (cross-attention: h_num query -> cross-attended RTI keys)
+        # Number Head (Multi-Head Cross-Attention: h_num query → raw RTI keys/values)
         num_pred = torch.zeros(B, device=h_normed.device, dtype=h_normed.dtype)
 
         if num_token_positions is not None:
@@ -507,9 +501,9 @@ class SpatialVLM(nn.Module):
             for b, pos in enumerate(num_token_positions):
                 if pos is not None and pos >= 0:
                     adjusted_pos = n_visual + pos
-                    if 0 <= adjusted_pos < h_normed.shape[1] and cross_rti_batch[b] is not None:
+                    if 0 <= adjusted_pos < h_normed.shape[1] and raw_rti_batch[b] is not None:
                         num_hidden_list.append(h_normed[b, adjusted_pos, :])
-                        num_rti_list.append(cross_rti_batch[b])
+                        num_rti_list.append(raw_rti_batch[b])
                         num_indices.append(b)
 
             if num_hidden_list:
@@ -518,15 +512,15 @@ class SpatialVLM(nn.Module):
                 for k, b in enumerate(num_indices):
                     num_pred[b] = preds[k]
 
-        # Category Head (bilinear: h_cat query -> cross-attended RTI keys)
+        # Category Head (Bilinear Scoring: h_cat query → raw RTI keys)
         cat_logits_list = []  # list of [N_masks] tensors
         if cat_token_positions is not None:
             for b, cat_pos in enumerate(cat_token_positions):
                 if cat_pos is not None and cat_pos >= 0:
                     adj_cat_pos = n_visual + cat_pos
-                    if 0 <= adj_cat_pos < h_normed.shape[1] and cross_rti_batch[b] is not None:
+                    if 0 <= adj_cat_pos < h_normed.shape[1] and raw_rti_batch[b] is not None:
                         h_cat = h_normed[b, adj_cat_pos, :]  # query from decoder
-                        scores = self.cat_head(cross_rti_batch[b], h_cat)  # [N_masks]
+                        scores = self.cat_head(raw_rti_batch[b], h_cat)  # [N_masks]
                         cat_logits_list.append(scores)
                     else:
                         cat_logits_list.append(None)
@@ -747,15 +741,13 @@ if __name__ == "__main__":
         "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
         "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
         "RTI (Region Token Injector)":     pipeline.region_token_extractor,
-        "Mask Cross-Attention":            pipeline.mask_cross_attn,
-        "Number Head (RTI cross-attn)":    pipeline.num_head,
-        "Category Head (MCQ/LR class.)":   pipeline.cat_head,
+        "Number Head (CrossAttn→Regr)":    pipeline.num_head,
+        "Category Head (Bilinear→Score)":  pipeline.cat_head,
     }
     custom_names = {
         "RTI (Region Token Injector)",
-        "Mask Cross-Attention",
-        "Number Head (RTI cross-attn)",
-        "Category Head (MCQ/LR class.)",
+        "Number Head (CrossAttn→Regr)",
+        "Category Head (Bilinear→Score)",
     }
     tied_names = {"Qwen LM Head (tied->Embed)"}
 

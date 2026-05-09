@@ -285,7 +285,6 @@ def main():
     if args.compile:
         print("  [*] Compiling model with torch.compile...")
         pipeline.qwen = torch.compile(pipeline.qwen)
-        pipeline.mask_cross_attn = torch.compile(pipeline.mask_cross_attn)
         pipeline.cat_head = torch.compile(pipeline.cat_head)
         pipeline.num_head = torch.compile(pipeline.num_head)
         
