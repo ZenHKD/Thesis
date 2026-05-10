@@ -7,3 +7,7 @@ result/
 
 model/qwen3.5-0.8b/
 model_micro/qwen3.5-micro/
+
+.venv/
+!checkpoints/micro/training_stage1.csv
+!checkpoints/micro/training_stage2.csv

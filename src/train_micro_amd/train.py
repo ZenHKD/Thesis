@@ -145,7 +145,7 @@ def main():
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--batch-size",  type=int,   default=1)
-    parser.add_argument("--grad-accum",  type=int,   default=8)
+    parser.add_argument("--grad-accum",  type=int,   default=32)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int,  default=500)
     parser.add_argument("--resolution",  default="320p",
@@ -165,7 +165,7 @@ def main():
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--init-weights", type=str,  default=None,
                         help="Load model weights only (no optimizer/step). Use for stage transitions.")
-    parser.add_argument("--num-workers", type=int,   default=2)
+    parser.add_argument("--num-workers", type=int,   default=16)
     # torch.compile disabled on AMD ROCm (unstable inductor backend)
     args = parser.parse_args()
 

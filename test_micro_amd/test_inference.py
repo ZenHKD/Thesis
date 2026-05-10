@@ -1,23 +1,22 @@
 """
-Test SpatialVLM Micro inference.
+Test SpatialVLM Micro inference (AMD ROCm).
 
 Usage:
     # No checkpoint (untrained pruned model):
-    python test_micro/test_inference.py
+    python test_micro_amd/test_inference.py
 
     # With checkpoint:
-    python test_micro/test_inference.py --step 20000
+    python test_micro_amd/test_inference.py --checkpoint checkpoints/micro/stage2/epoch_5
 
     # More options:
-    python test_micro/test_inference.py --step 20000 --num-samples 10 --split val
-    python test_micro/test_inference.py --step 20000 --sample-idx 0 5 10 15 20
+    python test_micro_amd/test_inference.py --checkpoint checkpoints/micro/stage2/epoch_5 --num-samples 30 --split val
+    python test_micro_amd/test_inference.py --checkpoint checkpoints/micro/stage2/epoch_5 --sample-idx 0 5 10 15 20
 """
 
 import sys
 import os
 import argparse
 import torch
-import re as _re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -180,7 +179,7 @@ def run_inference(pipeline, sample: dict, max_new_tokens: int = 20, repetition_p
     rle_list = rle_list[:n]
     decoded_masks = decoded_masks[:n]
 
-    # Step 1: Generate text tokens (always T_max loops)
+    # Step 1: Generate text tokens
     output_ids = pipeline.generate(
         pixel_values, pixel_values_rgb, image_grid_thw, depth_map, input_ids,
         rle_list=[rle_list],
@@ -196,28 +195,22 @@ def run_inference(pipeline, sample: dict, max_new_tokens: int = 20, repetition_p
     raw_output = raw_full.strip()
     parsed = pipeline.parse_output(raw_output)
 
-    # Step 2: For numeric categories, get num_pred via forward pass
+    # Step 2: For numeric/categorical, get predictions via forward pass
     num_pred_val = None
     cat_pred_idx = None
 
-    _clean_pattern = _re.compile(
-        r'^(distance|count)\s*\|\s*<\|num\|>$'
-    )
-    _cat_pattern = _re.compile(
-        r'^(mcq|left_right)\s*\|\s*<\|cat\|>$'
-    )
+    # Check for special token IDs directly in generated output
+    gen_ids_list = output_ids[0].tolist()
+    has_num_token = NUM_TOKEN_ID in gen_ids_list
+    has_cat_token = CAT_TOKEN_ID in gen_ids_list
 
-    # Check raw output for clean format
-    is_clean = bool(_clean_pattern.match(raw_full))
-    is_cat_clean = bool(_cat_pattern.match(raw_full))
-
-    if is_clean and parsed["category"] in ("distance", "count"):
+    if parsed["category"] in ("distance", "count") and has_num_token:
         full_generated_ids = torch.cat([input_ids, output_ids], dim=1)
-        gen_ids_list = full_generated_ids[0].tolist()
+        full_ids_list = full_generated_ids[0].tolist()
         num_token_pos = -1
         
-        for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
-            if gen_ids_list[idx_pos] == NUM_TOKEN_ID:
+        for idx_pos in range(len(full_ids_list) - 1, -1, -1):
+            if full_ids_list[idx_pos] == NUM_TOKEN_ID:
                 num_token_pos = idx_pos
                 break
 
@@ -235,13 +228,13 @@ def run_inference(pipeline, sample: dict, max_new_tokens: int = 20, repetition_p
             )
             num_pred_val = output["num_pred"][0].item()
 
-    elif is_cat_clean and parsed["category"] in ("mcq", "left_right"):
+    elif parsed["category"] in ("mcq", "left_right") and has_cat_token:
         full_generated_ids = torch.cat([input_ids, output_ids], dim=1)
-        gen_ids_list = full_generated_ids[0].tolist()
+        full_ids_list = full_generated_ids[0].tolist()
         cat_token_pos = -1
         
-        for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
-            if gen_ids_list[idx_pos] == CAT_TOKEN_ID:
+        for idx_pos in range(len(full_ids_list) - 1, -1, -1):
+            if full_ids_list[idx_pos] == CAT_TOKEN_ID:
                 cat_token_pos = idx_pos
                 break
 
@@ -275,7 +268,7 @@ def run_inference(pipeline, sample: dict, max_new_tokens: int = 20, repetition_p
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Test SpatialVLM Micro inference")
+    parser = argparse.ArgumentParser(description="Test SpatialVLM Micro inference (AMD ROCm)")
     parser.add_argument("--checkpoint",     type=str, default=None,
                         help="Path to full checkpoint dir (e.g. checkpoints/micro/stage2/epoch_2)")
     parser.add_argument("--step",           type=int, default=None,
@@ -286,7 +279,7 @@ def main():
                         help="Device to run on (only cuda is supported)")
     parser.add_argument("--dtype",          default="bfloat16",
                         choices=["bfloat16", "float32"])
-    parser.add_argument("--attn-impl",      default="flash_attention_2",
+    parser.add_argument("--attn-impl",      default="sdpa",
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
@@ -333,6 +326,9 @@ def main():
         ckpt_label = f"step_{args.step}"
     else:
         print("  Using untrained pruned model (no checkpoint)")
+
+    # torch.compile disabled on AMD ROCm
+    print("  [*] torch.compile disabled (AMD ROCm)")
     pipeline.eval()
 
     print(f"\n  Decoder Layers: 24 (single pass)")
@@ -368,22 +364,14 @@ def main():
     N = len(selected)
     print(f"  Selected {N} samples: {selected[:10]}{'...' if N > 10 else ''}")
 
-    # Load samples
+    # Load samples on-the-fly
     samples = []
     for idx in selected:
         try:
             s = dataset[idx]
             entry = dataset.data[idx]
-            from PIL import Image
-            img = Image.open(
-                os.path.join(dataset.image_dir, entry["image"])
-            ).convert("RGB")
-            if target_size:
-                img = img.resize(target_size, Image.LANCZOS)
             question_raw = entry["conversations"][0]["value"]
-            question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
-            s["_image"] = img
-            s["_question"] = question
+            s["_question"] = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
             s["idx"] = idx
             samples.append(s)
         except Exception as e:

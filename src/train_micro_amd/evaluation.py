@@ -88,10 +88,10 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
 
     B = len(batch_samples)
     
-    # Stack visual tensors
-    pixel_values = torch.stack([s["pixel_values"] for s in batch_samples]).to(device=dev, dtype=dtype)
+    # Batch visual tensors (match collate_fn: cat for pixel_values/image_grid_thw, stack for rgb/depth)
+    pixel_values = torch.cat([s["pixel_values"] for s in batch_samples], dim=0).to(device=dev, dtype=dtype)
     pixel_values_rgb = torch.stack([s["pixel_values_rgb"] for s in batch_samples]).to(device=dev, dtype=dtype)
-    image_grid_thw = torch.stack([s["image_grid_thw"] for s in batch_samples]).to(device=dev)
+    image_grid_thw = torch.cat([s["image_grid_thw"] for s in batch_samples], dim=0).to(device=dev)
     depth_maps = torch.stack([s["depth_map"] for s in batch_samples]).to(device=dev, dtype=dtype)
 
     prompts = []
@@ -116,7 +116,8 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
             "  count | <|num|><|im_end|>\n"
         )
         
-        h_p, w_p = s["image_grid_thw"][1].item(), s["image_grid_thw"][2].item()
+        # image_grid_thw per sample is [1, 3] from processor
+        h_p, w_p = s["image_grid_thw"][0, 1].item(), s["image_grid_thw"][0, 2].item()
         h_vis, w_vis = h_p // 2, w_p // 2
         num_visual_tokens = int(h_vis * w_vis)
         
@@ -162,8 +163,6 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
     )
 
     results = []
-    _clean_pattern = _re.compile(r'^(distance|count)\s*\|\s*<\|num\|>')
-    _cat_pattern = _re.compile(r'^(mcq|left_right)\s*\|\s*<\|cat\|>')
 
     for b in range(B):
         # Decode only the newly generated tokens
@@ -174,53 +173,70 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
         num_pred_val = None
         cat_pred_idx = None
 
-        is_clean = bool(_clean_pattern.match(raw_full))
-        is_cat_clean = bool(_cat_pattern.match(raw_full))
+        # Strip left-padding from input_ids so position IDs start at 0
+        # for real tokens (matching val.py's right-padding behavior)
+        non_pad_mask = attention_mask[b].bool()
+        clean_input_ids = input_ids[b][non_pad_mask]  # [L_real]
+        pad_offset = (~non_pad_mask).sum().item()
 
-        if is_clean and parsed["category"] in ("distance", "count"):
-            full_generated_ids = torch.cat([input_ids[b].unsqueeze(0), output_ids[b].unsqueeze(0)], dim=1)
-            gen_ids_list = full_generated_ids[0].tolist()
+        # Adjust mask positions by subtracting the padding offset
+        clean_mask_positions = [p - pad_offset for p in mask_positions_list[b]]
+
+        # Per-sample tensors for second forward pass (original shapes from dataloader)
+        s_pv = batch_samples[b]["pixel_values"].to(device=dev, dtype=dtype)       # [patches, C]
+        s_rgb = batch_samples[b]["pixel_values_rgb"].unsqueeze(0).to(device=dev, dtype=dtype)  # [1, 3, H, W]
+        s_grid = batch_samples[b]["image_grid_thw"].to(device=dev)                # [1, 3]
+        s_depth = batch_samples[b]["depth_map"].unsqueeze(0).to(device=dev, dtype=dtype)       # [1, H, W]
+
+        # Check for special token IDs directly in generated output
+        gen_ids_list = output_ids[b].tolist()
+        has_num_token = NUM_TOKEN_ID in gen_ids_list
+        has_cat_token = CAT_TOKEN_ID in gen_ids_list
+
+        if parsed["category"] in ("distance", "count") and has_num_token:
+            full_generated_ids = torch.cat([clean_input_ids.unsqueeze(0), output_ids[b].unsqueeze(0)], dim=1)
+            full_ids_list = full_generated_ids[0].tolist()
             num_token_pos = -1
-            for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
-                if gen_ids_list[idx_pos] == NUM_TOKEN_ID:
+            for idx_pos in range(len(full_ids_list) - 1, -1, -1):
+                if full_ids_list[idx_pos] == NUM_TOKEN_ID:
                     num_token_pos = idx_pos
                     break
 
             if num_token_pos >= 0:
                 out = pipeline(
-                    pixel_values=pixel_values[b].unsqueeze(0),
-                    pixel_values_rgb=pixel_values_rgb[b].unsqueeze(0),
-                    image_grid_thw=image_grid_thw[b].unsqueeze(0),
-                    depth_maps=depth_maps[b].unsqueeze(0),
+                    pixel_values=s_pv,
+                    pixel_values_rgb=s_rgb,
+                    image_grid_thw=s_grid,
+                    depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
                     rle_list=[rle_lists[b]],
-                    mask_token_positions=[mask_positions_list[b]],
+                    mask_token_positions=[clean_mask_positions],
                     decoded_masks=[decoded_masks_lists[b]],
                     num_token_positions=[num_token_pos],
                 )
                 if out.get("num_pred") is not None:
                     num_pred_val = out["num_pred"][0].item()
 
-        elif is_cat_clean and parsed["category"] in ("mcq", "left_right"):
-            full_generated_ids = torch.cat([input_ids[b].unsqueeze(0), output_ids[b].unsqueeze(0)], dim=1)
-            gen_ids_list = full_generated_ids[0].tolist()
+        elif parsed["category"] in ("mcq", "left_right") and has_cat_token:
+            full_generated_ids = torch.cat([clean_input_ids.unsqueeze(0), output_ids[b].unsqueeze(0)], dim=1)
+            full_ids_list = full_generated_ids[0].tolist()
             cat_token_pos = -1
-            for idx_pos in range(len(gen_ids_list) - 1, -1, -1):
-                if gen_ids_list[idx_pos] == CAT_TOKEN_ID:
+            for idx_pos in range(len(full_ids_list) - 1, -1, -1):
+                if full_ids_list[idx_pos] == CAT_TOKEN_ID:
                     cat_token_pos = idx_pos
                     break
 
             if cat_token_pos >= 0:
                 out = pipeline(
-                    pixel_values=pixel_values[b].unsqueeze(0),
-                    pixel_values_rgb=pixel_values_rgb[b].unsqueeze(0),
-                    image_grid_thw=image_grid_thw[b].unsqueeze(0),
-                    depth_maps=depth_maps[b].unsqueeze(0),
+                    pixel_values=s_pv,
+                    pixel_values_rgb=s_rgb,
+                    image_grid_thw=s_grid,
+                    depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
                     rle_list=[rle_lists[b]],
-                    mask_token_positions=[mask_positions_list[b]],
+                    mask_token_positions=[clean_mask_positions],
                     decoded_masks=[decoded_masks_lists[b]],
                     cat_token_positions=[cat_token_pos],
                 )
@@ -287,7 +303,7 @@ def main():
         
     pipeline.eval()
 
-    # Load dataset
+     # Load dataset
     print(f"\n{'='*70}")
     print(f"LOADING DATASET  (split={args.split}, resolution={args.resolution}, batch_size={args.batch_size})")
     print(f"{'='*70}")
@@ -300,23 +316,6 @@ def main():
     
     N = len(dataset)
     print(f"  Total validation entries: {N}")
-
-    samples = []
-    for idx in tqdm(range(N), desc="Loading items into memory"):
-        s = dataset[idx]
-        entry = dataset.data[idx]
-        from PIL import Image
-        img = Image.open(
-            os.path.join(dataset.image_dir, entry["image"])
-        ).convert("RGB")
-        if target_size:
-            img = img.resize(target_size, Image.LANCZOS)
-        question_raw = entry["conversations"][0]["value"]
-        question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
-        s["_image"] = img
-        s["_question"] = question
-        s["idx"] = idx
-        samples.append(s)
 
     print(f"\n{'='*70}")
     print(f"EVALUATING SAMPLES")
@@ -331,10 +330,21 @@ def main():
     num_thresholds = [0.10, 0.15, 0.20]
     num_thresh_results = {t: {cat: {"correct": 0, "total": 0} for cat in ["count", "distance"]} for t in num_thresholds}
 
-    # Group into batches
-    batches = [samples[i:i + args.batch_size] for i in range(0, N, args.batch_size)]
+    # Build batches on-the-fly (no preloading into memory)
+    num_batches = (N + args.batch_size - 1) // args.batch_size
 
-    for batch_idx, batch_samples in enumerate(tqdm(batches, desc="Inference Progress")):
+    for batch_idx in tqdm(range(num_batches), desc="Inference Progress"):
+        start = batch_idx * args.batch_size
+        end = min(start + args.batch_size, N)
+
+        batch_samples = []
+        for idx in range(start, end):
+            s = dataset[idx]
+            entry = dataset.data[idx]
+            question_raw = entry["conversations"][0]["value"]
+            s["_question"] = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
+            batch_samples.append(s)
+
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -352,6 +362,9 @@ def main():
             cat = s["category"]
             gt = str(s.get("answer", ""))
             gt_clean = gt.strip('"')
+            # Strip special token prefix: "<|num|>=3" → "3", "<|cat|>=left" → "left"
+            if "=" in gt_clean:
+                gt_clean = gt_clean.split("=", 1)[1]
 
             pred_cat = result.get("category", "unknown")
             if pred_cat not in categories:
