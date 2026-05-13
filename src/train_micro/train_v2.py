@@ -1,5 +1,5 @@
 """
-SpatialVLM Micro Training — Full Fine-tuning (AMD ROCm)
+SpatialVLM Micro Training — Full Fine-tuning
 ==========================================================
 
 All components trainable from epoch 1:
@@ -37,13 +37,13 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
-from model_micro.pipeline import SpatialVLM, print_vram_usage
+from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage
 from model_micro.loss import SpatialLoss
-from src.train_micro_amd.val import validate
+from src.train_micro.val import validate
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CHECKPOINT_BASE = os.path.join(PROJECT_DIR, "checkpoints", "micro")
+CHECKPOINT_BASE = os.path.join(PROJECT_DIR, "checkpoints", "micro_v2")
 
 
 # =========================================================================
@@ -123,8 +123,8 @@ def main():
     # Model
     parser.add_argument("--device",      default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",       default="bfloat16", choices=["bfloat16", "float32"])
-    parser.add_argument("--attn-impl",   default="sdpa",
-                        choices=["sdpa", "eager"])
+    parser.add_argument("--attn-impl",   default="flash_attention_2",
+                        choices=["flash_attention_2", "sdpa", "eager"])
     # Training
     parser.add_argument("--split",       default="train", choices=["train", "train_balanced", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=1)
@@ -132,20 +132,22 @@ def main():
                         help="Training stage: 1=freeze decoder (train vision+RTI+Embed+LM_Head+CustomHeads), "
                              "2=full fine-tuning (all trainable)")
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
-    parser.add_argument("--lr-backbone", type=float, default=1e-6)
-    parser.add_argument("--lr-rti",      type=float, default=5e-5)
-    parser.add_argument("--lr-numhead",  type=float, default=5e-5)
-    parser.add_argument("--lr-c",        type=float, default=5e-5,
+    parser.add_argument("--lr-backbone", type=float, default=2e-5)
+    parser.add_argument("--lr-rti",      type=float, default=1e-4)
+    parser.add_argument("--lr-numhead",  type=float, default=5e-4)
+    parser.add_argument("--lr-c",        type=float, default=1e-4,
                         help="Learning rate for Category Head")
-    parser.add_argument("--alpha",       type=float, default=0.5,
-                        help="Weight for SmoothL1 loss (α in L)")
-    parser.add_argument("--gamma",       type=float, default=2.0,
-                        help="Weight for Category Focal Loss (γ in L)")
+    parser.add_argument("--weight-sl1",  type=float, default=2.0,
+                        help="Weight for SmoothL1 loss")
+    parser.add_argument("--weight-cat",  type=float, default=2.0,
+                        help="Weight for Category Focal Loss")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Exponent for Focal Loss")
     parser.add_argument("--label-smoothing", type=float, default=0.0,
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--batch-size",  type=int,   default=1)
-    parser.add_argument("--grad-accum",  type=int,   default=32)
+    parser.add_argument("--grad-accum",  type=int,   default=8)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int,  default=500)
     parser.add_argument("--resolution",  default="320p",
@@ -154,10 +156,10 @@ def main():
                         help="Enable gradient checkpointing (saves VRAM, slower)")
     # Validation
     parser.add_argument("--val-split",   default="val")
-    parser.add_argument("--val-batch-size", type=int, default=2)
+    parser.add_argument("--val-batch-size", type=int, default=4)
     parser.add_argument("--val-max-samples", type=int, default=None,
                         help="Limit val samples (None = full val set)")
-    parser.add_argument("--val-steps", type=int, default=1000,
+    parser.add_argument("--val-steps", type=int, default=500,
                     help="Run validation every N steps (0 to disable)")
     # Logging & Checkpointing
     parser.add_argument("--log-steps",   type=int,   default=100)
@@ -165,21 +167,16 @@ def main():
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--init-weights", type=str,  default=None,
                         help="Load model weights only (no optimizer/step). Use for stage transitions.")
-    parser.add_argument("--num-workers", type=int,   default=16)
-    # torch.compile disabled on AMD ROCm (unstable inductor backend)
+    parser.add_argument("--num-workers", type=int,   default=2)
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile on the Qwen backbone")
     args = parser.parse_args()
 
-    # AMD ROCm: check bfloat16 support, fallback to float16
-    if args.dtype == "bfloat16":
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-        else:
-            print("  [!] bfloat16 not supported on this GPU, falling back to float16")
-            dtype = torch.float16
-    else:
-        dtype = torch.float32
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
-    # AMD ROCm: no TF32 (NVIDIA-only), enable MIOpen benchmark
+    # Enable TF32 for Ampere GPUs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
     CHECKPOINT_DIR = os.path.join(CHECKPOINT_BASE, f"stage{args.stage}")
@@ -200,9 +197,12 @@ def main():
     )
     print_vram_usage("after model load")
 
-    # torch.compile skipped on AMD ROCm
-    print("  [*] torch.compile disabled (AMD ROCm)")
-
+    if args.compile:
+        print("  [*] Compiling Qwen backbone, custom heads, and RTI with torch.compile...")
+        pipeline.qwen = torch.compile(pipeline.qwen)
+        pipeline.cat_head = torch.compile(pipeline.cat_head)
+        pipeline.num_head = torch.compile(pipeline.num_head)
+        pipeline.region_token_extractor = torch.compile(pipeline.region_token_extractor)
 
     # Load weights from a previous stage (no optimizer/step restore)
     if args.init_weights:
@@ -316,7 +316,12 @@ def main():
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(total_steps - args.warmup_steps, 1), eta_min=1e-6,
     )
-    criterion = SpatialLoss(alpha=args.alpha, gamma=args.gamma, label_smoothing=args.label_smoothing)
+    criterion = SpatialLoss(
+        weight_sl1=args.weight_sl1,
+        weight_cat=args.weight_cat,
+        focal_gamma=args.focal_gamma,
+        label_smoothing=args.label_smoothing
+    )
     dev = pipeline.device
 
     # ====================================================================
@@ -368,7 +373,7 @@ def main():
     print("=" * 70)
     print(f"  stage={args.stage}  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  "
           f"lr_rti={args.lr_rti}  lr_numhead={args.lr_numhead}  lr_c={args.lr_c}")
-    print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}  alpha={args.alpha}  gamma={args.gamma}")
+    print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}  weight_sl1={args.weight_sl1}  weight_cat={args.weight_cat}")
     print()
 
     pipeline.train()
@@ -430,8 +435,7 @@ def main():
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     tqdm.write(f"  [!] OOM at batch {batch_idx}, skipping")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
                     optimizer.zero_grad(set_to_none=True)
                     continue
                 raise
@@ -535,8 +539,7 @@ def main():
                 if args.val_steps > 0 and global_step % args.val_steps == 0 and global_step > 0:
                     print(f"\n  [{'='*70}]")
                     print(f"  Running validation at step {global_step}...")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
 
                     val_results = validate(
                         pipeline, criterion, pipeline.processor,

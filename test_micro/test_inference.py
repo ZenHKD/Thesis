@@ -408,6 +408,9 @@ def main():
         cat = s["category"]
         gt = str(s.get("answer", ""))
         gt_clean = gt.strip('"')
+        # Strip special token prefix: "<|num|>=3" → "3", "<|cat|>=left" → "left"
+        if "=" in gt_clean:
+            gt_clean = gt_clean.split("=", 1)[1]
 
         print(f"\n{'--'*35}")
         print(f"  Sample [{s['idx']}]: {s['image_name']}  |  "

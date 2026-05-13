@@ -65,13 +65,21 @@ def extract_archives(local_dir: Path) -> None:
                 continue
 
             print(f"  [{split}/{subdir}]  found {len(archives)} archive(s)")
-            for archive_path in tqdm(archives, desc=f"  {split}/{subdir}", unit="file"):
-                with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(path=str(folder))
+            
+            # Optimize using subprocess and Linux commands for multi-threading (much faster than tarfile)
+            import subprocess
+            
+            # find: locate all tar.gz files
+            # xargs -P 8: run up to 8 tar processes in parallel
+            extract_cmd = f"find {folder} -maxdepth 1 -name 'chunk_*.tar.gz' -print0 | xargs -0 -P 8 -I {{}} tar -xzf {{}} -C {folder}"
+            
+            print(f"  >> Running parallel extraction (xargs -P 8 tar -xzf)...")
+            subprocess.run(extract_cmd, shell=True, check=True)
 
-            # Remove archives to save disk space
-            for archive_path in archives:
-                os.remove(archive_path)
+            # Fast deletion of archives using find -delete
+            rm_cmd = f"find {folder} -maxdepth 1 -name 'chunk_*.tar.gz' -delete"
+            print(f"  >> Cleaning up .tar.gz archives...")
+            subprocess.run(rm_cmd, shell=True, check=True)
 
     print("\n Extraction complete.\n")
 

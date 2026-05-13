@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.dataloader.dataloader import SpatialVLMDataset, get_dataloader
-from model_micro.pipeline import SpatialVLM, print_vram_usage
+from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage
 from model_micro.loss import SpatialLoss
 
 
@@ -388,9 +388,23 @@ def main():
     print(f"    embed_tokens.weight: grad={'has grad (TRAINABLE, correct)' if embed_ok else 'NO GRAD (unexpected!)'}")
 
     print(f"\n{'='*70}")
-    print("GRADIENT CHECK — RTI")
+    print("GRADIENT CHECK — RTI (Full)")
     print("=" * 70)
     rti_ok, rti_issues = check_gradients(pipeline.region_token_extractor, "RTI")
+
+    print(f"\n{'='*70}")
+    print("GRADIENT CHECK — RTI Sub-components")
+    print("=" * 70)
+    print("1. RGB U-Net (Encoder + Decoder)")
+    check_gradients(pipeline.region_token_extractor.rgb_encoder, "  RTI RGB Encoder")
+    check_gradients(pipeline.region_token_extractor.rgb_decoder, "  RTI RGB Decoder")
+
+    print("\n2. Depth U-Net (Encoder + Decoder)")
+    check_gradients(pipeline.region_token_extractor.depth_encoder, "  RTI Depth Encoder")
+    check_gradients(pipeline.region_token_extractor.depth_decoder, "  RTI Depth Decoder")
+
+    print("\n3. Geo CNN Encoder")
+    check_gradients(pipeline.region_token_extractor.geo_encoder, "  RTI Geo CNN")
 
     print(f"\n{'='*70}")
     print("GRADIENT CHECK — Number Head")

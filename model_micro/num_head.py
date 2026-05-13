@@ -79,10 +79,10 @@ class NumberHead(nn.Module):
             batch_first=True,
         )
 
-        # Regression: concat(query, attended) → scalar
+        # Regression: concat(query, attended, gated_sum) → scalar
         self.regression = nn.Sequential(
-            nn.LayerNorm(proj_dim * 2),
-            nn.Linear(proj_dim * 2, proj_dim),
+            nn.LayerNorm(proj_dim * 3),
+            nn.Linear(proj_dim * 3, proj_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(proj_dim, 1),
@@ -116,13 +116,23 @@ class NumberHead(nn.Module):
             rti_i = rti_list[i]  # [N_masks, mask_feat_dim]
             kv = self.kv_proj(rti_i).unsqueeze(0)  # [1, N_masks, proj_dim]
 
-            # Cross-attention: query attends to mask features
+            # 1. Softmax Cross-attention: Good for averaging features (Distance task)
             attended, _ = self.cross_attn(q, kv, kv)  # [1, 1, proj_dim]
 
-            # Concat query + attended → regression
-            q_flat = q.squeeze(0)             # [1, proj_dim]
+            # 2. Sigmoid Gated Sum: Good for preserving magnitude (Count task)
+            q_flat = q.squeeze(0)              # [1, proj_dim]
+            kv_flat = kv.squeeze(0)            # [N_masks, proj_dim]
+            
+            # Calculate independent relevance score for each mask (no sum=1 constraint)
+            relevance = torch.matmul(q_flat, kv_flat.transpose(0, 1)) / (self.proj_dim ** 0.5)
+            gate = torch.sigmoid(relevance)    # [1, N_masks] (Values 0.0 -> 1.0 for each mask independently)
+            
+            # Aggregate relevant masks via summation (Preserves magnitude for counting)
+            gated_sum = torch.matmul(gate, kv_flat) # [1, proj_dim]
+
+            # 3. Concat query + attended (Softmax) + gated_sum (Sigmoid) → regression
             att_flat = attended.squeeze(0)     # [1, proj_dim]
-            combined = torch.cat([q_flat, att_flat], dim=-1)  # [1, 2*proj_dim]
+            combined = torch.cat([q_flat, att_flat, gated_sum], dim=-1)  # [1, 3*proj_dim]
 
             pred = self.regression(combined).squeeze(-1)  # [1]
             preds.append(pred)

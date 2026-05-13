@@ -1,17 +1,17 @@
 """
-SpatialVLM Micro — CE + SmoothL1 + CategoryCE
+SpatialVLM Micro — CE + SmoothL1 + Category Focal Loss
 ============================================================================
 
 Training loss:
 
-    L = CE(label_smoothing=0.1) + α · L_SmoothL1 + γ · L_CatCE
+    L = CE(label_smoothing) + weight_sl1 · L_SmoothL1 + weight_cat · L_CatFocal
 
 Where:
     - CE:         Cross-entropy on LM head output (single pass, no per-step)
     - L_SmoothL1: SmoothL1 (Huber) on Number Head predictions (distance + count)
-    - L_CatCE:    Cross-entropy on Category Head predictions (mcq + left_right)
-    - α:          Weight for SmoothL1 (default 0.1)
-    - γ:          Weight for CategoryCE (default 1.0)
+    - L_CatFocal: Focal Loss on Category Head predictions (mcq + left_right)
+    - weight_sl1: Weight for SmoothL1 loss (default 0.5)
+    - weight_cat: Weight for Category Focal loss (default 2.0)
 """
 
 import torch
@@ -25,29 +25,30 @@ class SpatialLoss(nn.Module):
     Combines:
         1. Cross-entropy loss on LM head output
         2. SmoothL1 loss for numeric regression (Number Head)
-        3. Cross-entropy loss for category classification (Category Head)
+        3. Focal loss for category classification (Category Head)
 
     Args:
-        alpha:           Weight for SmoothL1 loss relative to CE loss.
-        gamma:           Weight for CategoryCE loss relative to CE loss.
+        weight_sl1:      Weight for SmoothL1 loss relative to CE loss.
+        weight_cat:      Weight for Category Focal loss relative to CE loss.
         ignore_index:    Token index to ignore in CE loss (default: -100).
         label_smoothing: Label smoothing for CE loss (default: 0.1).
+        focal_gamma:     Exponent for Focal Loss.
     """
 
     def __init__(
         self,
-        alpha: float = 0.1,
-        gamma: float = 1.0,
+        weight_sl1: float = 0.5,
+        weight_cat: float = 2.0,
         ignore_index: int = -100,
         label_smoothing: float = 0.1,
-        beta: float = 0.05,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.weight_sl1 = weight_sl1
+        self.weight_cat = weight_cat
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
-        self.beta = beta
+        self.focal_gamma = focal_gamma
 
     def forward(
         self,
@@ -82,25 +83,22 @@ class SpatialLoss(nn.Module):
                 label_smoothing=self.label_smoothing,
             )
 
-        # --- 2. SmoothL1 loss (Number Head) with Dynamic Beta ---
+        # --- 2. Log-L1 Loss (Number Head) for Scale & Relative Invariance ---
         if is_numeric.any():
             pred = num_pred[is_numeric].float()
             target = num_gt[is_numeric].float()
             
-            abs_diff = torch.abs(pred - target)
+            # Clamp prediction to be non-negative to avoid NaN in log
+            pred = torch.clamp(pred, min=0.0)
             
-            # Target-Scaled Dynamic Beta (L2 zone proportional to target magnitude)
-            # count=1 → β=0.05, count=3 → β=0.15, distance=10m → β=0.50
-            dynamic_beta = torch.abs(target) * self.beta + 1e-6
+            # Convert to log space (add 1 to prevent log(0))
+            # This compresses large distances and naturally penalizes relative percentage errors.
+            log_pred = torch.log(pred + 1.0)
+            log_target = torch.log(target + 1.0)
             
-            # SmoothL1 with dynamic beta (no relative error penalty)
-            smooth_l1 = torch.where(
-                abs_diff < dynamic_beta,
-                0.5 * abs_diff**2 / dynamic_beta,
-                abs_diff - 0.5 * dynamic_beta
-            )
-            
-            loss_sl1 = smooth_l1.mean()
+            # SmoothL1 in Log space (Huber Log Loss). 
+            # beta=0.1 means if relative error is <10%, use L2. Otherwise L1.
+            loss_sl1 = F.smooth_l1_loss(log_pred, log_target, reduction='mean', beta=0.1)
         else:
             loss_sl1 = torch.tensor(0.0, device=lm_targets.device)
 
@@ -117,16 +115,16 @@ class SpatialLoss(nn.Module):
                     
                     # Validate target index is within range
                     if target_b.item() < logits_b.shape[1]:
-                        # Focal loss implementation (alpha=0.25, gamma=2.0)
+                        # Focal loss implementation (alpha=1.0)
                         ce_loss = F.cross_entropy(logits_b, target_b, reduction='none')
                         pt = torch.exp(-ce_loss)
-                        f_loss = 0.25 * ((1 - pt) ** 2.0) * ce_loss
+                        f_loss = ((1 - pt) ** self.focal_gamma) * ce_loss
                         cat_losses.append(f_loss.mean())
             
             if cat_losses:
                 loss_cat = torch.stack(cat_losses).mean()
 
-        total = loss_ce + self.alpha * loss_sl1 + self.gamma * loss_cat
+        total = loss_ce + self.weight_sl1 * loss_sl1 + self.weight_cat * loss_cat
 
         if return_components:
             return total, {

@@ -1,5 +1,5 @@
 """
-Evaluate SpatialVLM Micro on a full dataset split. (AMD ROCm)
+Evaluate SpatialVLM Micro on a full dataset split.
 
 Usage:
     python src/train_micro/evaluation.py --checkpoint checkpoints/micro/stage2/epoch_2 --split val
@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
+from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage, find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
 from src.dataloader.dataloader import SpatialVLMDataset
 
 # Paths
@@ -265,8 +265,8 @@ def main():
     parser.add_argument("--split",          default="val",
                         choices=["train", "val", "test", "train_sample"])
     parser.add_argument("--device",         default="cuda", choices=["cuda"])
-    parser.add_argument("--attn-impl",      default="sdpa",
-                        choices=["sdpa", "eager"])
+    parser.add_argument("--attn-impl",      default="flash_attention_2",
+                        choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--batch-size",     type=int, default=1,
@@ -298,12 +298,15 @@ def main():
     print(f"\n  Loading checkpoint...")
     load_checkpoint_weights(pipeline, ckpt_path)
     
-    # torch.compile disabled on AMD ROCm
-    print("  [*] torch.compile disabled (AMD ROCm)")
+    if args.compile:
+        print("  [*] Compiling model with torch.compile...")
+        pipeline.qwen = torch.compile(pipeline.qwen)
+        pipeline.cat_head = torch.compile(pipeline.cat_head)
+        pipeline.num_head = torch.compile(pipeline.num_head)
         
     pipeline.eval()
 
-     # Load dataset
+    # Load dataset
     print(f"\n{'='*70}")
     print(f"LOADING DATASET  (split={args.split}, resolution={args.resolution}, batch_size={args.batch_size})")
     print(f"{'='*70}")
