@@ -106,10 +106,17 @@ def validate(pipeline, criterion, processor, resolution="320p",
         is_categorical = batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev)
         target_cat = batch.get("target_cat_index", torch.zeros(1)).to(dev)
 
+        # Build is_distance mask for domain-aware MSE normalization
+        is_distance = torch.tensor(
+            [c == "distance" for c in batch["categories"]],
+            dtype=torch.bool, device=dev,
+        )
+
         loss, components = criterion(
             logits, labels,
             num_pred, batch["target_num"].to(dev),
             is_numeric,
+            num_is_distance=is_distance,
             cat_logits=cat_logits,
             cat_targets=target_cat,
             is_categorical=is_categorical,
@@ -229,7 +236,7 @@ def main():
             pipeline.load_state_dict(ckpt["model_state_dict"], strict=False)
         print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    criterion = SpatialLoss(alpha=1.0, gamma=1.0)
+    criterion = SpatialLoss()
 
     results = validate(
         pipeline, criterion, pipeline.processor,

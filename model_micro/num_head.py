@@ -137,4 +137,4 @@ class NumberHead(nn.Module):
             pred = self.regression(combined).squeeze(-1)  # [1]
             preds.append(pred)
 
-        return F.softplus(torch.cat(preds))  # [B_num]
+        return torch.relu(torch.cat(preds))  # [B_num]

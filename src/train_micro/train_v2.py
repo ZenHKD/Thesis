@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--attn-impl",   default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
-    parser.add_argument("--split",       default="train", choices=["train", "train_balanced", "train_sample"])
+    parser.add_argument("--split",       default="train_balanced", choices=["train", "train_balanced", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=1)
     parser.add_argument("--stage",       type=int,   default=2, choices=[1, 2],
                         help="Training stage: 1=freeze decoder (train vision+RTI+Embed+LM_Head+CustomHeads), "
@@ -134,12 +134,12 @@ def main():
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
     parser.add_argument("--lr-backbone", type=float, default=2e-5)
     parser.add_argument("--lr-rti",      type=float, default=1e-4)
-    parser.add_argument("--lr-numhead",  type=float, default=5e-4)
+    parser.add_argument("--lr-numhead",  type=float, default=1e-4)
     parser.add_argument("--lr-c",        type=float, default=1e-4,
                         help="Learning rate for Category Head")
-    parser.add_argument("--weight-sl1",  type=float, default=2.0,
+    parser.add_argument("--weight-sl1",  type=float, default=1.0,
                         help="Weight for SmoothL1 loss")
-    parser.add_argument("--weight-cat",  type=float, default=2.0,
+    parser.add_argument("--weight-cat",  type=float, default=1.0,
                         help="Weight for Category Focal Loss")
     parser.add_argument("--focal-gamma", type=float, default=2.0,
                         help="Exponent for Focal Loss")
@@ -147,9 +147,9 @@ def main():
                         help="Label smoothing factor for CrossEntropy (0.0 for modern LLMs)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--batch-size",  type=int,   default=1)
-    parser.add_argument("--grad-accum",  type=int,   default=8)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--warmup-steps", type=int,  default=500)
+    parser.add_argument("--grad-accum",  type=int,   default=16)
+    parser.add_argument("--max-grad-norm", type=float, default=2.0)
+    parser.add_argument("--warmup-steps", type=int,  default=1000)
     parser.add_argument("--resolution",  default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
     parser.add_argument("--grad-ckpt", action="store_true",
@@ -167,7 +167,7 @@ def main():
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--init-weights", type=str,  default=None,
                         help="Load model weights only (no optimizer/step). Use for stage transitions.")
-    parser.add_argument("--num-workers", type=int,   default=2)
+    parser.add_argument("--num-workers", type=int,   default=4)
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile on the Qwen backbone")
     args = parser.parse_args()
@@ -444,10 +444,17 @@ def main():
             num_pred = output["num_pred"]
             cat_logits = output.get("cat_logits", None)
 
+            # Build is_distance mask for domain-aware MSE normalization
+            is_distance = torch.tensor(
+                [c == "distance" for c in batch["categories"]],
+                dtype=torch.bool, device=dev,
+            )
+
             loss = criterion(
                 logits, labels,
                 num_pred, batch["target_num"].to(dev),
                 batch["is_numeric"].to(dev),
+                num_is_distance=is_distance,
                 cat_logits=cat_logits,
                 cat_targets=batch.get("target_cat_index", torch.zeros(1)).to(dev),
                 is_categorical=batch.get("is_categorical", torch.zeros(1, dtype=torch.bool)).to(dev),

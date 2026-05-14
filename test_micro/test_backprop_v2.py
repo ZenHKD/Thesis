@@ -61,7 +61,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test Micro backpropagation (full fine-tuning)")
     parser.add_argument("--device",    default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--dtype",     default="bfloat16", choices=["bfloat16", "float32"])
-    parser.add_argument("--attn-impl", default="flash_attention_2",
+    parser.add_argument("--attn-impl", default="sdpa",
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution", default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
@@ -275,7 +275,7 @@ def main():
     print(f"  cat_logits:      {[cl.shape if cl is not None else None for cl in cat_logits] if cat_logits else None}")
 
     # Loss (Uniform CE + SmoothL1 + CategoryCE)
-    criterion = SpatialLoss(alpha=0.1, gamma=0.5)
+    criterion = SpatialLoss()
     loss = criterion(
         logits, labels,
         num_pred, batch["target_num"].to(dev),

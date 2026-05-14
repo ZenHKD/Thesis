@@ -218,9 +218,9 @@ def main():
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         pipeline  = None
     else:
-        from model_micro.pipeline import SpatialVLM, print_vram_usage
+        from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage
         print("=" * 70)
-        print("LOADING MODEL (Micro)")
+        print("LOADING MODEL (Micro v2)")
         print("=" * 70)
         pipeline = SpatialVLM(dtype=dtype, device_map=args.device,
                               attn_implementation=args.attn_impl)
@@ -281,7 +281,7 @@ def main():
     # ------------------------------------------------------------------ #
     # SECTION 1b: Full Backbone Sequence Map
     # ------------------------------------------------------------------ #
-    from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions
+    from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage, find_mask_positions
 
     print(f"\n{'='*70}")
     print("SECTION 1b: FULL BACKBONE SEQUENCE MAP")
@@ -447,7 +447,7 @@ def main():
     # ------------------------------------------------------------------ #
     # SECTION 3: Forward pass + alignment
     # ------------------------------------------------------------------ #
-    from model_micro.pipeline import print_vram_usage
+    from model_micro.pipeline_v2 import print_vram_usage
 
     print(f"\n{'='*70}")
     print("SECTION 3: FORWARD PASS LABEL ALIGNMENT")
@@ -491,7 +491,7 @@ def main():
     print("=" * 70)
 
     # Disable label smoothing so we can perfectly match mathematical CE base calculation
-    criterion = SpatialLoss(alpha=0.1, gamma=0.5, label_smoothing=0.0)
+    criterion = SpatialLoss(weight_sl1=2.0, weight_cat=2.0, focal_gamma=2.0, label_smoothing=0.0)
     device = logits.device
     official_loss, components = criterion(
         logits,
@@ -527,7 +527,7 @@ def main():
     # ------------------------------------------------------------------ #
     # SECTION 5: Inference
     # ------------------------------------------------------------------ #
-    from model_micro.pipeline import find_mask_positions
+    from model_micro.pipeline_v2 import find_mask_positions
     from PIL import Image
 
     print(f"\n{'='*70}")

@@ -21,12 +21,12 @@ import re as _re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_micro.pipeline import SpatialVLM, print_vram_usage, find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
+from model_micro.pipeline_v2 import SpatialVLM, print_vram_usage, find_mask_positions, NUM_TOKEN_ID, CAT_TOKEN_ID
 from src.dataloader.dataloader import SpatialVLMDataset
 
 # Paths
 ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CKPT_DIR = os.path.join(ROOT, "checkpoints", "micro")
+CKPT_DIR = os.path.join(ROOT, "checkpoints", "micro_v2")
 
 
 # =========================================================================

@@ -1,17 +1,17 @@
 """
-SpatialVLM Micro — CE + SmoothL1 + Category Focal Loss
+SpatialVLM Micro — CE + Normalized MSE + Category Focal Loss
 ============================================================================
 
 Training loss:
 
-    L = CE(label_smoothing) + weight_sl1 · L_SmoothL1 + weight_cat · L_CatFocal
+    L = CE(label_smoothing) + weight_sl1 · L_NormMSE + weight_cat · L_CatFocal
 
 Where:
-    - CE:         Cross-entropy on LM head output (single pass, no per-step)
-    - L_SmoothL1: SmoothL1 (Huber) on Number Head predictions (distance + count)
-    - L_CatFocal: Focal Loss on Category Head predictions (mcq + left_right)
-    - weight_sl1: Weight for SmoothL1 loss (default 0.5)
-    - weight_cat: Weight for Category Focal loss (default 2.0)
+    - CE:          Cross-entropy on LM head output (single pass, no per-step)
+    - L_NormMSE:   Normalized MSE on Number Head (distance/16, count/4)
+    - L_CatFocal:  Focal Loss on Category Head predictions (mcq + left_right)
+    - weight_sl1:  Weight for Normalized MSE loss (default 2.0)
+    - weight_cat:  Weight for Category Focal loss (default 2.0)
 """
 
 import torch
@@ -24,24 +24,30 @@ class SpatialLoss(nn.Module):
 
     Combines:
         1. Cross-entropy loss on LM head output
-        2. SmoothL1 loss for numeric regression (Number Head)
+        2. Normalized MSE loss for numeric regression (Number Head)
+           - distance targets normalized by /16.0 (domain max range)
+           - count targets normalized by /4.0 (domain max count)
         3. Focal loss for category classification (Category Head)
 
     Args:
-        weight_sl1:      Weight for SmoothL1 loss relative to CE loss.
+        weight_sl1:      Weight for Normalized MSE loss relative to CE loss.
         weight_cat:      Weight for Category Focal loss relative to CE loss.
         ignore_index:    Token index to ignore in CE loss (default: -100).
         label_smoothing: Label smoothing for CE loss (default: 0.1).
         focal_gamma:     Exponent for Focal Loss.
+        dist_scale:      Normalization constant for distance targets (default: 16.0).
+        count_scale:     Normalization constant for count targets (default: 4.0).
     """
 
     def __init__(
         self,
-        weight_sl1: float = 0.5,
+        weight_sl1: float = 2.0,
         weight_cat: float = 2.0,
         ignore_index: int = -100,
         label_smoothing: float = 0.1,
         focal_gamma: float = 2.0,
+        dist_scale: float = 4.0,   # 16m / 4.0 = range [0, 4]
+        count_scale: float = 1.0,  # 4 / 1.0 = range [1, 4]
     ):
         super().__init__()
         self.weight_sl1 = weight_sl1
@@ -49,6 +55,8 @@ class SpatialLoss(nn.Module):
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
         self.focal_gamma = focal_gamma
+        self.dist_scale = dist_scale
+        self.count_scale = count_scale
 
     def forward(
         self,
@@ -57,6 +65,7 @@ class SpatialLoss(nn.Module):
         num_pred:        torch.Tensor,         # [B]
         num_gt:          torch.Tensor,         # [B]
         is_numeric:      torch.Tensor,         # [B]
+        num_is_distance: torch.Tensor = None,  # [B] bool: True=distance, False=count
         cat_logits:      list = None,          # list of [N_masks] tensors or None
         cat_targets:     torch.Tensor = None,  # [B] target indices
         is_categorical:  torch.Tensor = None,  # [B] bool
@@ -64,7 +73,7 @@ class SpatialLoss(nn.Module):
     ) -> torch.Tensor:
         """Compute training loss.
 
-        L = CE + α · L_SmoothL1 + γ · L_CatCE
+        L = CE + α · L_NormMSE + γ · L_CatFocal
 
         Returns:
             Scalar loss (or tuple with component dict if return_components=True).
@@ -83,22 +92,21 @@ class SpatialLoss(nn.Module):
                 label_smoothing=self.label_smoothing,
             )
 
-        # --- 2. Log-L1 Loss (Number Head) for Scale & Relative Invariance ---
+        # --- 2. Normalized MSE Loss (Number Head) ---
+        #     distance targets / 16.0 → [0, ~1], count targets / 4.0 → [0.25, 1.0]
+        #     This balances gradient magnitudes between the two tasks.
         if is_numeric.any():
             pred = num_pred[is_numeric].float()
             target = num_gt[is_numeric].float()
             
-            # Clamp prediction to be non-negative to avoid NaN in log
-            pred = torch.clamp(pred, min=0.0)
+            # Apply domain-aware normalization
+            if num_is_distance is not None:
+                dist_mask = num_is_distance[is_numeric]
+                scale = torch.where(dist_mask, self.dist_scale, self.count_scale)
+                pred = pred / scale
+                target = target / scale
             
-            # Convert to log space (add 1 to prevent log(0))
-            # This compresses large distances and naturally penalizes relative percentage errors.
-            log_pred = torch.log(pred + 1.0)
-            log_target = torch.log(target + 1.0)
-            
-            # SmoothL1 in Log space (Huber Log Loss). 
-            # beta=0.1 means if relative error is <10%, use L2. Otherwise L1.
-            loss_sl1 = F.smooth_l1_loss(log_pred, log_target, reduction='mean', beta=0.1)
+            loss_sl1 = F.mse_loss(pred, target, reduction='mean')
         else:
             loss_sl1 = torch.tensor(0.0, device=lm_targets.device)
 

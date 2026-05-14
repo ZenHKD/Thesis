@@ -148,8 +148,10 @@ def main():
     model.config.vocab_size = new_vocab_size
     model.config.num_token_id = num_token_id
     model.config.cat_token_id = cat_token_id
+    model.config.max_position_embeddings = 512
     if hasattr(model.config, "text_config"):
         model.config.text_config.vocab_size = new_vocab_size
+        model.config.text_config.max_position_embeddings = 512
 
     model.save_pretrained(OUTPUT_PATH)
 
@@ -157,8 +159,10 @@ def main():
     config.vocab_size = new_vocab_size
     config.num_token_id = num_token_id
     config.cat_token_id = cat_token_id
+    config.max_position_embeddings = 512
     if hasattr(config, "text_config"):
         config.text_config.vocab_size = new_vocab_size
+        config.text_config.max_position_embeddings = 512
     config.save_pretrained(OUTPUT_PATH)
 
     # Copy auxiliary files from original model
