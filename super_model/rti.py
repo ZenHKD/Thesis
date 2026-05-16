@@ -1,5 +1,5 @@
 """
-MODULE: Region-Level Token Injection (RTI) — Super Model
+MODULE: Region-Level Token Injection (RTI) — Super Model (Batch-Optimized)
 
 Architecture:
 - Tri-Source U-Net (RGB + Depth + Global Depth) with shared ViT semantics at bottleneck.
@@ -11,6 +11,11 @@ Architecture:
   The global_depth token shares the same depth U-Net encoder but uses a separate
   decoder, and pools with the inverted mask to capture the spatial relationship
   between the object and its environment.
+
+Optimization:
+  All masks are batched into a single tensor [N_masks, H, W] and pooled
+  simultaneously via broadcast multiply + sum — eliminates per-mask Python
+  loops and reduces CUDA kernel launches from O(N_masks * 12) to O(12).
 """
 
 import torch
@@ -115,6 +120,8 @@ class RTE(nn.Module):
     - mask_depth:   Depth features pooled inside the object mask
     - global_depth: Depth features pooled OUTSIDE the object mask (reversed mask)
                     → captures surrounding spatial context for richer reasoning
+
+    Batch-optimized: all masks are pooled simultaneously via broadcast multiply.
     """
 
     def __init__(self, hidden_dim=1024, vit_dim=768):
@@ -131,57 +138,59 @@ class RTE(nn.Module):
         # but has its own decoder to learn different spatial features
         self.global_depth_decoder = UNetDecoder(vit_dim=vit_dim, hidden_dim=hidden_dim)
 
-    def _multiscale_mask_pool(self, feat3, feat2, feat1, feat0, mask_t, b, decoder):
-        """Multi-scale mask pooling: pool at 4 decoder levels and concat.
+    def _batch_multiscale_mask_pool(self, feat3, feat2, feat1, feat0, masks, b, decoder):
+        """Batched multi-scale mask pooling: pool ALL masks at ALL scales in one go.
+
+        Instead of looping per mask (N_masks × 4 kernel launches per scale),
+        this uses broadcast multiply + sum to pool all masks simultaneously.
 
         Args:
             feat3: [B, 512, H/8,  W/8 ]
             feat2: [B, 256, H/4,  W/4 ]
             feat1: [B, 128, H/2,  W/2 ]
             feat0: [B, 128, H,    W   ]
-            mask_t: [H, W] boolean mask at full resolution
+            masks: [N_masks, H, W] float tensor (0/1)
             b: batch index
             decoder: UNetDecoder (to access proj layer)
 
         Returns:
-            [1024] token — projected multi-scale features
+            [N_masks, 1024] — one token per mask
         """
-        # Downscale mask to each level's resolution
-        mask_float = mask_t.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
+        N = masks.shape[0]
+        if N == 0:
+            return torch.zeros(0, 1024, device=feat0.device, dtype=feat0.dtype)
 
-        # Level 0: full resolution — direct mask
-        pixels_0 = feat0[b, :, mask_t].T             # [N0, 128]
-        pooled_0 = pixels_0.mean(dim=0)              # [128]
+        masks_4d = masks.unsqueeze(1)  # [N, 1, H, W]
 
-        # Level 1: /2 resolution
-        mask_1 = F.interpolate(mask_float, size=feat1.shape[2:], mode='nearest').squeeze() > 0.5
-        if mask_1.sum() > 0:
-            pixels_1 = feat1[b, :, mask_1].T         # [N1, 128]
-            pooled_1 = pixels_1.mean(dim=0)          # [128]
-        else:
-            pooled_1 = feat1.new_zeros(128)
+        # Level 0: full resolution [N, 1, H, W]
+        f0 = feat0[b].unsqueeze(0)  # [1, 128, H, W]
+        m0 = masks_4d               # [N, 1, H, W]
+        area_0 = m0.sum(dim=(2, 3)).clamp(min=1)  # [N, 1]
+        pooled_0 = (f0 * m0).sum(dim=(2, 3)) / area_0  # [N, 128]
 
-        # Level 2: /4 resolution
-        mask_2 = F.interpolate(mask_float, size=feat2.shape[2:], mode='nearest').squeeze() > 0.5
-        if mask_2.sum() > 0:
-            pixels_2 = feat2[b, :, mask_2].T         # [N2, 256]
-            pooled_2 = pixels_2.mean(dim=0)          # [256]
-        else:
-            pooled_2 = feat2.new_zeros(256)
+        # Level 1: /2
+        m1 = F.interpolate(masks_4d, size=feat1.shape[2:], mode='nearest')  # [N, 1, h1, w1]
+        f1 = feat1[b].unsqueeze(0)  # [1, 128, h1, w1]
+        area_1 = m1.sum(dim=(2, 3)).clamp(min=1)
+        pooled_1 = (f1 * m1).sum(dim=(2, 3)) / area_1  # [N, 128]
 
-        # Level 3: /8 resolution
-        mask_3 = F.interpolate(mask_float, size=feat3.shape[2:], mode='nearest').squeeze() > 0.5
-        if mask_3.sum() > 0:
-            pixels_3 = feat3[b, :, mask_3].T         # [N3, 512]
-            pooled_3 = pixels_3.mean(dim=0)          # [512]
-        else:
-            pooled_3 = feat3.new_zeros(512)
+        # Level 2: /4
+        m2 = F.interpolate(masks_4d, size=feat2.shape[2:], mode='nearest')  # [N, 1, h2, w2]
+        f2 = feat2[b].unsqueeze(0)  # [1, 256, h2, w2]
+        area_2 = m2.sum(dim=(2, 3)).clamp(min=1)
+        pooled_2 = (f2 * m2).sum(dim=(2, 3)) / area_2  # [N, 256]
 
-        # Concat all scales: 512 + 256 + 128 + 128 = 1024
-        multi_scale = torch.cat([pooled_3, pooled_2, pooled_1, pooled_0], dim=-1)  # [1024]
+        # Level 3: /8
+        m3 = F.interpolate(masks_4d, size=feat3.shape[2:], mode='nearest')  # [N, 1, h3, w3]
+        f3 = feat3[b].unsqueeze(0)  # [1, 512, h3, w3]
+        area_3 = m3.sum(dim=(2, 3)).clamp(min=1)
+        pooled_3 = (f3 * m3).sum(dim=(2, 3)) / area_3  # [N, 512]
 
-        # Alignment projection
-        return decoder.proj(multi_scale)  # [1024]
+        # Concat: [N, 512+256+128+128] = [N, 1024]
+        multi_scale = torch.cat([pooled_3, pooled_2, pooled_1, pooled_0], dim=-1)
+
+        # Project: [N, 1024]
+        return decoder.proj(multi_scale)
 
     def forward(
         self,
@@ -212,60 +221,74 @@ class RTE(nn.Module):
 
         out_tokens = []
         for b in range(B):
-            sample_tokens = []
-            masks = rle_list[b] if rle_list else []
-            d_masks = decoded_masks[b] if decoded_masks else [None] * len(masks)
-            
-            for m_idx, mask_dict in enumerate(masks):
+            masks_rle = rle_list[b] if rle_list else []
+            d_masks = decoded_masks[b] if decoded_masks else [None] * len(masks_rle)
+            n_masks = len(masks_rle)
+
+            if n_masks == 0:
+                out_tokens.append([])
+                continue
+
+            # --- Decode all masks and stack into a single tensor ---
+            mask_list = []
+            valid_flags = []
+            for m_idx, mask_dict in enumerate(masks_rle):
                 if d_masks[m_idx] is not None:
                     binary_mask = d_masks[m_idx]['binary']
                 else:
                     binary_mask = mask_utils.decode(mask_dict).astype(bool)
-                
-                mask_t = torch.from_numpy(binary_mask).to(device=dev) if isinstance(binary_mask, np.ndarray) else binary_mask.to(device=dev, dtype=torch.bool)
-                
-                if mask_t.sum() == 0:
-                    rgb_tok = torch.zeros(1024, device=dev, dtype=dtype)
-                    dep_tok = torch.zeros(1024, device=dev, dtype=dtype)
-                    gdep_tok = torch.zeros(1024, device=dev, dtype=dtype)
-                    sample_tokens.append((rgb_tok.unsqueeze(0), dep_tok.unsqueeze(0), gdep_tok.unsqueeze(0)))
-                    continue
 
-                # Token 1: mask_rgb — RGB features inside object mask
-                rgb_tok = self._multiscale_mask_pool(
-                    rgb_f3, rgb_f2, rgb_f1, rgb_f0, mask_t, b, self.rgb_decoder
-                )
-
-                # Token 2: mask_depth — Depth features inside object mask
-                dep_tok = self._multiscale_mask_pool(
-                    dep_f3, dep_f2, dep_f1, dep_f0, mask_t, b, self.depth_decoder
-                )
-
-                # Token 3: global_depth — Depth features OUTSIDE object mask (reversed)
-                # Invert the mask: capture surrounding spatial context instead of object interior
-                reversed_mask = ~mask_t  # [H, W] boolean — everything except the object
-
-                if reversed_mask.sum() == 0:
-                    # Edge case: object fills entire image → no surrounding context
-                    gdep_tok = torch.zeros(1024, device=dev, dtype=dtype)
+                if isinstance(binary_mask, np.ndarray):
+                    mask_t = torch.from_numpy(binary_mask).to(device=dev, dtype=torch.bool)
                 else:
-                    gdep_tok = self._multiscale_mask_pool(
-                        gdep_f3, gdep_f2, gdep_f1, gdep_f0, reversed_mask, b, self.global_depth_decoder
-                    )
+                    mask_t = binary_mask.to(device=dev, dtype=torch.bool)
 
-                sample_tokens.append((rgb_tok.unsqueeze(0), dep_tok.unsqueeze(0), gdep_tok.unsqueeze(0)))
-                
+                valid_flags.append(mask_t.sum() > 0)
+                mask_list.append(mask_t)
+
+            # Stack: [N_masks, H, W] float
+            masks_stacked = torch.stack(mask_list, dim=0).to(dtype=dtype)  # [N, H, W]
+
+            # Reversed masks for global depth: [N, H, W]
+            reversed_masks = 1.0 - masks_stacked
+
+            # --- Batch pool all masks at once (3 calls instead of N×3) ---
+            rgb_tokens = self._batch_multiscale_mask_pool(
+                rgb_f3, rgb_f2, rgb_f1, rgb_f0, masks_stacked, b, self.rgb_decoder
+            )  # [N, 1024]
+
+            dep_tokens = self._batch_multiscale_mask_pool(
+                dep_f3, dep_f2, dep_f1, dep_f0, masks_stacked, b, self.depth_decoder
+            )  # [N, 1024]
+
+            gdep_tokens = self._batch_multiscale_mask_pool(
+                gdep_f3, gdep_f2, gdep_f1, gdep_f0, reversed_masks, b, self.global_depth_decoder
+            )  # [N, 1024]
+
+            # --- Zero out invalid masks (empty masks) ---
+            sample_tokens = []
+            for m_idx in range(n_masks):
+                if valid_flags[m_idx]:
+                    sample_tokens.append((
+                        rgb_tokens[m_idx:m_idx+1],     # [1, 1024]
+                        dep_tokens[m_idx:m_idx+1],     # [1, 1024]
+                        gdep_tokens[m_idx:m_idx+1],    # [1, 1024]
+                    ))
+                else:
+                    z = torch.zeros(1, 1024, device=dev, dtype=dtype)
+                    sample_tokens.append((z, z, z))
+
             out_tokens.append(sample_tokens)
-            
+
         return out_tokens
 
     def inject_into_text_embeds(
         self,
-        text_embeds:    torch.Tensor,                
-        mask_positions: List[List[int]],             
+        text_embeds:    torch.Tensor,
+        mask_positions: List[List[int]],
         region_tokens:  List[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
-        mask_token_len: int = 3,                     
-    ) -> torch.Tensor:                               
+        mask_token_len: int = 3,
+    ) -> torch.Tensor:
         B, L, D = text_embeds.shape
 
         for b in range(B):

@@ -38,7 +38,7 @@ from transformers.masking_utils import create_causal_mask
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from super_model.rti import RTE
-from super_model.heads import MCQHead, LeftRightHead, DistanceHead, CountHead
+from super_model.heads import SharedVisualFuser, MCQHead, LeftRightHead, DistanceHead, CountHead
 
 
 # Default model path
@@ -176,8 +176,9 @@ class SpatialVLM(nn.Module):
             model_name, trust_remote_code=True
         )
 
-        # Custom Modules — 4 dedicated heads
+        # Custom Modules — shared visual fuser + 4 dedicated heads
         self.region_token_extractor = RTE(hidden_dim=1024, vit_dim=768)
+        self.visual_fuser = SharedVisualFuser(hidden_dim=1024)
         self.mcq_head   = MCQHead(hidden_dim=1024)
         self.lr_head    = LeftRightHead(hidden_dim=1024)
         self.dist_head  = DistanceHead(hidden_dim=1024)
@@ -189,11 +190,12 @@ class SpatialVLM(nn.Module):
         qwen_device = next(self.qwen.parameters()).device
         qwen_dtype  = next(self.qwen.parameters()).dtype
         self.region_token_extractor = self.region_token_extractor.to(device=qwen_device, dtype=qwen_dtype)
+        self.visual_fuser = self.visual_fuser.to(device=qwen_device, dtype=qwen_dtype)
         self.mcq_head   = self.mcq_head.to(device=qwen_device, dtype=qwen_dtype)
         self.lr_head    = self.lr_head.to(device=qwen_device, dtype=qwen_dtype)
         self.dist_head  = self.dist_head.to(device=qwen_device, dtype=qwen_dtype)
         self.count_head = self.count_head.to(device=qwen_device, dtype=qwen_dtype)
-        print(f"  Custom modules (RTI + 4 Heads) -> {qwen_device} ({qwen_dtype})")
+        print(f"  Custom modules (RTI + Fuser + Heads) -> {qwen_device} ({qwen_dtype})")
 
         embed = self.qwen.model.language_model.embed_tokens
         embed.weight.requires_grad = True
@@ -548,7 +550,12 @@ class SpatialVLM(nn.Module):
                         dist_indices.append(b)
             if dist_h_list:
                 h_dist = torch.stack(dist_h_list, dim=0)
-                preds = self.dist_head(h_dist, dist_rgb, dist_dep, dist_gdep, dist_vis)
+                # Compute fused queries via shared fuser
+                dist_q_list = []
+                for k in range(len(dist_h_list)):
+                    q, _ = self.visual_fuser(dist_h_list[k], dist_vis[k])
+                    dist_q_list.append(q)
+                preds = self.dist_head(h_dist, dist_rgb, dist_dep, dist_gdep, dist_q_list)
                 for k, b in enumerate(dist_indices):
                     dist_pred[b] = preds[k]
 
@@ -569,7 +576,13 @@ class SpatialVLM(nn.Module):
                         cnt_indices.append(b)
             if cnt_h_list:
                 h_cnt = torch.stack(cnt_h_list, dim=0)
-                preds = self.count_head(h_cnt, cnt_rgb, cnt_dep, cnt_gdep, cnt_vis)
+                # Compute fused queries + scene contexts via shared fuser
+                cnt_q_list, cnt_scene_list = [], []
+                for k in range(len(cnt_h_list)):
+                    q, sc = self.visual_fuser(cnt_h_list[k], cnt_vis[k])
+                    cnt_q_list.append(q)
+                    cnt_scene_list.append(sc)
+                preds = self.count_head(h_cnt, cnt_rgb, cnt_dep, cnt_gdep, cnt_q_list, cnt_scene_list)
                 for k, b in enumerate(cnt_indices):
                     count_pred[b] = preds[k]
 
@@ -581,7 +594,8 @@ class SpatialVLM(nn.Module):
                     adj = n_visual + pos
                     if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
                         h_mcq = h_normed[b, adj, :]
-                        scores = self.mcq_head(rgb_batch[b], dep_batch[b], gdep_batch[b], h_mcq, vis_batch[b])
+                        q, _ = self.visual_fuser(h_mcq, vis_batch[b])
+                        scores = self.mcq_head(rgb_batch[b], dep_batch[b], gdep_batch[b], q)
                         mcq_logits_list.append(scores)
                     else:
                         mcq_logits_list.append(None)
@@ -596,7 +610,8 @@ class SpatialVLM(nn.Module):
                     adj = n_visual + pos
                     if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
                         h_lr = h_normed[b, adj, :]
-                        scores = self.lr_head(rgb_batch[b], dep_batch[b], gdep_batch[b], h_lr, vis_batch[b])
+                        q, _ = self.visual_fuser(h_lr, vis_batch[b])
+                        scores = self.lr_head(rgb_batch[b], dep_batch[b], gdep_batch[b], q)
                         lr_logits_list.append(scores)
                     else:
                         lr_logits_list.append(None)

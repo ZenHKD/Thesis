@@ -127,8 +127,6 @@ def main():
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
     parser.add_argument("--lr-backbone", type=float, default=5e-5)
     parser.add_argument("--lr-rti",      type=float, default=1e-4)
-    parser.add_argument("--lr-mcq",      type=float, default=1e-4)
-    parser.add_argument("--lr-lr",       type=float, default=1e-4)
     parser.add_argument("--lr-dist",     type=float, default=1e-4)
     parser.add_argument("--lr-count",    type=float, default=1e-4)
     parser.add_argument("--weight-dist",  type=float, default=2.0)
@@ -190,9 +188,10 @@ def main():
     print_vram_usage("after model load")
 
     if args.compile:
-        print("  [*] Compiling Qwen backbone + custom modules with torch.compile...")
+        print("  [*] Compiling Qwen + RTI + Fuser + Heads with torch.compile...")
         pipeline.qwen = torch.compile(pipeline.qwen)
         pipeline.region_token_extractor = torch.compile(pipeline.region_token_extractor)
+        pipeline.visual_fuser = torch.compile(pipeline.visual_fuser)
         pipeline.mcq_head = torch.compile(pipeline.mcq_head)
         pipeline.lr_head = torch.compile(pipeline.lr_head)
         pipeline.dist_head = torch.compile(pipeline.dist_head)
@@ -237,8 +236,7 @@ def main():
     decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
                      [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
     rti_params = [p for p in pipeline.region_token_extractor.parameters() if p.requires_grad]
-    mcq_params = [p for p in pipeline.mcq_head.parameters() if p.requires_grad]
-    lr_params  = [p for p in pipeline.lr_head.parameters() if p.requires_grad]
+    fuser_params = [p for p in pipeline.visual_fuser.parameters() if p.requires_grad]
     dist_params = [p for p in pipeline.dist_head.parameters() if p.requires_grad]
     count_params = [p for p in pipeline.count_head.parameters() if p.requires_grad]
 
@@ -247,8 +245,7 @@ def main():
         ("Special Embed",   [special_embed],       args.lr_backbone),
         ("Decoder",         decoder_params,        args.lr_backbone),
         ("RTI",             rti_params,            args.lr_rti),
-        ("MCQ Head",        mcq_params,            args.lr_mcq),
-        ("LeftRight Head",  lr_params,             args.lr_lr),
+        ("Visual Fuser",    fuser_params,          args.lr_rti),
         ("Distance Head",   dist_params,           args.lr_dist),
         ("Count Head",      count_params,          args.lr_count),
     ]
@@ -347,8 +344,8 @@ def main():
         "val_loss_lr", "val_acc_lr",
         "val_loss_dist", "val_acc_dist",
         "val_loss_count", "val_acc_count",
-        "lr_vision", "lr_embed", "lr_decoder", "lr_rti",
-        "lr_mcq", "lr_lr", "lr_dist", "lr_count",
+        "lr_vision", "lr_embed", "lr_decoder", "lr_rti", "lr_fuser",
+        "lr_dist", "lr_count",
         "grad_norm", "samples_per_sec",
     ]
 
@@ -377,7 +374,7 @@ def main():
     print("TRAINING")
     print("=" * 70)
     print(f"  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  lr_rti={args.lr_rti}")
-    print(f"  lr_mcq={args.lr_mcq}  lr_lr={args.lr_lr}  lr_dist={args.lr_dist}  lr_count={args.lr_count}")
+    print(f"  lr_dist={args.lr_dist}  lr_count={args.lr_count}  (MCQ/LR use SharedVisualFuser @ lr_rti)")
     print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}")
     print(f"  w_dist={args.weight_dist}  w_count={args.weight_count}  w_mcq={args.weight_mcq}  w_lr={args.weight_lr}")
     print()
@@ -525,14 +522,13 @@ def main():
                     current_epoch = (global_step * effective_batch) / total_samples
 
                     lrs = {pg["name"]: pg["lr"] for pg in optimizer.param_groups}
-                    lr_v   = lrs.get("Vision Encoder", 0.0)
-                    lr_e   = lrs.get("Special Embed", 0.0)
-                    lr_d   = lrs.get("Decoder", 0.0)
-                    lr_rti = lrs.get("RTI", 0.0)
-                    lr_mcq = lrs.get("MCQ Head", 0.0)
-                    lr_lr  = lrs.get("LeftRight Head", 0.0)
+                    lr_v    = lrs.get("Vision Encoder", 0.0)
+                    lr_e    = lrs.get("Special Embed", 0.0)
+                    lr_d    = lrs.get("Decoder", 0.0)
+                    lr_rti  = lrs.get("RTI", 0.0)
+                    lr_fus  = lrs.get("Visual Fuser", 0.0)
                     lr_dist = lrs.get("Distance Head", 0.0)
-                    lr_cnt = lrs.get("Count Head", 0.0)
+                    lr_cnt  = lrs.get("Count Head", 0.0)
 
                     tqdm.write(
                         f"  step={global_step:>7d}  "
@@ -551,8 +547,8 @@ def main():
                             "", "",               # total_val_loss, val_loss_ce
                             "", "", "", "",       # mcq loss/acc, lr loss/acc
                             "", "", "", "",       # dist loss/acc, count loss/acc
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}",
-                            f"{lr_mcq:.8f}", f"{lr_lr:.8f}", f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
+                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}", f"{lr_fus:.8f}",
+                            f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
                         ])
 
@@ -595,14 +591,13 @@ def main():
 
                     current_epoch = (global_step * effective_batch) / total_samples
                     lrs = {pg["name"]: pg["lr"] for pg in optimizer.param_groups}
-                    lr_v   = lrs.get("Vision Encoder", 0.0)
-                    lr_e   = lrs.get("Special Embed", 0.0)
-                    lr_d   = lrs.get("Decoder", 0.0)
-                    lr_rti = lrs.get("RTI", 0.0)
-                    lr_mcq = lrs.get("MCQ Head", 0.0)
-                    lr_lr  = lrs.get("LeftRight Head", 0.0)
+                    lr_v    = lrs.get("Vision Encoder", 0.0)
+                    lr_e    = lrs.get("Special Embed", 0.0)
+                    lr_d    = lrs.get("Decoder", 0.0)
+                    lr_rti  = lrs.get("RTI", 0.0)
+                    lr_fus  = lrs.get("Visual Fuser", 0.0)
                     lr_dist = lrs.get("Distance Head", 0.0)
-                    lr_cnt = lrs.get("Count Head", 0.0)
+                    lr_cnt  = lrs.get("Count Head", 0.0)
 
                     with open(csv_path, "a", newline="") as f:
                         writer = csv.writer(f)
@@ -614,8 +609,8 @@ def main():
                             f"{vlr:.6f}", f"{vlr_a:.2f}",
                             f"{vdist:.6f}", f"{vdist_a:.2f}",
                             f"{vcnt:.6f}", f"{vcnt_a:.2f}",
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}",
-                            f"{lr_mcq:.8f}", f"{lr_lr:.8f}", f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
+                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}", f"{lr_fus:.8f}",
+                            f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
                             "", "",
                         ])
                     print(f"\nValidation: val_loss={vl:.4f} "
