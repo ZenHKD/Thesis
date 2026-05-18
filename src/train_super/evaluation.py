@@ -93,7 +93,6 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
     
     # Batch visual tensors
     pixel_values = torch.cat([s["pixel_values"] for s in batch_samples], dim=0).to(device=dev, dtype=dtype)
-    pixel_values_rgb = torch.stack([s["pixel_values_rgb"] for s in batch_samples]).to(device=dev, dtype=dtype)
     image_grid_thw = torch.cat([s["image_grid_thw"] for s in batch_samples], dim=0).to(device=dev)
     depth_maps = torch.stack([s["depth_map"] for s in batch_samples]).to(device=dev, dtype=dtype)
 
@@ -145,7 +144,7 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
     # Generate
     with torch.amp.autocast("cuda", dtype=dtype):
         output_ids = pipeline.generate(
-            pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
+            pixel_values, image_grid_thw, depth_maps, input_ids,
             attention_mask=attention_mask,
             rle_list=rle_lists,
             mask_token_positions=mask_positions_list,
@@ -160,6 +159,19 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
         raw_output = raw_full.strip()
         parsed = pipeline.parse_output(raw_output)
 
+        # Determine predicted category from special tokens in output
+        gen_ids_list = output_ids[b].tolist()
+        if MCQ_TOKEN_ID in gen_ids_list:
+            pred_cat = "mcq"
+        elif LR_TOKEN_ID in gen_ids_list:
+            pred_cat = "left_right"
+        elif DIST_TOKEN_ID in gen_ids_list:
+            pred_cat = "distance"
+        elif COUNT_TOKEN_ID in gen_ids_list:
+            pred_cat = "count"
+        else:
+            pred_cat = parsed.get("category", "unknown")
+
         dist_pred_val = None
         count_pred_val = None
         mcq_pred_idx = None
@@ -173,11 +185,9 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
 
         # Per-sample tensors for second forward pass
         s_pv = batch_samples[b]["pixel_values"].to(device=dev, dtype=dtype)
-        s_rgb = batch_samples[b]["pixel_values_rgb"].unsqueeze(0).to(device=dev, dtype=dtype)
         s_grid = batch_samples[b]["image_grid_thw"].to(device=dev)
         s_depth = batch_samples[b]["depth_map"].unsqueeze(0).to(device=dev, dtype=dtype)
 
-        gen_ids_list = output_ids[b].tolist()
         has_dist  = DIST_TOKEN_ID in gen_ids_list
         has_count = COUNT_TOKEN_ID in gen_ids_list
         has_mcq   = MCQ_TOKEN_ID in gen_ids_list
@@ -192,12 +202,11 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
                     return idx_pos
             return -1
 
-        # Distance head
-        if parsed["category"] == "distance" and has_dist:
+        if pred_cat == "distance" and has_dist:
             pos = _find_last_pos(DIST_TOKEN_ID)
             if pos >= 0:
                 out = pipeline(
-                    pixel_values=s_pv, pixel_values_rgb=s_rgb,
+                    pixel_values=s_pv,
                     image_grid_thw=s_grid, depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
@@ -210,11 +219,11 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
                     dist_pred_val = out["dist_pred"][0].item()
 
         # Count head
-        elif parsed["category"] == "count" and has_count:
+        elif pred_cat == "count" and has_count:
             pos = _find_last_pos(COUNT_TOKEN_ID)
             if pos >= 0:
                 out = pipeline(
-                    pixel_values=s_pv, pixel_values_rgb=s_rgb,
+                    pixel_values=s_pv,
                     image_grid_thw=s_grid, depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
@@ -227,11 +236,11 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
                     count_pred_val = out["count_pred"][0].item()
 
         # MCQ head
-        elif parsed["category"] == "mcq" and has_mcq:
+        elif pred_cat == "mcq" and has_mcq:
             pos = _find_last_pos(MCQ_TOKEN_ID)
             if pos >= 0:
                 out = pipeline(
-                    pixel_values=s_pv, pixel_values_rgb=s_rgb,
+                    pixel_values=s_pv,
                     image_grid_thw=s_grid, depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
@@ -245,11 +254,11 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
                     mcq_pred_idx = mcq_logits_out[0].argmax().item()
 
         # LeftRight head
-        elif parsed["category"] == "left_right" and has_lr:
+        elif pred_cat == "left_right" and has_lr:
             pos = _find_last_pos(LR_TOKEN_ID)
             if pos >= 0:
                 out = pipeline(
-                    pixel_values=s_pv, pixel_values_rgb=s_rgb,
+                    pixel_values=s_pv,
                     image_grid_thw=s_grid, depth_maps=s_depth,
                     input_ids=full_generated_ids,
                     attention_mask=torch.ones_like(full_generated_ids),
@@ -263,8 +272,8 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20)
                     lr_pred_idx = lr_logits_out[0].argmax().item()
 
         results.append({
-            "category":   parsed["category"],
-            "answer":     parsed["answer"],
+            "category":   pred_cat,
+            "answer":     parsed.get("answer"),
             "dist_pred":  dist_pred_val,
             "count_pred": count_pred_val,
             "mcq_pred":   mcq_pred_idx,

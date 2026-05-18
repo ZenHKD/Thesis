@@ -1,12 +1,13 @@
 """
 SpatialVLM Super Pruning Pipeline (No External Pruning Libs)
-- Vision: Keep ViT blocks [8,9,10,11] -> renumber [0,1,2,3]
+- Vision: Keep ALL 12 ViT blocks (no pruning — needed for DPT multi-layer features)
 - Decoder: Keep all 24 layers (single pass)
 - Vocab: FULL original vocabulary (248,320) + 4 special tokens appended
 - Add <|mcq|>   token (ID = 248077) for MCQ Head
 - Add <|lr|>    token (ID = 248078) for Left-Right Head
 - Add <|dist|>  token (ID = 248079) for Distance Head
 - Add <|count|> token (ID = 248080) for Count Head
+- Context length: 768
 """
 
 import json
@@ -19,8 +20,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForImageTextToText
 ORIGINAL_MODEL_PATH = Path(__file__).parent.parent / "model" / "qwen3.5-0.8b"
 OUTPUT_PATH = Path(__file__).parent / "qwen3.5-super"
 
-KEEP_VISION_BLOCKS = [8, 9, 10, 11]
-KEEP_DECODER_LAYERS = list(range(24))
+
 
 MCQ_TOKEN   = "<|mcq|>"
 LR_TOKEN    = "<|lr|>"
@@ -128,44 +128,13 @@ def setup_tokenizer_with_special_tokens(tokenizer):
     return new_vocab_size, mcq_token_id, lr_token_id, dist_token_id, count_token_id
 
 
-# ============== ARCHITECTURE PRUNING ==============
-
-def prune_vision(sd: dict) -> dict:
-    print(f"  Vision: blocks {KEEP_VISION_BLOCKS} -> [0..3]")
-    new = {}
-    for k, v in sd.items():
-        if "model.visual.blocks." in k:
-            parts = k.split(".")
-            # model.visual.blocks.N.xxx -> index of "blocks" + 1
-            bi = parts.index("blocks")
-            idx = int(parts[bi + 1])
-            if idx in KEEP_VISION_BLOCKS:
-                parts[bi + 1] = str(KEEP_VISION_BLOCKS.index(idx))
-                new[".".join(parts)] = v
-        else:
-            new[k] = v
-    return new
-
-
-def prune_decoder(sd: dict) -> dict:
-    print(f"  Decoder: layers {KEEP_DECODER_LAYERS} (all 24 layers)")
-    new = {}
-    for k, v in sd.items():
-        if "model.language_model.layers." in k:
-            parts = k.split(".")
-            li = parts.index("layers")
-            idx = int(parts[li + 1])
-            if idx in KEEP_DECODER_LAYERS:
-                new[k] = v
-        else:
-            new[k] = v
-    return new
-
 # ============== MAIN ==============
 
 def main():
     print("=" * 60)
     print("SpatialVLM Super Pruning Pipeline")
+    print("  Vision: ALL 12 blocks (no pruning)")
+    print("  Context: 768")
     print("=" * 60)
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -191,23 +160,13 @@ def main():
             if model.get_output_embeddings() is not None:
                 model.get_output_embeddings().weight[tid].normal_(0.0, 0.02)
 
-    # 4. Prune architecture (vision + decoder only)
-    print("\n[4/6] Pruning model architecture...")
-    sd = prune_vision(model.state_dict())
-    sd = prune_decoder(sd)
-    model.load_state_dict(sd, strict=False)
-
-    # Physically remove extra layers/blocks from model
-    import torch.nn as nn
-    n_keep_dec = len(KEEP_DECODER_LAYERS)
-    n_keep_vis = len(KEEP_VISION_BLOCKS)
-    model.model.language_model.layers = nn.ModuleList(
-        list(model.model.language_model.layers)[:n_keep_dec]
-    )
-    model.model.visual.blocks = nn.ModuleList(
-        list(model.model.visual.blocks)[:n_keep_vis]
-    )
-    print(f"  Trimmed model: {n_keep_vis} vision blocks, {n_keep_dec} decoder layers")
+    # 4. No architecture pruning — all 12 ViT blocks + 24 decoder layers kept
+    print("\n[4/6] Architecture check (no pruning)...")
+    print("  Vision: ALL 12 blocks kept")
+    print("  Decoder: ALL 24 layers kept")
+    n_vis_blocks = len(list(model.model.visual.blocks))
+    n_dec_layers = len(list(model.model.language_model.layers))
+    print(f"  Model: {n_vis_blocks} vision blocks, {n_dec_layers} decoder layers")
 
     # 5. Update config & save
     print(f"\n[5/6] Saving to {OUTPUT_PATH}...")
@@ -218,17 +177,16 @@ def main():
     model.config.lr_token_id    = lr_token_id
     model.config.dist_token_id  = dist_token_id
     model.config.count_token_id = count_token_id
-    model.config.max_position_embeddings = 512
+    model.config.max_position_embeddings = 768
     if hasattr(model.config, "text_config"):
-        model.config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
+        model.config.text_config.num_hidden_layers = n_dec_layers
         model.config.text_config.vocab_size = new_vocab_size
-        model.config.text_config.max_position_embeddings = 512
+        model.config.text_config.max_position_embeddings = 768
         if hasattr(model.config.text_config, "layer_types") and model.config.text_config.layer_types:
-            model.config.text_config.layer_types = [
-                model.config.text_config.layer_types[i] for i in KEEP_DECODER_LAYERS
-            ]
+            pass  # No pruning, keep original layer_types
+    # Vision config: depth stays at 12 (full)
     if hasattr(model.config, "vision_config"):
-        model.config.vision_config.depth = len(KEEP_VISION_BLOCKS)
+        model.config.vision_config.depth = n_vis_blocks
 
     model.save_pretrained(OUTPUT_PATH)
 
@@ -238,17 +196,15 @@ def main():
     config.lr_token_id    = lr_token_id
     config.dist_token_id  = dist_token_id
     config.count_token_id = count_token_id
-    config.max_position_embeddings = 512
+    config.max_position_embeddings = 768
     if hasattr(config, "text_config"):
-        config.text_config.num_hidden_layers = len(KEEP_DECODER_LAYERS)
+        config.text_config.num_hidden_layers = n_dec_layers
         config.text_config.vocab_size = new_vocab_size
-        config.text_config.max_position_embeddings = 512
+        config.text_config.max_position_embeddings = 768
         if hasattr(config.text_config, "layer_types") and config.text_config.layer_types:
-            config.text_config.layer_types = [
-                config.text_config.layer_types[i] for i in KEEP_DECODER_LAYERS
-            ]
+            pass  # No pruning, keep original layer_types
     if hasattr(config, "vision_config"):
-        config.vision_config.depth = len(KEEP_VISION_BLOCKS)
+        config.vision_config.depth = n_vis_blocks
     config.save_pretrained(OUTPUT_PATH)
 
     # Copy auxiliary files from original model
@@ -269,8 +225,10 @@ def main():
         "dist_token_id": dist_token_id,
         "count_token_id": count_token_id,
         "vocab_pruned": False,
-        "kept_vision_blocks": KEEP_VISION_BLOCKS,
-        "kept_decoder_layers": KEEP_DECODER_LAYERS,
+        "vision_pruned": False,
+        "kept_vision_blocks": list(range(n_vis_blocks)),
+        "kept_decoder_layers": list(range(n_dec_layers)),
+        "max_position_embeddings": 768,
     }
     with open(OUTPUT_PATH / "prune_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -283,8 +241,9 @@ def main():
     print(f"  Vocab:       248077 active tokens + 4 special (Embeddings padded to {new_vocab_size})")
     print(f"  Special:     <|mcq|>={mcq_token_id}, <|lr|>={lr_token_id}, "
           f"<|dist|>={dist_token_id}, <|count|>={count_token_id}")
-    print(f"  Vision:      12 blocks -> {len(KEEP_VISION_BLOCKS)}")
-    print(f"  Decoder:     24 layers -> {len(KEEP_DECODER_LAYERS)}")
+    print(f"  Vision:      {n_vis_blocks} blocks (ALL kept, no pruning)")
+    print(f"  Decoder:     {n_dec_layers} layers (ALL kept, no pruning)")
+    print(f"  Context:     768 max positions")
     print(f"  Embed:       {embed_params/1e6:.1f}M params ({embed_params * 2 / 1e6:.1f} MB bf16)")
     print(f"  Total:       {total_params/1e6:.1f}M params")
     print(f"  Output:      {OUTPUT_PATH}")

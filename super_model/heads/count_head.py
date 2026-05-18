@@ -9,7 +9,7 @@ Output: continuous scalar predictions [B_count] (positive, rounded at inference)
 
 Design differences from DistanceHead:
     - Down-weighted scene context (×scene_gate) — counting is mask-centric
-    - N_masks as query bias: q *= (1 + N_masks/10), more masks → stronger query
+    - Scene gate: learnable sigmoid gate blends global scene context into query
     - Shallower MLP: 4096 → 512 → 1
     - Softplus output for smooth positive values
 
@@ -87,9 +87,10 @@ class CountHead(nn.Module):
             dep  = dep_list[i]   # [N_masks, 1024]
             gdep = gdep_list[i]  # [N_masks, 1024]
 
-            # N_masks as query bias: more masks → stronger query
-            n_masks = rgb.shape[0]
-            q = q * (1.0 + n_masks / 10.0)
+            # Scene gate: counting is mask-centric, down-weight global scene context
+            gate = torch.sigmoid(self.scene_gate)
+            scene_ctx = scene_ctx_list[i].squeeze(0)  # [1024]
+            q = q + gate * scene_ctx  # blend scene context (learnable weight)
 
             # Tri-Source Attention @ full 1024-dim
             score_rgb = (q @ rgb.T) / self.scale

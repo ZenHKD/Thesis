@@ -1,20 +1,26 @@
 """
-SpatialVLM Super Training — 4-Head Architecture
+SpatialVLM Super Training — 4-Head Architecture (DPT Pipeline)
 ==========================================================
 
-All components trainable (embeddings FROZEN except 4 special tokens):
-    - Vision Encoder (4 ViT blocks)
+2-Stage Training:
+    Stage 1 (--stage 1): Freeze Qwen Vision Encoder
+    Stage 2 (--stage 2): Unfreeze Qwen Vision Encoder
+
+Both stages: Embeddings FROZEN (only <|mcq|>, <|lr|>, <|dist|>, <|count|> trainable)
+
+Components:
+    - Vision Encoder (12 ViT blocks, DPT multi-layer features)
     - Text Decoder (24 layers, single pass)
-    - RTI (Tri-Source U-Net)
+    - DPT-based RTI (Region Token Extractor)
+    - SharedVisualFuser (Dual-Stream)
     - 4 Heads: MCQ, LeftRight, Distance, Count
-    - Embeddings: FROZEN (only <|mcq|>, <|lr|>, <|dist|>, <|count|> trainable)
 
 Loss:   L = CE + w_dist·L_Dist + w_count·L_Count + w_mcq·L_MCQ + w_lr·L_LR
 
 Usage:
-    python src/train_super/train.py
-    python src/train_super/train.py --epochs 5 --batch-size 4
-    python src/train_super/train.py --resume checkpoints/super/step_20000
+    python src/train_super/train.py --stage 1
+    python src/train_super/train.py --stage 2 --resume checkpoints/super/stage1/epoch_1
+    python src/train_super/train.py --stage 1 --epochs 5 --batch-size 4
 """
 import multiprocessing
 multiprocessing.set_start_method("spawn", force=True)
@@ -31,6 +37,12 @@ from safetensors.torch import save_file, load_file
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+
+# ---- CUDA Performance Flags (free speed-ups) ----
+torch.backends.cuda.matmul.allow_tf32 = True   # TF32 for matmul ops (Ampere+)
+torch.backends.cudnn.allow_tf32 = True         # TF32 for cuDNN ops (Ampere+)
+torch.backends.cudnn.benchmark = True          # Auto-tune convolution kernels (RTI U-Net)
+torch.set_float32_matmul_precision("medium")   # Allow TF32 matmul in torch.compile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -122,6 +134,8 @@ def main():
     parser.add_argument("--attn-impl",   default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
+    parser.add_argument("--stage",       type=int, default=1, choices=[1, 2],
+                        help="Training stage: 1=freeze vision, 2=unfreeze vision")
     parser.add_argument("--split",       default="train_balanced", choices=["train", "train_balanced", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=1)
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
@@ -136,7 +150,7 @@ def main():
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--batch-size",  type=int,   default=1)
+    parser.add_argument("--batch-size",  type=int,   default=2)
     parser.add_argument("--grad-accum",  type=int,   default=16)
     parser.add_argument("--max-grad-norm", type=float, default=2.0)
     parser.add_argument("--warmup-steps", type=int,  default=1000)
@@ -164,12 +178,7 @@ def main():
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 
-    # Enable TF32 for Ampere GPUs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-
-    CHECKPOINT_DIR = CHECKPOINT_BASE
+    CHECKPOINT_DIR = os.path.join(CHECKPOINT_BASE, f"stage{args.stage}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     csv_path = os.path.join(CHECKPOINT_BASE, "training.csv")
 
@@ -177,7 +186,7 @@ def main():
     # 1. LOAD MODEL
     # ====================================================================
     print("=" * 70)
-    print("SUPER TRAINING: 4-Head Architecture")
+    print(f"SUPER TRAINING: Stage {args.stage} — {'Freeze' if args.stage == 1 else 'Unfreeze'} Vision")
     print("=" * 70)
 
     pipeline = SpatialVLM(
@@ -211,7 +220,7 @@ def main():
     # 2. CONFIGURE TRAINABLE PARAMETERS (8 groups)
     # ====================================================================
     print(f"\n{'='*70}")
-    print("PARAMETER GROUPS  [Full Fine-tuning]")
+    print(f"PARAMETER GROUPS  [Stage {args.stage}: {'Vision FROZEN' if args.stage == 1 else 'Vision TRAINABLE'}]")
     print("=" * 70)
 
     # --- Freeze text embeddings (only 4 special tokens trainable) ---
@@ -229,7 +238,17 @@ def main():
     print(f"  [*] Only 4 special tokens trainable: {special_ids} ({n_special:,} params)")
     print(f"  [*] Manual embed injection (no hook — compile-friendly)")
 
-    # All trainable (except frozen embeddings above)
+    # Stage-based Vision Encoder freezing
+    if args.stage == 1:
+        # Stage 1: Freeze vision encoder
+        for p in pipeline.qwen.model.visual.parameters():
+            p.requires_grad = False
+        print(f"  [*] Vision Encoder FROZEN (Stage 1)")
+    else:
+        # Stage 2: Unfreeze vision encoder
+        for p in pipeline.qwen.model.visual.parameters():
+            p.requires_grad = True
+        print(f"  [*] Vision Encoder TRAINABLE (Stage 2)")
 
     # Build optimizer param groups (only include params with requires_grad)
     vision_params = [p for p in pipeline.qwen.model.visual.parameters() if p.requires_grad]
@@ -307,7 +326,7 @@ def main():
         if len(params) > 0:
             param_groups.append({"params": params, "lr": lr, "name": name})
 
-    optimizer = AdamW(param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+    optimizer = AdamW(param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.999), fused=True)
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(total_steps - args.warmup_steps, 1), eta_min=1e-6,
     )
@@ -411,7 +430,6 @@ def main():
 
             # Move to device
             pixel_values   = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
-            pixel_values_rgb = batch["pixel_values_rgb"].to(device=dev, dtype=dtype, non_blocking=True)
             image_grid_thw = batch["image_grid_thw"].to(device=dev, non_blocking=True)
             depth_maps     = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
             input_ids      = batch["input_ids"].to(device=dev, non_blocking=True)
@@ -426,7 +444,6 @@ def main():
             try:
                 output = pipeline(
                     pixel_values=pixel_values,
-                    pixel_values_rgb=pixel_values_rgb,
                     image_grid_thw=image_grid_thw,
                     depth_maps=depth_maps,
                     input_ids=input_ids,
@@ -439,7 +456,7 @@ def main():
                     count_token_positions=batch.get("count_token_positions"),
                     attention_mask=attention_mask,
                     use_gradient_checkpointing=args.grad_ckpt,
-                    vision_requires_grad=True,
+                    vision_requires_grad=(args.stage == 2),
                 )
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -491,7 +508,7 @@ def main():
                 "loss": f"{window_avg:.4f}",
             })
 
-            del logits, output, loss, pixel_values, pixel_values_rgb, depth_maps
+            del logits, output, loss, pixel_values, depth_maps
             del dist_pred, count_pred, mcq_logits, lr_logits
 
             # Optimizer step every grad_accum micro-steps
@@ -613,10 +630,9 @@ def main():
                             f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
                             "", "",
                         ])
-                    print(f"\nValidation: val_loss={vl:.4f} "
-                          f"(CE={vce:.4f} Dist={vdist:.4f} Count={vcnt:.4f} "
-                          f"MCQ={vmcq:.4f}/{vmcq_a:.1f}% LR={vlr:.4f}/{vlr_a:.1f}% "
-                          f"DistAcc={vdist_a:.1f}% CntAcc={vcnt_a:.1f}%)")
+                    print(f"\nValidation Accuracy: "
+                          f"MCQ={vmcq_a:.1f}% | LR={vlr_a:.1f}% | "
+                          f"Dist={vdist_a:.1f}% | Count={vcnt_a:.1f}%")
 
         # ==============================================================
         # END OF EPOCH 

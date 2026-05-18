@@ -1,23 +1,20 @@
 """
-SpatialVLM Super — Batched DataLoader
-======================================
+SpatialVLM Super — Batched DataLoader (v2: Dual-Image + Simplified Output)
+==========================================================================
 
 PyTorch Dataset for the NVIDIA Warehouse dataset, adapted for the Super
 architecture with 4 dedicated heads and batch_size > 1 support.
 
-Key changes from model_micro dataloader:
-    1. format_answer(): each task → its own special token
-       distance   → "distance | <|dist|>"
-       count      → "count | <|count|>"
-       mcq        → "mcq | <|mcq|>"
-       left_right → "left_right | <|lr|>"
-    2. 4 separate token position fields (one per head)
-    3. Direct output: no chain-of-thought, answer only
-    4. No chat template: question tokenized directly, image processed separately
-    5. Separate tokenization: question & answer tokenized independently
-       then concatenated to guarantee exact label boundaries (BPE-safe)
-    6. RTI 3→3: <mask> (3 tokens) replaced by [mask_rgb, mask_depth, global_depth]
-       — NO sequence length change, no trimming needed
+Key changes from v1:
+    1. Dual-image input: [RGB, Depth] batched through ViT as Picture 1 & Picture 2
+       - RGB  → visual_rgb_tokens [160, 1024] — scene appearance
+       - Depth → visual_dep_tokens [160, 1024] — global depth context
+       This provides the global depth features that v1 was missing (distance ~35% acc).
+    2. Simplified LM output: LM head outputs ONLY the special token directly
+       No more "category | <|token|>" format — just <|token|><|im_end|>
+       The category is implied by which token is generated.
+    3. DPT-based RTI: ViT intermediate features replace U-Net
+       RTI now receives ViT intermediates instead of raw images.
 
 Splits: train (499K), val (1.9K), test (19K)
 
@@ -74,32 +71,32 @@ _SPLIT_CONFIG = {
 
 
 # ===========================================================================
-# Answer formatting (Super: each task gets its own special token)
+# Answer formatting (Super v2: direct token output, no category prefix)
 # ===========================================================================
 
 def format_answer(category: str, normalized_answer) -> str:
     """Build the structured target string for training.
 
-    Format: <category> | <value>
-
-    Super architecture: each task type has its own dedicated token:
-        distance   → "distance | <|dist|>"    (DistanceHead predicts the value)
-        count      → "count | <|count|>"      (CountHead predicts the value)
-        mcq        → "mcq | <|mcq|>"          (MCQHead selects region)
-        left_right → "left_right | <|lr|>"    (LeftRightHead determines direction)
+    Super v2: LM head outputs only the special token directly.
+        distance   → "<|dist|>"
+        count      → "<|count|>"
+        mcq        → "<|mcq|>"
+        left_right → "<|lr|>"
+    
+    No more "category | <|token|>" format. The category is inferred
+    from which special token the model generates.
     """
     if category == "distance":
-        return "distance | <|dist|>"
+        return "<|dist|>"
     elif category == "count":
-        return "count | <|count|>"
+        return "<|count|>"
     elif category == "mcq":
-        return "mcq | <|mcq|>"
+        return "<|mcq|>"
     elif category == "left_right":
-        return "left_right | <|lr|>"
+        return "<|lr|>"
     else:
         raw = str(normalized_answer)
-        formatted = f'"{raw}"'
-        return f"{category} | {formatted}"
+        return f'"{raw}"'
 
 
 # ===========================================================================
@@ -110,9 +107,8 @@ class SpatialVLMDataset(Dataset):
     """PyTorch Dataset for SpatialVLM Super training/evaluation.
 
     Each __getitem__ returns a dict with:
-        pixel_values      : [num_patches, 1536]
-        pixel_values_rgb  : [3, H_orig, W_orig] — raw image tensor for RTI
-        image_grid_thw    : [1, 3]
+        pixel_values      : [num_patches_total, 1536] — RGB + Depth patches concatenated
+        image_grid_thw    : [2, 3] — grid for [RGB, Depth] images
         depth_map         : [H, W]
         input_ids         : [T]
         labels            : [T]
@@ -219,7 +215,7 @@ class SpatialVLMDataset(Dataset):
     def _load_sample(self, idx: int) -> dict:
         entry = self.data[idx]
 
-        # 1. Load image
+        # 1. Load RGB image
         image_name = entry["image"]
         image_path = os.path.join(self.image_dir, image_name)
         image = Image.open(image_path).convert("RGB")
@@ -227,11 +223,10 @@ class SpatialVLMDataset(Dataset):
             image = image.resize(self.target_size, Image.LANCZOS)
 
         # Apply augmentation (RGB only, training splits only)
-        # Safe transforms that preserve geometry (no flip/crop/rotate/resize)
         if self.augment:
             image = self._augment_rgb(image)
 
-        # 2. Load depth map
+        # 2. Load depth map (as raw tensor AND as RGB-converted PIL for ViT)
         depth_path = os.path.join(self.depth_dir, image_name.replace(".png", "_depth.png"))
         depth_pil = Image.open(depth_path)
         if self.target_size:
@@ -239,7 +234,16 @@ class SpatialVLMDataset(Dataset):
         depth_np = np.array(depth_pil, dtype=np.float32)
         depth_map = torch.from_numpy(depth_np)
 
-        # 3. Parse question (conversations[0] = user question, [1] = GPT answer — no longer used)
+        # Convert depth to 3-channel "RGB" image for ViT processing
+        # Normalize to 0-255 range and replicate across 3 channels
+        depth_for_vit = depth_np.copy()
+        if depth_for_vit.max() > 0:
+            depth_for_vit = (depth_for_vit / depth_for_vit.max() * 255).astype(np.uint8)
+        else:
+            depth_for_vit = depth_for_vit.astype(np.uint8)
+        depth_rgb = Image.fromarray(np.stack([depth_for_vit]*3, axis=-1))
+
+        # 3. Parse question
         question_raw = entry["conversations"][0]["value"]
         question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
 
@@ -255,16 +259,13 @@ class SpatialVLMDataset(Dataset):
             if category == "mcq":
                 target_cat_index = int(raw_answer)  # Region index (0-12)
             elif category == "left_right":
-                # "left" -> 0 (first mask), "right" -> 1 (second mask)
                 target_cat_index = 0 if raw_answer == "left" else 1
             else:
                 target_cat_index = -1
         else:
             target_cat_index = -1
 
-        # 5. Build answer string (no CoT — direct output)
-        cot_str = f"{category} | "
-        
+        # 5. Build answer string (direct token output, no category prefix)
         if category == "distance":
             ans_text = ""
         elif category == "count":
@@ -287,30 +288,37 @@ class SpatialVLMDataset(Dataset):
             return f"[Region {i}]: <|object_ref_start|>{match.group(1)}<|object_ref_end|>"
         question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
-        # 7. Process image separately (pixel_values + grid only)
+        # 7. Process BOTH images through image_processor (batch of 2)
         image_inputs = self.processor.image_processor(
-            images=image, return_tensors="pt"
+            images=[image, depth_rgb], return_tensors="pt"
         )
-        pixel_values   = image_inputs["pixel_values"]
-        image_grid_thw = image_inputs["image_grid_thw"]
+        pixel_values   = image_inputs["pixel_values"]       # [num_patches_total, 1536]
+        image_grid_thw = image_inputs["image_grid_thw"]      # [2, 3]
 
-        # 8. Calculate visual tokens correctly for inline injection
-        h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
-        h_vis, w_vis = h_p // 2, w_p // 2
-        num_visual_tokens = int(h_vis * w_vis)
+        # 8. Calculate visual tokens for EACH image (for inline injection)
+        # RGB tokens
+        h_p_rgb, w_p_rgb = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+        h_vis_rgb, w_vis_rgb = h_p_rgb // 2, w_p_rgb // 2
+        num_visual_rgb_tokens = int(h_vis_rgb * w_vis_rgb)
+
+        # Depth tokens  
+        h_p_dep, w_p_dep = image_grid_thw[1, 1].item(), image_grid_thw[1, 2].item()
+        h_vis_dep, w_vis_dep = h_p_dep // 2, w_p_dep // 2
+        num_visual_dep_tokens = int(h_vis_dep * w_vis_dep)
         
-        vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
-        user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+        # Build dual-image vision string
+        vision_str_1 = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_rgb_tokens + "<|vision_end|>\n"
+        vision_str_2 = "Picture 2: <|vision_start|>" + "<|image_pad|>" * num_visual_dep_tokens + "<|vision_end|>\n"
+        user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{question}<|im_end|>\n"
         eval_prompt = f"<|im_start|>assistant\n"
         
         q_ids = self.tokenizer.encode(user_str + eval_prompt, add_special_tokens=False)
 
-        # 9. Encode separately to guarantee boundary mapping
-        cot_ids = self.tokenizer.encode(cot_str, add_special_tokens=False)
-        ans_ids = self.tokenizer.encode(ans_text, add_special_tokens=False)
+        # 9. Encode answer tokens
+        ans_ids = self.tokenizer.encode(ans_text, add_special_tokens=False) if ans_text else []
         tail_ids = self.tokenizer.encode(tail_str, add_special_tokens=False)
 
-        # Map each category to its dedicated special token
+        # Map each category to its dedicated special token (direct, no prefix)
         if category == "distance":
             target_ids = [self.dist_token_id] + tail_ids
         elif category == "count":
@@ -322,13 +330,13 @@ class SpatialVLMDataset(Dataset):
         else:
             target_ids = ans_ids + tail_ids
 
-        a_ids = cot_ids + target_ids
+        a_ids = target_ids
         all_ids    = q_ids + a_ids
         input_ids  = torch.tensor(all_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
 
 
-        # 10. Labels: question + separator = -100, answer (+ EOS) = active
+        # 10. Labels: question = -100, answer = active
         answer_start = len(q_ids)
         labels = input_ids.clone()
         labels[:answer_start] = -100
@@ -369,7 +377,7 @@ class SpatialVLMDataset(Dataset):
         else:
             answer_str = raw_answer
 
-        # 14. Pre-decode RLE masks + soft masks
+        # 14. Pre-decode RLE masks + soft masks (use RGB grid for mask resolution)
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
         h_vis, w_vis = h_p // 2, w_p // 2
         decoded_masks = []
@@ -391,12 +399,8 @@ class SpatialVLMDataset(Dataset):
             soft2d = torch.sigmoid(50.0 * (coverage - 0.3))
             decoded_masks.append({'binary': binary, 'soft2d': soft2d})
 
-        # 15. Raw RGB for RTI (0-1 float)
-        pixel_values_rgb = TF.to_tensor(image)  # [3, H_orig, W_orig]
-
         return {
             "pixel_values":   pixel_values,
-            "pixel_values_rgb": pixel_values_rgb,
             "image_grid_thw": image_grid_thw,
             "depth_map":      depth_map,
             "input_ids":      input_ids,
@@ -447,6 +451,7 @@ def collate_fn(batch: list[dict]) -> dict:
         - Fixed-size tensors: stack pixel_values, depth_maps, image_grid_thw
         - Numeric fields: stack is_numeric and target_num as tensors
         - 4 separate token position lists (one per head)
+        - Dual-image: each sample has 2 entries in image_grid_thw
     """
     B = len(batch)
 
@@ -465,8 +470,9 @@ def collate_fn(batch: list[dict]) -> dict:
         attention_mask[i, :L] = d["attention_mask"]
 
     # --- Stack fixed-size tensors ---
+    # pixel_values: each sample has patches for 2 images (RGB + Depth)
     pixel_values = torch.cat([d["pixel_values"] for d in batch], dim=0)
-    pixel_values_rgb = torch.stack([d["pixel_values_rgb"] for d in batch], dim=0)
+    # image_grid_thw: each sample has [2, 3], stack to [B*2, 3]
     image_grid_thw = torch.cat([d["image_grid_thw"] for d in batch], dim=0)
 
     # Depth maps (same resolution if target_size is set)
@@ -496,7 +502,6 @@ def collate_fn(batch: list[dict]) -> dict:
 
     return {
         "pixel_values":          pixel_values,
-        "pixel_values_rgb":      pixel_values_rgb,
         "image_grid_thw":        image_grid_thw,
         "depth_maps":            depth_maps,
         "input_ids":             input_ids,

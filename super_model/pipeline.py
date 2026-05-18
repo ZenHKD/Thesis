@@ -2,26 +2,27 @@
 MODULE: Full Pipeline — SpatialVLM Super (Training)
 
 Architecture:
-    1. Qwen 3.5 Vision Encoder (pruned: 4 ViT blocks)
-       4 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
-    2. RTI: Region-Level Token Injection (batched)
+    1. Qwen 3.5 Vision Encoder (FULL: 12 ViT blocks, no pruning)
+       12 ViT blocks (768-dim) + merger (VL Projector, 768->1024)
+       Dual-image: [RGB, Depth] batched through ViT → 2 × [160, 1024]
+    2. DPT-based RTI: Multi-layer ViT features (layers 3,6,9,12)
        Each <mask> -> [mask_rgb | mask_depth | global_depth] (3 tokens x 1024-dim)
-    3. Concat Fusion: [visual_tokens | text+region_tokens]
+    3. Dual-Stream Fuser: concat RGB+Depth visual tokens → unified scene context
     4. Qwen 3.5 Backbone (full: 24 layers, single pass)
     5. Five Heads:
-       - LM Head (tied w/ embed): category text
-       - MCQ Head: Tri-Source + Visual Context Scoring
-       - LeftRight Head: Binary Tri-Source + Visual Context Scoring
-       - Distance Head: Tri-Source + Visual Context -> Regression
+       - LM Head (tied w/ embed): direct special token output
+       - MCQ Head: Tri-Source + Dual Visual Context Scoring
+       - LeftRight Head: Binary Tri-Source + Dual Visual Context
+       - Distance Head: Tri-Source + Dual Visual Context -> Regression
        - Count Head: Mask-Centric Tri-Source Regression
 
 4 special token IDs read from config (set by prune.py).
 
-Output format (direct, no chain-of-thought):
-    mcq | <|mcq|>
-    left_right | <|lr|>
-    distance | <|dist|>
-    count | <|count|>
+Output format (direct, no chain-of-thought, no category prefix):
+    <|mcq|>
+    <|lr|>
+    <|dist|>
+    <|count|>
 """
 
 import re
@@ -64,12 +65,18 @@ def _read_special_token_ids():
 MCQ_TOKEN_ID, LR_TOKEN_ID, DIST_TOKEN_ID, COUNT_TOKEN_ID = _read_special_token_ids()
 
 # Regex for structured output parsing
-# Format: category | answer
+# Direct token output (no category prefix)
 _OUTPUT_RE = re.compile(
-    r'(?P<category>left_right|mcq|distance|count)\s*\|\s*'
     r'(?P<answer><\|mcq\|>|<\|lr\|>|<\|dist\|>|<\|count\|>)',
     re.IGNORECASE,
 )
+# Map token -> category
+_TOKEN_TO_CATEGORY = {
+    '<|mcq|>': 'mcq',
+    '<|lr|>': 'left_right',
+    '<|dist|>': 'distance',
+    '<|count|>': 'count',
+}
 
 
 def find_mask_positions(input_ids: torch.Tensor, tokenizer) -> list[int]:
@@ -115,17 +122,18 @@ def print_vram_usage(label: str = ""):
 
 
 class SpatialVLM(nn.Module):
-    """Full pipeline: Qwen 3.5 VLM (vision pruned) + RTI + 4 Dedicated Heads.
+    """Full pipeline: Qwen 3.5 VLM (full 12-block ViT) + DPT RTI + 4 Dedicated Heads.
 
     Custom modules:
-        self.region_token_extractor  - RTE (Tri-Source U-Net)
+        self.region_token_extractor  - RTE (DPT-style multi-layer ViT features)
+        self.visual_fuser            - SharedVisualFuser (dual-stream RGB+Depth)
         self.mcq_head                - MCQHead
         self.lr_head                 - LeftRightHead
         self.dist_head               - DistanceHead
         self.count_head              - CountHead
 
     Qwen built-in (from Qwen 3.5 0.8B):
-        self.qwen.model.visual         - Vision Encoder (4 blocks)
+        self.qwen.model.visual         - Vision Encoder (12 blocks, full)
         self.qwen.model.language_model - 24-layer backbone (single pass)
         self.qwen.lm_head              - Vocab projection
     """
@@ -210,66 +218,105 @@ class SpatialVLM(nn.Module):
     def device(self):
         return next(self.qwen.parameters()).device
 
-    # ---- Vision Encoder ----
+    # ---- Vision Encoder (Dual-Image + Intermediate Feature Extraction) ----
 
-    def _get_visual_tokens(
+    def _get_visual_tokens_with_intermediates(
         self,
         pixel_values:   torch.Tensor,
         image_grid_thw: torch.Tensor,
         vision_requires_grad: bool = False,
     ) -> tuple:
-        """Run Qwen's Vision Encoder + Merger.
+        """Run Qwen's Vision Encoder with intermediate feature extraction for DPT.
+
+        Dual-image aware: image_grid_thw has [B*2, 3] entries (RGB + Depth per sample).
+
         Returns:
-            stacked_visual_tokens: [B, N, 1024]
-            stacked_vit_feat:      [B, 768, H, W] (pre-merger unflattened feature map)
+            merged_tokens: [B*2, N_merged, 1024] — post-merger visual tokens
+            intermediates: list of 4 × [B*2, N_patches, 768] — ViT intermediate features
+                           from blocks 2, 5, 8, 11 (layers 3, 6, 9, 12)
         """
         visual = self.qwen.model.visual
         ctx = torch.enable_grad() if vision_requires_grad else torch.no_grad()
+
+        HOOK_LAYERS = [2, 5, 8, 11]  # 0-indexed blocks for layers 3, 6, 9, 12
+
         with ctx:
-            visual_out = visual(pixel_values, grid_thw=image_grid_thw)
+            # Step 1: Patch embedding
+            x = visual.patch_embed(pixel_values)
 
-        if isinstance(visual_out, torch.Tensor):
-            hidden = visual_out
-        elif hasattr(visual_out, "last_hidden_state"):
-            hidden = visual_out.last_hidden_state
-        elif isinstance(visual_out, tuple):
-            hidden = visual_out[0]
-        else:
-            hidden = visual_out
+            # Step 2: Position embedding
+            if hasattr(visual, 'fast_pos_embed_interpolate'):
+                x = x + visual.fast_pos_embed_interpolate(image_grid_thw)
+                
+                # Qwen 3.5 requires cu_seqlens and rotary_pos_emb for the blocks
+                rotary_pos_emb = visual.rot_pos_emb(image_grid_thw)
+                seq_len, _ = x.size()
+                rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+                emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+                position_embeddings = (emb.cos(), emb.sin())
+                
+                cu_seqlens = torch.repeat_interleave(
+                    image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+                ).cumsum(dim=0, dtype=torch.int32)
+                cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+            elif hasattr(visual, 'pos_embed') and visual.pos_embed is not None:
+                # Fallback for old architecture if needed
+                pos_ids = []
+                for i in range(image_grid_thw.shape[0]):
+                    t, h, w = [int(v) for v in image_grid_thw[i].tolist()]
+                    hpos = torch.arange(h, device=x.device).unsqueeze(1).expand(-1, w).reshape(-1)
+                    wpos = torch.arange(w, device=x.device).unsqueeze(0).expand(h, -1).reshape(-1)
+                    hpos = hpos.unsqueeze(1).repeat(1, t)
+                    wpos = wpos.unsqueeze(1).repeat(1, t)
+                    tpos = torch.arange(t, device=x.device).unsqueeze(0).expand(h*w, -1)
+                    pos = torch.stack([tpos, hpos, wpos], dim=-1).reshape(-1, 3)
+                    pos_ids.append(pos)
+                pos_ids_cat = torch.cat(pos_ids, dim=0)
+                x = x + visual.pos_embed(pos_ids_cat)
+                cu_seqlens = None
+                position_embeddings = None
 
-        B = image_grid_thw.shape[0]
+            # Step 3: Run through all blocks, hooking intermediates
+            intermediates_raw = []
+            for block_idx, block in enumerate(visual.blocks):
+                if cu_seqlens is not None:
+                    x = block(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+                else:
+                    x = block(x)
+                if block_idx in HOOK_LAYERS:
+                    intermediates_raw.append(x.clone())
+
+        # x is now the final ViT output [N_total, 768]
+        hidden = x
+
+        # Split per image
+        B_images = image_grid_thw.shape[0]
         patches_per_image = [
             int(image_grid_thw[i, 0] * image_grid_thw[i, 1] * image_grid_thw[i, 2])
-            for i in range(B)
+            for i in range(B_images)
         ]
 
-        if hidden.dim() == 2:
-            hidden_list = hidden.split(patches_per_image, dim=0)
-        else:
-            hidden_list = [hidden[i] for i in range(B)]
-
-        if hidden_list[0].shape[-1] == 1024:
-            max_n = max(h.shape[0] for h in hidden_list)
+        # Split intermediates per image
+        intermediates = []
+        for layer_feats in intermediates_raw:
+            split_feats = layer_feats.split(patches_per_image, dim=0)
+            max_n = max(f.shape[0] for f in split_feats)
             stacked = torch.stack([
-                F.pad(h, (0, 0, 0, max_n - h.shape[0])) for h in hidden_list
-            ])
-            return stacked, None
+                F.pad(f, (0, 0, 0, max_n - f.shape[0])) for f in split_feats
+            ])  # [B_images, max_n, 768]
+            intermediates.append(stacked)
 
-        # Pre-merger: apply merger per-image
+        # Apply merger to get post-merger tokens [B_images, N_merged, 1024]
+        hidden_list = hidden.split(patches_per_image, dim=0)
+
         ms = 2
         merged = []
-        vit_feats = []
-        for i in range(B):
+        for i in range(B_images):
             h_i = hidden_list[i].unsqueeze(0)
-            t, h, w = [int(x) for x in image_grid_thw[i].tolist()]
+            t, h, w = [int(v) for v in image_grid_thw[i].tolist()]
             C = h_i.shape[-1]
 
             h_i = visual.merger.norm(h_i)
-            
-            # Extract spatial ViT feature map [1, C, h, w]
-            vit_spatial = h_i.view(1, t, h, w, C).squeeze(1).permute(0, 3, 1, 2).contiguous()
-            vit_feats.append(vit_spatial)
-
             h_i = h_i.view(1, t, h, w, C)
             h_i = h_i.view(1, t, h // ms, ms, w // ms, ms, C)
             h_i = h_i.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
@@ -278,18 +325,18 @@ class SpatialVLM(nn.Module):
             h_i = visual.merger.linear_fc1(h_i)
             h_i = F.gelu(h_i)
             h_i = visual.merger.linear_fc2(h_i)
-
             merged.append(h_i)
 
-        return torch.cat(merged, dim=0), torch.cat(vit_feats, dim=0)
+        merged_tokens = torch.cat(merged, dim=0)  # [B_images, N_merged, 1024]
+
+        return merged_tokens, intermediates
 
     # ---- Build inputs embeds ----
 
     def _build_inputs_embeds(
         self,
         pixel_values:         torch.Tensor,
-        pixel_values_rgb:     torch.Tensor,   # Raw RGB for RTI [B, 3, H, W]
-        image_grid_thw:       torch.Tensor,
+        image_grid_thw:       torch.Tensor,   # [B*2, 3] — RGB + Depth per sample
         depth_maps:           torch.Tensor,
         input_ids:            torch.Tensor,   # [B, L]
         rle_list:             list = None,    # [B][num_masks]
@@ -299,33 +346,64 @@ class SpatialVLM(nn.Module):
     ) -> tuple:
         """Build [B, T, 1024] inputs_embeds for the backbone.
 
-        RTI uses 3 -> 3 replacement: sequence length is UNCHANGED.
+        Dual-image: each sample has 2 images (RGB, Depth) in ViT.
+        RTI uses DPT features from ViT intermediates (no raw image input).
 
         Returns:
             inputs_embeds:  [B, T, 1024]
-            n_visual:       int (0, since visual tokens are inline padded)
-            region_tokens:  list[list[tuple]] — RTI projected tokens per sample/mask
-                            region_tokens[b][m] = (rgb [1,1024], dep [1,1024], gdep [1,1024])
-                            None if no RTI was computed.
+            n_visual:       int (0, inline padded)
+            region_tokens:  list[list[tuple]] or None
+            vis_rgb_list:   list of [N_vis, 1024] — RGB visual tokens per sample
+            vis_dep_list:   list of [N_vis, 1024] — Depth visual tokens per sample
         """
-        # Step 1: Vision Encoder + Merger -> [B, N, 1024]
-        visual_tokens, vit_feat = self._get_visual_tokens(
+        # Step 1: Vision Encoder + Merger + Intermediates
+        merged_tokens, intermediates = self._get_visual_tokens_with_intermediates(
             pixel_values, image_grid_thw,
             vision_requires_grad=vision_requires_grad,
         )
-        n_visual = visual_tokens.shape[1]
+        # merged_tokens: [B*2, N_merged, 1024]
+        # intermediates: 4 × [B*2, N_patches, 768]
+
+        B = input_ids.shape[0]
+        # Each sample has 2 images: RGB (even indices) and Depth (odd indices)
+        # Split merged tokens into RGB and Depth
+        vis_rgb_list = []
+        vis_dep_list = []
+        for b in range(B):
+            rgb_idx = b * 2
+            dep_idx = b * 2 + 1
+            vis_rgb_list.append(merged_tokens[rgb_idx])  # [N_merged, 1024]
+            vis_dep_list.append(merged_tokens[dep_idx])  # [N_merged, 1024]
+
+        # Split intermediates into RGB and Depth for DPT RTI
+        rgb_intermediates = []
+        dep_intermediates = []
+        for layer_feats in intermediates:
+            # layer_feats: [B*2, N, 768]
+            rgb_feats = layer_feats[0::2]  # even indices: RGB [B, N, 768]
+            dep_feats = layer_feats[1::2]  # odd indices: Depth [B, N, 768]
+            rgb_intermediates.append(rgb_feats)
+            dep_intermediates.append(dep_feats)
 
         # Step 2: Text embeddings
         embed = self.qwen.model.language_model.embed_tokens
         text_embeds = embed(input_ids)
 
-        # Step 3: RTI (Independent of Vision Encoder)
+        # Step 2.5: Inject Trainable Special Embeddings (if enabled)
+        if hasattr(self, '_special_embed') and self._special_embed is not None:
+            for i, token_id in enumerate(self._special_ids):
+                mask = (input_ids == token_id).unsqueeze(-1)
+                text_embeds = torch.where(mask, self._special_embed[i].to(text_embeds.dtype), text_embeds)
+
+        # Step 3: DPT-based RTI (uses ViT intermediates, not raw images)
         region_tokens = None
         if (rle_list is not None and mask_token_positions is not None
                 and any(len(rl) > 0 for rl in rle_list)):
+            # Use RGB grid for mask spatial dims (first of each pair)
+            rgb_grid_thw = image_grid_thw[0::2]  # [B, 3]
             region_tokens = self.region_token_extractor(
-                pixel_values_rgb, depth_maps, rle_list, image_grid_thw,
-                decoded_masks=decoded_masks, vit_feat=vit_feat,
+                rgb_intermediates, dep_intermediates, rle_list, rgb_grid_thw,
+                decoded_masks=decoded_masks,
             )
             mask_token_len = len(self.processor.tokenizer.encode(
                 "<mask>", add_special_tokens=False
@@ -336,20 +414,24 @@ class SpatialVLM(nn.Module):
                 mask_token_len=mask_token_len,
             )
 
-        # Step 4: Inline Pad Replacement Fusion
+        # Step 4: Inline Pad Replacement (dual-image: RGB pads then Depth pads)
         img_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        B = text_embeds.shape[0]
-        
+
         for b in range(B):
             pad_indices = (input_ids[b] == img_pad_id).nonzero(as_tuple=True)[0]
             if len(pad_indices) > 0:
-                n_vis = min(len(pad_indices), visual_tokens.shape[1])
-                text_embeds[b, pad_indices[:n_vis]] = visual_tokens[b, :n_vis]
+                # First N_rgb pads → RGB tokens, next N_dep pads → Depth tokens
+                n_rgb = vis_rgb_list[b].shape[0]
+                n_dep = vis_dep_list[b].shape[0]
+                rgb_pads = pad_indices[:n_rgb]
+                dep_pads = pad_indices[n_rgb:n_rgb + n_dep]
+                text_embeds[b, rgb_pads] = vis_rgb_list[b][:len(rgb_pads)]
+                text_embeds[b, dep_pads] = vis_dep_list[b][:len(dep_pads)]
 
         inputs_embeds = text_embeds
         n_visual_offset = 0
 
-        return inputs_embeds, n_visual_offset, region_tokens
+        return inputs_embeds, n_visual_offset, region_tokens, vis_rgb_list, vis_dep_list
 
     # ---- Backbone forward ----
 
@@ -386,7 +468,7 @@ class SpatialVLM(nn.Module):
         if attention_mask is not None:
             causal_mask = create_causal_mask(
                 config=lm.config,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=inputs_embeds, # type: ignore
                 attention_mask=attention_mask,
                 cache_position=cache_position if cache_position is not None
                     else torch.arange(seq_len, device=inputs_embeds.device),
@@ -443,7 +525,6 @@ class SpatialVLM(nn.Module):
     def forward(
         self,
         pixel_values:         torch.Tensor,
-        pixel_values_rgb:     torch.Tensor,
         image_grid_thw:       torch.Tensor,
         depth_maps:           torch.Tensor,
         input_ids:            torch.Tensor,
@@ -468,8 +549,8 @@ class SpatialVLM(nn.Module):
                 'mcq_logits':   list of [N_masks] tensors
                 'lr_logits':    list of [2] tensors
         """
-        inputs_embeds, n_visual, region_tokens = self._build_inputs_embeds(
-            pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
+        inputs_embeds, n_visual, region_tokens, vis_rgb_list, vis_dep_list = self._build_inputs_embeds(
+            pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
             vision_requires_grad=vision_requires_grad,
         )
@@ -521,22 +602,28 @@ class SpatialVLM(nn.Module):
             dep_batch  = [None] * B
             gdep_batch = [None] * B
 
-        # Extract visual tokens (post-merger, 160 tokens) for head context
-        # Visual tokens are embedded at image_pad positions in h_normed
+        # Extract dual-stream visual tokens from h_normed at image_pad positions
         img_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        vis_batch = []  # list of [N_vis, 1024]
+        vis_rgb_normed = []  # [N_vis_rgb, 1024] per sample
+        vis_dep_normed = []  # [N_vis_dep, 1024] per sample
         for b in range(B):
             pad_indices = (input_ids[b] == img_pad_id).nonzero(as_tuple=True)[0]
             if len(pad_indices) > 0:
-                vis_tokens_b = h_normed[b, n_visual + pad_indices, :]  # [N_vis, 1024]
-                vis_batch.append(vis_tokens_b)
+                n_rgb = vis_rgb_list[b].shape[0]
+                n_dep = vis_dep_list[b].shape[0]
+                rgb_pads = pad_indices[:n_rgb]
+                dep_pads = pad_indices[n_rgb:n_rgb + n_dep]
+                vis_rgb_normed.append(h_normed[b, n_visual + rgb_pads, :])
+                vis_dep_normed.append(h_normed[b, n_visual + dep_pads, :])
             else:
-                vis_batch.append(None)
+                vis_rgb_normed.append(None)
+                vis_dep_normed.append(None)
 
         # ---- Distance Head ----
-        dist_pred = torch.zeros(B, device=h_normed.device, dtype=h_normed.dtype)
+        dist_pred_list = [torch.tensor(0.0, device=h_normed.device, dtype=h_normed.dtype)] * B
         if dist_token_positions is not None:
-            dist_h_list, dist_rgb, dist_dep, dist_gdep, dist_vis = [], [], [], [], []
+            dist_h_list, dist_rgb, dist_dep, dist_gdep = [], [], [], []
+            dist_vis_rgb, dist_vis_dep = [], []
             dist_indices = []
             for b, pos in enumerate(dist_token_positions):
                 if pos is not None and pos >= 0:
@@ -546,23 +633,25 @@ class SpatialVLM(nn.Module):
                         dist_rgb.append(rgb_batch[b])
                         dist_dep.append(dep_batch[b])
                         dist_gdep.append(gdep_batch[b])
-                        dist_vis.append(vis_batch[b])
+                        dist_vis_rgb.append(vis_rgb_normed[b])
+                        dist_vis_dep.append(vis_dep_normed[b])
                         dist_indices.append(b)
             if dist_h_list:
                 h_dist = torch.stack(dist_h_list, dim=0)
-                # Compute fused queries via shared fuser
                 dist_q_list = []
                 for k in range(len(dist_h_list)):
-                    q, _ = self.visual_fuser(dist_h_list[k], dist_vis[k])
+                    q, _ = self.visual_fuser(dist_h_list[k], dist_vis_rgb[k], dist_vis_dep[k])
                     dist_q_list.append(q)
                 preds = self.dist_head(h_dist, dist_rgb, dist_dep, dist_gdep, dist_q_list)
                 for k, b in enumerate(dist_indices):
-                    dist_pred[b] = preds[k]
+                    dist_pred_list[b] = preds[k]
+        dist_pred = torch.stack(dist_pred_list)
 
         # ---- Count Head ----
-        count_pred = torch.zeros(B, device=h_normed.device, dtype=h_normed.dtype)
+        count_pred_list = [torch.tensor(0.0, device=h_normed.device, dtype=h_normed.dtype)] * B
         if count_token_positions is not None:
-            cnt_h_list, cnt_rgb, cnt_dep, cnt_gdep, cnt_vis = [], [], [], [], []
+            cnt_h_list, cnt_rgb, cnt_dep, cnt_gdep = [], [], [], []
+            cnt_vis_rgb, cnt_vis_dep = [], []
             cnt_indices = []
             for b, pos in enumerate(count_token_positions):
                 if pos is not None and pos >= 0:
@@ -572,19 +661,20 @@ class SpatialVLM(nn.Module):
                         cnt_rgb.append(rgb_batch[b])
                         cnt_dep.append(dep_batch[b])
                         cnt_gdep.append(gdep_batch[b])
-                        cnt_vis.append(vis_batch[b])
+                        cnt_vis_rgb.append(vis_rgb_normed[b])
+                        cnt_vis_dep.append(vis_dep_normed[b])
                         cnt_indices.append(b)
             if cnt_h_list:
                 h_cnt = torch.stack(cnt_h_list, dim=0)
-                # Compute fused queries + scene contexts via shared fuser
                 cnt_q_list, cnt_scene_list = [], []
                 for k in range(len(cnt_h_list)):
-                    q, sc = self.visual_fuser(cnt_h_list[k], cnt_vis[k])
+                    q, sc = self.visual_fuser(cnt_h_list[k], cnt_vis_rgb[k], cnt_vis_dep[k])
                     cnt_q_list.append(q)
                     cnt_scene_list.append(sc)
                 preds = self.count_head(h_cnt, cnt_rgb, cnt_dep, cnt_gdep, cnt_q_list, cnt_scene_list)
                 for k, b in enumerate(cnt_indices):
-                    count_pred[b] = preds[k]
+                    count_pred_list[b] = preds[k]
+        count_pred = torch.stack(count_pred_list)
 
         # ---- MCQ Head ----
         mcq_logits_list = []
@@ -594,7 +684,7 @@ class SpatialVLM(nn.Module):
                     adj = n_visual + pos
                     if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
                         h_mcq = h_normed[b, adj, :]
-                        q, _ = self.visual_fuser(h_mcq, vis_batch[b])
+                        q, _ = self.visual_fuser(h_mcq, vis_rgb_normed[b], vis_dep_normed[b])
                         scores = self.mcq_head(rgb_batch[b], dep_batch[b], gdep_batch[b], q)
                         mcq_logits_list.append(scores)
                     else:
@@ -610,7 +700,7 @@ class SpatialVLM(nn.Module):
                     adj = n_visual + pos
                     if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
                         h_lr = h_normed[b, adj, :]
-                        q, _ = self.visual_fuser(h_lr, vis_batch[b])
+                        q, _ = self.visual_fuser(h_lr, vis_rgb_normed[b], vis_dep_normed[b])
                         scores = self.lr_head(rgb_batch[b], dep_batch[b], gdep_batch[b], q)
                         lr_logits_list.append(scores)
                     else:
@@ -626,13 +716,13 @@ class SpatialVLM(nn.Module):
             "lr_logits": lr_logits_list,
         }
 
+
     # ---- Generate (inference) ----
 
     @torch.no_grad()
     def generate(
         self,
         pixel_values:         torch.Tensor,
-        pixel_values_rgb:     torch.Tensor,
         image_grid_thw:       torch.Tensor,
         depth_maps:           torch.Tensor,
         input_ids:            torch.Tensor,
@@ -644,10 +734,10 @@ class SpatialVLM(nn.Module):
         **gen_kwargs,
     ) -> torch.Tensor:
         """Autoregressive generation with repetition penalty."""
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache  # type: ignore
 
-        inputs_embeds, n_visual, _region_tokens = self._build_inputs_embeds(
-            pixel_values, pixel_values_rgb, image_grid_thw, depth_maps, input_ids,
+        inputs_embeds, n_visual, _region_tokens, _vis_rgb, _vis_dep = self._build_inputs_embeds(
+            pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
         )
 
@@ -718,14 +808,18 @@ class SpatialVLM(nn.Module):
     def parse_output(text: str) -> dict:
         """Parse structured LM output -> {category, answer}.
 
-        Expected format: category | value
+        Direct token output (no category prefix).
+        <|mcq|> -> category='mcq'
+        <|lr|>  -> category='left_right'
+        <|dist|> -> category='distance'
+        <|count|> -> category='count'
         """
         clean = text.strip()
         m = _OUTPUT_RE.search(clean)
         if m:
-            category = m.group("category").strip().lower()
-            answer   = m.group("answer").strip()
-            return {"category": category, "answer": answer}
+            token = m.group("answer").strip()
+            category = _TOKEN_TO_CATEGORY.get(token, "unknown")
+            return {"category": category, "answer": token}
         return {"category": "unknown", "answer": None}
 
     # ---- Full inference ----
@@ -733,15 +827,13 @@ class SpatialVLM(nn.Module):
     @torch.no_grad()
     def predict(
         self,
-        image_rgb_tensor,               # [1, 3, H, W] 0-1 for RTI
-        image_processor_output,         # Dict from image_processor
+        image_processor_output,         # Dict from image_processor (dual-image)
         question: str,
         depth_map: torch.Tensor,        # [H, W] raw
         rle_list: list = None,
         max_new_tokens: int = 150,
     ) -> dict:
         """Single-shot inference: image + question -> {category, answer, raw}."""
-        # Tokenize question directly — no chat template, no system prompt
         dev   = self.device
         dtype = next(self.qwen.parameters()).dtype
 
@@ -751,9 +843,7 @@ class SpatialVLM(nn.Module):
 
         pixel_values   = image_processor_output["pixel_values"].to(device=dev, dtype=dtype)
         image_grid_thw = image_processor_output["image_grid_thw"].to(device=dev)
-        
-        pixel_values_rgb = image_rgb_tensor.to(device=dev, dtype=dtype)
-        depth_batch      = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
+        depth_batch    = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
 
         # Auto-find <mask> positions
         mask_positions = find_mask_positions(input_ids, self.processor.tokenizer)
@@ -769,7 +859,7 @@ class SpatialVLM(nn.Module):
             mask_positions_batched = None
 
         output_ids = self.generate(
-            pixel_values, pixel_values_rgb, image_grid_thw, depth_batch, input_ids,
+            pixel_values, image_grid_thw, depth_batch, input_ids,
             rle_list=rle_list_batched,
             mask_token_positions=mask_positions_batched,
             max_new_tokens=max_new_tokens,
@@ -784,6 +874,7 @@ class SpatialVLM(nn.Module):
             "answer":   parsed["answer"],
             "raw":      raw_output,
         }
+
 
 def count_parameters(model: nn.Module) -> dict:
     total     = sum(p.numel() for p in model.parameters())
@@ -834,6 +925,7 @@ if __name__ == "__main__":
         "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
         "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
         "RTI (Region Token Injector)":     pipeline.region_token_extractor,
+        "SharedVisualFuser (Dual-Stream)": pipeline.visual_fuser,
         "MCQ Head":                        pipeline.mcq_head,
         "LeftRight Head":                  pipeline.lr_head,
         "Distance Head":                   pipeline.dist_head,
@@ -841,6 +933,7 @@ if __name__ == "__main__":
     }
     custom_names = {
         "RTI (Region Token Injector)",
+        "SharedVisualFuser (Dual-Stream)",
         "MCQ Head",
         "LeftRight Head",
         "Distance Head",

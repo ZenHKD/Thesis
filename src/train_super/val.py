@@ -69,7 +69,6 @@ def validate(pipeline, criterion, processor, resolution="320p",
     pbar = tqdm(loader, desc="Validation", leave=False)
     for batch in pbar:
         pixel_values     = batch["pixel_values"].to(device=dev, dtype=dtype, non_blocking=True)
-        pixel_values_rgb = batch["pixel_values_rgb"].to(device=dev, dtype=dtype, non_blocking=True)
         image_grid_thw   = batch["image_grid_thw"].to(device=dev, non_blocking=True)
         depth_maps       = batch["depth_maps"].to(device=dev, dtype=dtype, non_blocking=True)
         input_ids        = batch["input_ids"].to(device=dev, non_blocking=True)
@@ -87,7 +86,6 @@ def validate(pipeline, criterion, processor, resolution="320p",
             try:
                 output = pipeline(
                     pixel_values=pixel_values,
-                    pixel_values_rgb=pixel_values_rgb,
                     image_grid_thw=image_grid_thw,
                     depth_maps=depth_maps,
                     input_ids=input_ids,
