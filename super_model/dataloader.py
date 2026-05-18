@@ -307,8 +307,8 @@ class SpatialVLMDataset(Dataset):
         num_visual_dep_tokens = int(h_vis_dep * w_vis_dep)
         
         # Build dual-image vision string
-        vision_str_1 = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_rgb_tokens + "<|vision_end|>\n"
-        vision_str_2 = "Picture 2: <|vision_start|>" + "<|image_pad|>" * num_visual_dep_tokens + "<|vision_end|>\n"
+        vision_str_1 = "Picture 1 (RGB): <|vision_start|>" + "<|image_pad|>" * num_visual_rgb_tokens + "<|vision_end|>\n"
+        vision_str_2 = "Picture 2 (Depth): <|vision_start|>" + "<|image_pad|>" * num_visual_dep_tokens + "<|vision_end|>\n"
         user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{question}<|im_end|>\n"
         eval_prompt = f"<|im_start|>assistant\n"
         

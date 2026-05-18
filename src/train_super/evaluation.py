@@ -107,12 +107,16 @@ def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 1) 
             return f"[Region {i}]: <|object_ref_start|>{m.group(1)}<|object_ref_end|>"
         question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
-        h_p, w_p = s["image_grid_thw"][0, 1].item(), s["image_grid_thw"][0, 2].item()
-        h_vis, w_vis = h_p // 2, w_p // 2
-        num_visual_tokens = int(h_vis * w_vis)
+        # RGB tokens (first image)
+        h_p_rgb, w_p_rgb = s["image_grid_thw"][0, 1].item(), s["image_grid_thw"][0, 2].item()
+        num_visual_rgb = int((h_p_rgb // 2) * (w_p_rgb // 2))
+        # Depth tokens (second image)
+        h_p_dep, w_p_dep = s["image_grid_thw"][1, 1].item(), s["image_grid_thw"][1, 2].item()
+        num_visual_dep = int((h_p_dep // 2) * (w_p_dep // 2))
         
-        vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
-        user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+        vision_str_1 = "Picture 1 (RGB): <|vision_start|>" + "<|image_pad|>" * num_visual_rgb + "<|vision_end|>\n"
+        vision_str_2 = "Picture 2 (Depth): <|vision_start|>" + "<|image_pad|>" * num_visual_dep + "<|vision_end|>\n"
+        user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{question}<|im_end|>\n"
         eval_prompt = f"<|im_start|>assistant\n"
         
         prompts.append(user_str + eval_prompt)

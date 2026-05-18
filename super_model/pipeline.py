@@ -126,7 +126,6 @@ class SpatialVLM(nn.Module):
 
     Custom modules:
         self.region_token_extractor  - RTE (DPT-style multi-layer ViT features)
-        self.visual_fuser            - SharedVisualFuser (dual-stream RGB+Depth)
         self.mcq_head                - MCQHead
         self.lr_head                 - LeftRightHead
         self.dist_head               - DistanceHead
@@ -797,12 +796,16 @@ class SpatialVLM(nn.Module):
         formatted_question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
         image_grid_thw = image_processor_output["image_grid_thw"].to(device=dev)
-        h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
-        h_vis, w_vis = h_p // 2, w_p // 2
-        num_visual_tokens = int(h_vis * w_vis)
+        # RGB tokens (first image)
+        h_p_rgb, w_p_rgb = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+        num_visual_rgb = int((h_p_rgb // 2) * (w_p_rgb // 2))
+        # Depth tokens (second image)
+        h_p_dep, w_p_dep = image_grid_thw[1, 1].item(), image_grid_thw[1, 2].item()
+        num_visual_dep = int((h_p_dep // 2) * (w_p_dep // 2))
         
-        vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
-        user_str = f"<|im_start|>user\n{vision_str}{formatted_question}<|im_end|>\n"
+        vision_str_1 = "Picture 1 (RGB): <|vision_start|>" + "<|image_pad|>" * num_visual_rgb + "<|vision_end|>\n"
+        vision_str_2 = "Picture 2 (Depth): <|vision_start|>" + "<|image_pad|>" * num_visual_dep + "<|vision_end|>\n"
+        user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{formatted_question}<|im_end|>\n"
         full_prompt = user_str + "<|im_start|>assistant\n"
 
         input_ids = self.processor.tokenizer(

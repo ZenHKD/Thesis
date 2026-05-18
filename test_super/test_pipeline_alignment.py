@@ -297,7 +297,7 @@ def main():
 
     # Build inputs_embeds (visual + text with RTI)
     with torch.no_grad():
-        inputs_embeds, n_visual, _region_tokens, _rgb, _dep = pipeline._build_inputs_embeds(
+        inputs_embeds, _region_tokens = pipeline._build_inputs_embeds(
             pixel_values_1b, image_grid_thw_1b, depth_maps_1b, input_ids_1b,
             rle_list=batch["rle_list"],
             mask_token_positions=batch["mask_positions"],
@@ -329,7 +329,7 @@ def main():
     print(box_line(f"  pixel_values: {list(pixel_values_1b.shape)}"))
     print(box_line(f"  image_grid_thw: [{t_grid}, {h_grid}, {w_grid}]"))
     print(box_line(f"  after merger (2×2): [{t_grid}, {h_vis}, {w_vis}]"))
-    print(box_line(f"  -> visual_tokens: [{B}, {n_visual}, {D}]"))
+    print(box_line(f"  -> visual_tokens: inline (replaced <|image_pad|>)"))
     print(box_line())
     print(box_line("Text Embeddings + RTI:"))
     print(box_line(f"  input_ids: [{B}, {n_text}]"))
@@ -422,7 +422,7 @@ def main():
 
     # Summary
     print(f"\n  Summary:")
-    summary_vis_tok = n_visual if n_visual > 0 else int(h_vis * w_vis)
+    summary_vis_tok = int(h_vis * w_vis)
     print(f"    Visual padding:    {summary_vis_tok} tokens inline over <|image_pad|>")
     print(f"    Text tokens:       {n_text} tokens")
     print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*3} positions replaced")
@@ -561,12 +561,16 @@ def main():
         return f"[Region {i}]: <|object_ref_start|>{m.group(1)}<|object_ref_end|>"
     question = re.sub(r'(<mask.*?>)', replace_mask, question)
 
-    h_p, w_p = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
-    h_vis, w_vis = h_p // 2, w_p // 2
-    num_visual_tokens = int(h_vis * w_vis)
+    # RGB tokens (first image)
+    h_p_rgb, w_p_rgb = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
+    num_visual_rgb = int((h_p_rgb // 2) * (w_p_rgb // 2))
+    # Depth tokens (second image)
+    h_p_dep, w_p_dep = image_grid_thw[1, 1].item(), image_grid_thw[1, 2].item()
+    num_visual_dep = int((h_p_dep // 2) * (w_p_dep // 2))
     
-    vision_str = "Picture 1: <|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>\n"
-    user_str = f"<|im_start|>user\n{vision_str}{question}<|im_end|>\n"
+    vision_str_1 = "Picture 1 (RGB): <|vision_start|>" + "<|image_pad|>" * num_visual_rgb + "<|vision_end|>\n"
+    vision_str_2 = "Picture 2 (Depth): <|vision_start|>" + "<|image_pad|>" * num_visual_dep + "<|vision_end|>\n"
+    user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{question}<|im_end|>\n"
     eval_prompt = f"<|im_start|>assistant\n"
     
     full_prompt = user_str + eval_prompt
