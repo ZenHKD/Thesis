@@ -150,8 +150,8 @@ def main():
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--batch-size",  type=int,   default=2)
-    parser.add_argument("--grad-accum",  type=int,   default=16)
+    parser.add_argument("--batch-size",  type=int,   default=8)
+    parser.add_argument("--grad-accum",  type=int,   default=8)
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--warmup-steps", type=int,  default=1000)
     parser.add_argument("--resolution",  default="320p",
@@ -160,7 +160,7 @@ def main():
                         help="Enable gradient checkpointing (saves VRAM, slower)")
     # Validation
     parser.add_argument("--val-split",   default="val")
-    parser.add_argument("--val-batch-size", type=int, default=4)
+    parser.add_argument("--val-batch-size", type=int, default=8)
     parser.add_argument("--val-max-samples", type=int, default=None,
                         help="Limit val samples (None = full val set)")
     parser.add_argument("--val-steps", type=int, default=500,
@@ -171,7 +171,7 @@ def main():
     parser.add_argument("--resume",      type=str,   default=None)
     parser.add_argument("--init-weights", type=str,  default=None,
                         help="Load model weights only (no optimizer/step restore).")
-    parser.add_argument("--num-workers", type=int,   default=2)
+    parser.add_argument("--num-workers", type=int,   default=4)
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile on the Qwen backbone")
     args = parser.parse_args()
@@ -261,7 +261,7 @@ def main():
         ("Vision Encoder",  vision_params,        args.lr_vision),
         ("Special Embed",   [special_embed],       args.lr_backbone),
         ("Decoder",         decoder_params,        args.lr_backbone),
-        ("RTI Modules",     rti_params,            args.lr_rti),
+        ("RTI",             rti_params,            args.lr_rti),
         ("Distance Head",   dist_params,           args.lr_rti),
         ("Count Head",      count_params,          args.lr_rti),
     ]
@@ -360,7 +360,7 @@ def main():
         "val_loss_lr", "val_acc_lr",
         "val_loss_dist", "val_acc_dist",
         "val_loss_count", "val_acc_count",
-        "lr_vision", "lr_embed", "lr_decoder", "lr_rti", "lr_fuser",
+        "lr_vision", "lr_embed", "lr_decoder", "lr_rti",
         "lr_dist", "lr_count",
         "grad_norm", "samples_per_sec",
     ]
@@ -390,7 +390,7 @@ def main():
     print("TRAINING")
     print("=" * 70)
     print(f"  lr_vision={args.lr_vision}  lr_backbone={args.lr_backbone}  lr_rti={args.lr_rti}")
-    print(f"  lr_dist={args.lr_dist}  lr_count={args.lr_count}  (MCQ/LR use SharedVisualFuser @ lr_rti)")
+    print(f"  lr_dist={args.lr_dist}  lr_count={args.lr_count}")
     print(f"  warmup={args.warmup_steps}  max_grad_norm={args.max_grad_norm}")
     print(f"  w_dist={args.weight_dist}  w_count={args.weight_count}  w_mcq={args.weight_mcq}  w_lr={args.weight_lr}")
     print()
@@ -540,7 +540,6 @@ def main():
                     lr_e    = lrs.get("Special Embed", 0.0)
                     lr_d    = lrs.get("Decoder", 0.0)
                     lr_rti  = lrs.get("RTI", 0.0)
-                    lr_fus  = lrs.get("Visual Fuser", 0.0)
                     lr_dist = lrs.get("Distance Head", 0.0)
                     lr_cnt  = lrs.get("Count Head", 0.0)
 
@@ -561,7 +560,7 @@ def main():
                             "", "",               # total_val_loss, val_loss_ce
                             "", "", "", "",       # mcq loss/acc, lr loss/acc
                             "", "", "", "",       # dist loss/acc, count loss/acc
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}", f"{lr_fus:.8f}",
+                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}",
                             f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
                             f"{grad_norm:.6f}", f"{samples_sec:.2f}",
                         ])
@@ -609,7 +608,6 @@ def main():
                     lr_e    = lrs.get("Special Embed", 0.0)
                     lr_d    = lrs.get("Decoder", 0.0)
                     lr_rti  = lrs.get("RTI", 0.0)
-                    lr_fus  = lrs.get("Visual Fuser", 0.0)
                     lr_dist = lrs.get("Distance Head", 0.0)
                     lr_cnt  = lrs.get("Count Head", 0.0)
 
@@ -623,7 +621,7 @@ def main():
                             f"{vlr:.6f}", f"{vlr_a:.2f}",
                             f"{vdist:.6f}", f"{vdist_a:.2f}",
                             f"{vcnt:.6f}", f"{vcnt_a:.2f}",
-                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}", f"{lr_fus:.8f}",
+                            f"{lr_v:.8f}", f"{lr_e:.8f}", f"{lr_d:.8f}", f"{lr_rti:.8f}",
                             f"{lr_dist:.8f}", f"{lr_cnt:.8f}",
                             "", "",
                         ])

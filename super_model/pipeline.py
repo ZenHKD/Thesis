@@ -349,10 +349,7 @@ class SpatialVLM(nn.Module):
 
         Returns:
             inputs_embeds:  [B, T, 1024]
-            n_visual:       int (0, inline padded)
             region_tokens:  list[list[tuple]] or None
-            vis_rgb_list:   list of [N_vis, 1024] — RGB visual tokens per sample
-            vis_dep_list:   list of [N_vis, 1024] — Depth visual tokens per sample
         """
         # Step 1: Vision Encoder + Merger + Intermediates
         merged_tokens, intermediates = self._get_visual_tokens_with_intermediates(
@@ -426,10 +423,7 @@ class SpatialVLM(nn.Module):
                 text_embeds[b, rgb_pads] = vis_rgb_list[b][:len(rgb_pads)]
                 text_embeds[b, dep_pads] = vis_dep_list[b][:len(dep_pads)]
 
-        inputs_embeds = text_embeds
-        n_visual_offset = 0
-
-        return inputs_embeds, n_visual_offset, region_tokens, vis_rgb_list, vis_dep_list
+        return text_embeds, region_tokens
 
     # ---- Backbone forward ----
 
@@ -547,31 +541,23 @@ class SpatialVLM(nn.Module):
                 'mcq_logits':   list of [N_masks] tensors
                 'lr_logits':    list of [2] tensors
         """
-        inputs_embeds, n_visual, region_tokens, vis_rgb_list, vis_dep_list = self._build_inputs_embeds(
+        inputs_embeds, region_tokens = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
             vision_requires_grad=vision_requires_grad,
         )
 
-        full_attention_mask = None
-        if attention_mask is not None:
-            B_mask = attention_mask.shape[0]
-            vis_mask = torch.ones(B_mask, n_visual, dtype=attention_mask.dtype,
-                                  device=attention_mask.device)
-            full_attention_mask = torch.cat([vis_mask, attention_mask], dim=1)
-
         hidden = self._backbone_forward(
             inputs_embeds,
-            attention_mask=full_attention_mask,
+            attention_mask=attention_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
         )
 
         lm_norm = self.qwen.model.language_model.norm
         h_normed = lm_norm(hidden)
 
-        # Text logits
-        text_h = h_normed[:, n_visual:, :]
-        logits = self.qwen.lm_head(text_h)
+        # Text logits (all positions are text since visual tokens are inlined)
+        logits = self.qwen.lm_head(h_normed)
 
         # Build per-modality RTI features (kept separate, no concat)
         B = input_ids.shape[0]
@@ -600,39 +586,18 @@ class SpatialVLM(nn.Module):
             dep_batch  = [None] * B
             gdep_batch = [None] * B
 
-        # Extract dual-stream visual tokens from h_normed at image_pad positions
-        img_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        vis_rgb_normed = []  # [N_vis_rgb, 1024] per sample
-        vis_dep_normed = []  # [N_vis_dep, 1024] per sample
-        for b in range(B):
-            pad_indices = (input_ids[b] == img_pad_id).nonzero(as_tuple=True)[0]
-            if len(pad_indices) > 0:
-                n_rgb = vis_rgb_list[b].shape[0]
-                n_dep = vis_dep_list[b].shape[0]
-                rgb_pads = pad_indices[:n_rgb]
-                dep_pads = pad_indices[n_rgb:n_rgb + n_dep]
-                vis_rgb_normed.append(h_normed[b, n_visual + rgb_pads, :])
-                vis_dep_normed.append(h_normed[b, n_visual + dep_pads, :])
-            else:
-                vis_rgb_normed.append(None)
-                vis_dep_normed.append(None)
-
         # ---- Distance Head ----
         dist_pred_list = [torch.tensor(0.0, device=h_normed.device, dtype=h_normed.dtype)] * B
         if dist_token_positions is not None:
             dist_h_list, dist_rgb, dist_dep, dist_gdep = [], [], [], []
-            dist_vis_rgb, dist_vis_dep = [], []
             dist_indices = []
             for b, pos in enumerate(dist_token_positions):
                 if pos is not None and pos >= 0:
-                    adj = n_visual + pos
-                    if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
-                        dist_h_list.append(h_normed[b, adj, :])
+                    if 0 <= pos < h_normed.shape[1] and rgb_batch[b] is not None:
+                        dist_h_list.append(h_normed[b, pos, :])
                         dist_rgb.append(rgb_batch[b])
                         dist_dep.append(dep_batch[b])
                         dist_gdep.append(gdep_batch[b])
-                        dist_vis_rgb.append(vis_rgb_normed[b])
-                        dist_vis_dep.append(vis_dep_normed[b])
                         dist_indices.append(b)
             if dist_h_list:
                 h_dist = torch.stack(dist_h_list, dim=0)
@@ -645,18 +610,14 @@ class SpatialVLM(nn.Module):
         count_pred_list = [torch.tensor(0.0, device=h_normed.device, dtype=h_normed.dtype)] * B
         if count_token_positions is not None:
             cnt_h_list, cnt_rgb, cnt_dep, cnt_gdep = [], [], [], []
-            cnt_vis_rgb, cnt_vis_dep = [], []
             cnt_indices = []
             for b, pos in enumerate(count_token_positions):
                 if pos is not None and pos >= 0:
-                    adj = n_visual + pos
-                    if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
-                        cnt_h_list.append(h_normed[b, adj, :])
+                    if 0 <= pos < h_normed.shape[1] and rgb_batch[b] is not None:
+                        cnt_h_list.append(h_normed[b, pos, :])
                         cnt_rgb.append(rgb_batch[b])
                         cnt_dep.append(dep_batch[b])
                         cnt_gdep.append(gdep_batch[b])
-                        cnt_vis_rgb.append(vis_rgb_normed[b])
-                        cnt_vis_dep.append(vis_dep_normed[b])
                         cnt_indices.append(b)
             if cnt_h_list:
                 h_cnt = torch.stack(cnt_h_list, dim=0)
@@ -670,9 +631,8 @@ class SpatialVLM(nn.Module):
         if mcq_token_positions is not None:
             for b, pos in enumerate(mcq_token_positions):
                 if pos is not None and pos >= 0:
-                    adj = n_visual + pos
-                    if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
-                        h_mcq = h_normed[b, adj, :]
+                    if 0 <= pos < h_normed.shape[1] and rgb_batch[b] is not None:
+                        h_mcq = h_normed[b, pos, :]
                         scores = self.mcq_head(rgb_batch[b], dep_batch[b], gdep_batch[b], h_mcq)
                         mcq_logits_list.append(scores)
                     else:
@@ -685,9 +645,8 @@ class SpatialVLM(nn.Module):
         if lr_token_positions is not None:
             for b, pos in enumerate(lr_token_positions):
                 if pos is not None and pos >= 0:
-                    adj = n_visual + pos
-                    if 0 <= adj < h_normed.shape[1] and rgb_batch[b] is not None:
-                        h_lr = h_normed[b, adj, :]
+                    if 0 <= pos < h_normed.shape[1] and rgb_batch[b] is not None:
+                        h_lr = h_normed[b, pos, :]
                         scores = self.lr_head(rgb_batch[b], dep_batch[b], gdep_batch[b], h_lr)
                         lr_logits_list.append(scores)
                     else:
@@ -723,7 +682,7 @@ class SpatialVLM(nn.Module):
         """Autoregressive generation with repetition penalty."""
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache  # type: ignore
 
-        inputs_embeds, n_visual, _region_tokens, _vis_rgb, _vis_dep = self._build_inputs_embeds(
+        inputs_embeds, _region_tokens = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_maps, input_ids,
             rle_list, mask_token_positions, decoded_masks,
         )
@@ -867,7 +826,7 @@ class SpatialVLM(nn.Module):
             mask_positions_batched = None
 
         # Build embeddings with RTI
-        inputs_embeds, n_visual, region_tokens, vis_rgb_list, vis_dep_list = self._build_inputs_embeds(
+        inputs_embeds, region_tokens = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_batch, input_ids,
             rle_list=rle_list_batched, mask_token_positions=mask_positions_batched,
         )
@@ -912,7 +871,6 @@ class SpatialVLM(nn.Module):
 
         # 3. Prepare visual features for the Heads
         rgb_batch, dep_batch, gdep_batch = None, None, None
-        vis_rgb, vis_dep = None, None
         
         if region_tokens and len(region_tokens[0]) > 0:
             rgb_list, dep_list, gdep_list = [], [], []
@@ -923,12 +881,6 @@ class SpatialVLM(nn.Module):
             rgb_batch = torch.stack(rgb_list)   # [N_masks, 1024]
             dep_batch = torch.stack(dep_list)
             gdep_batch = torch.stack(gdep_list)
-            
-            # Use visual features from the first image
-            if vis_rgb_list and len(vis_rgb_list) > 0:
-                vis_rgb = lm.norm(vis_rgb_list[0])
-            if vis_dep_list and len(vis_dep_list) > 1:
-                vis_dep = lm.norm(vis_dep_list[1])
 
         answer = None
 
@@ -1004,16 +956,14 @@ if __name__ == "__main__":
         "Qwen Backbone (layers)":          pipeline.qwen.model.language_model.layers,
         "Qwen Final Norm":                 pipeline.qwen.model.language_model.norm,
         "Qwen LM Head (tied->Embed)":      pipeline.qwen.lm_head,
-        "RTI (Region Token Injector)":     pipeline.region_token_extractor,
-        "SharedVisualFuser (Dual-Stream)": pipeline.visual_fuser,
+        "RTI (Region Token Extractor)":    pipeline.region_token_extractor,
         "MCQ Head":                        pipeline.mcq_head,
         "LeftRight Head":                  pipeline.lr_head,
         "Distance Head":                   pipeline.dist_head,
         "Count Head":                      pipeline.count_head,
     }
     custom_names = {
-        "RTI (Region Token Injector)",
-        "SharedVisualFuser (Dual-Stream)",
+        "RTI (Region Token Extractor)",
         "MCQ Head",
         "LeftRight Head",
         "Distance Head",
