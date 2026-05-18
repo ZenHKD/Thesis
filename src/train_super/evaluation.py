@@ -85,7 +85,7 @@ def load_checkpoint_weights(pipeline, path: str):
 # Inference Runner
 # =========================================================================
 
-def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 20) -> list:
+def run_inference_batch(pipeline, batch_samples: list, max_new_tokens: int = 1) -> list:
     dev = pipeline.device
     dtype = next(pipeline.qwen.parameters()).dtype
 
@@ -397,9 +397,9 @@ def main():
             result = batch_results[i]
             cat = s["category"]
             gt = str(s.get("answer", ""))
-            gt_clean = gt.strip('"')
+            gt_clean = gt.strip().strip('"').strip("'")
             if "=" in gt_clean:
-                gt_clean = gt_clean.split("=", 1)[1]
+                gt_clean = gt_clean.split("=", 1)[1].strip().strip('"').strip("'")
 
             pred_cat = result.get("category", "unknown")
             if pred_cat not in categories:

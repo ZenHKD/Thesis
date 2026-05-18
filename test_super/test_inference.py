@@ -94,7 +94,7 @@ def load_checkpoint_weights(pipeline, path: str):
 # Inference Runner
 # =========================================================================
 
-def run_inference(pipeline, sample: dict, max_new_tokens: int = 20) -> dict:
+def run_inference(pipeline, sample: dict, max_new_tokens: int = 1) -> dict:
     """Run inference on a single dataloader sample.
 
     Uses pipeline.generate() to produce the routing token,
@@ -377,9 +377,9 @@ def main():
     for i, s in enumerate(samples):
         cat = s["category"]
         gt = str(s.get("answer", ""))
-        gt_clean = gt.strip('"')
+        gt_clean = gt.strip().strip('"').strip("'")
         if "=" in gt_clean:
-            gt_clean = gt_clean.split("=", 1)[1]
+            gt_clean = gt_clean.split("=", 1)[1].strip().strip('"').strip("'")
 
         print(f"\n{'--'*35}")
         print(f"  Sample [{s['idx']}]: {s['image_name']}  |  "
