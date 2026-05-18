@@ -108,12 +108,17 @@ class SpatialLoss(nn.Module):
                 label_smoothing=self.label_smoothing,
             )
 
-        # ─── 2. Distance Head — Normalized MSE ───
+        # ─── 2. Distance Head — Log-MSE (MSLE) for Relative Error ───
         loss_dist = torch.tensor(0.0, device=device)
         if is_distance is not None and is_distance.any():
-            pred = dist_pred[is_distance].float() / self.dist_scale
-            target = dist_gt[is_distance].float() / self.dist_scale
-            loss_dist = F.mse_loss(pred, target, reduction='mean')
+            pred = dist_pred[is_distance].float()
+            target = dist_gt[is_distance].float()
+            
+            # Log-MSE: log(pred + 1) - log(target + 1) naturally optimizes for relative error
+            # so that 10% error at 1m is penalized identically to 10% error at 16m.
+            log_pred = torch.log(pred + 1.0)
+            log_target = torch.log(target + 1.0)
+            loss_dist = F.mse_loss(log_pred, log_target, reduction='mean')
 
         # ─── 3. Count Head — Normalized MSE ───
         loss_count = torch.tensor(0.0, device=device)

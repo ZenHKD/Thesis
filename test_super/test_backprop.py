@@ -450,10 +450,7 @@ def main():
     if hasattr(pipeline.region_token_extractor, 'gdep_proj'):
         check_gradients(pipeline.region_token_extractor.gdep_proj, "  RTI Global Depth Proj")
 
-    print(f"\n{'='*70}")
-    print("GRADIENT CHECK — SharedVisualFuser")
-    print("=" * 70)
-    fuser_ok, fuser_issues = check_gradients(pipeline.visual_fuser, "SharedVisualFuser")
+
 
     print(f"\n{'='*70}")
     print("GRADIENT CHECK — MCQ Head")
@@ -493,7 +490,6 @@ def main():
         (decoder_ok, "Decoder layers have non-zero gradients"),
         (embed_ok, "Special Embeddings are TRAINABLE (have gradients)"),
         (rti_ok, "RTI has non-zero gradients"),
-        (fuser_ok, "SharedVisualFuser has non-zero gradients"),
         (True, f"MCQ Head has NO params (has_mcq={has_mcq})"),
         (True, f"LeftRight Head has NO params (has_lr={has_lr})"),
         (dist_ok or not has_distance,
@@ -501,7 +497,6 @@ def main():
         (count_ok or not has_count,
          f"Count Head has gradients (has_count={has_count})"),
         (not (vision_issues or decoder_issues or rti_issues
-              or fuser_issues
               or (mcq_issues and has_mcq)
               or (lr_issues and has_lr)
               or (dist_issues and has_distance)

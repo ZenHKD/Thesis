@@ -1,21 +1,18 @@
 """
-MODULE: Count Head — Mask-Centric Tri-Source Regression (uses SharedVisualFuser)
+MODULE: Count Head — Mask-Centric Tri-Source Regression
 
 Position: After Decoder, parallel to LM Head
 Input:  1. hidden state at <|count|> token [B_count, 1024]
         2. Tri-source mask features: rgb, dep, gdep lists of [N_masks, 1024]
-        3. Visual tokens [N_vis, 1024] (via shared fuser)
 Output: continuous scalar predictions [B_count] (positive, rounded at inference)
 
-Design differences from DistanceHead:
-    - Down-weighted scene context (×scene_gate) — counting is mask-centric
-    - Scene gate: learnable sigmoid gate blends global scene context into query
-    - Shallower MLP: 4096 → 512 → 1
-    - Softplus output for smooth positive values
+Architecture:
+    1. Sigmoid Filtering (Sum Pooling): Replaces softmax attention to preserve object cardinality.
+    2. Regression MLP: concat(q, att_rgb, att_dep, att_gdep) [4096]
+       → LN → Linear(4096, 512) → GELU → Dropout → Linear(512, 1)
 
-Params: ~2.10M (private regression MLP + scene_gate)
-    regression: LN(4096) + Linear(4096, 512) + Linear(512, 1)
-    scene_gate: 1 parameter
+Params: ~2.10M (private regression MLP only)
+    regression: LN(4096) + Linear(4096, 512) + Linear(512, 1) = ~2.1M
 """
 
 import math
@@ -25,12 +22,7 @@ import torch.nn.functional as F
 
 
 class CountHead(nn.Module):
-    """Mask-centric Tri-Source regression head for counting.
-
-    Uses external SharedVisualFuser for scene context extraction.
-    N_masks modulates query strength: q *= (1 + N_masks / 10).
-    More masks → stronger attention query → model aware of density.
-    """
+    """Mask-centric Tri-Source regression head for counting."""
 
     def __init__(
         self,
@@ -51,17 +43,12 @@ class CountHead(nn.Module):
             nn.Linear(512, 1),
         )
 
-        # Learnable gate for scene context weighting
-        self.scene_gate = nn.Parameter(torch.tensor(0.5))
-
     def forward(
         self,
         h_token: torch.Tensor,         # [B_count, 1024]
         rgb_list: list,                 # list of [N_masks, 1024]
         dep_list: list,                 # list of [N_masks, 1024]
         gdep_list: list,                # list of [N_masks, 1024]
-        q_list: list,                   # list of [1, 1024] — pre-fused queries
-        scene_ctx_list: list,           # list of [1, 1024] — scene contexts (for gating)
     ) -> torch.Tensor:
         """
         Args:
@@ -69,8 +56,6 @@ class CountHead(nn.Module):
             rgb_list:        list of [N_masks_b, 1024]
             dep_list:        list of [N_masks_b, 1024]
             gdep_list:       list of [N_masks_b, 1024]
-            q_list:          list of [1, 1024] — fused queries from SharedVisualFuser
-            scene_ctx_list:  list of [1, 1024] — scene contexts for gating
 
         Returns:
             [B_count] — predicted counts (positive via softplus)
@@ -81,26 +66,22 @@ class CountHead(nn.Module):
 
         preds = []
         for i in range(B_count):
-            q = q_list[i].squeeze(0)  # [1024]
+            q = h_token[i]  # [1024]
 
             rgb  = rgb_list[i]   # [N_masks, 1024]
             dep  = dep_list[i]   # [N_masks, 1024]
             gdep = gdep_list[i]  # [N_masks, 1024]
 
-            # Scene gate: counting is mask-centric, down-weight global scene context
-            gate = torch.sigmoid(self.scene_gate)
-            scene_ctx = scene_ctx_list[i].squeeze(0)  # [1024]
-            q = q + gate * scene_ctx  # blend scene context (learnable weight)
-
             # Tri-Source Attention @ full 1024-dim
+            # Use Sigmoid to filter objects and SUM their features (preserves cardinality)
             score_rgb = (q @ rgb.T) / self.scale
-            att_rgb = torch.softmax(score_rgb, dim=-1) @ rgb    # [1024]
+            att_rgb = torch.sigmoid(score_rgb) @ rgb    # [1024]
 
             score_dep = (q @ dep.T) / self.scale
-            att_dep = torch.softmax(score_dep, dim=-1) @ dep    # [1024]
+            att_dep = torch.sigmoid(score_dep) @ dep    # [1024]
 
             score_gdep = (q @ gdep.T) / self.scale
-            att_gdep = torch.softmax(score_gdep, dim=-1) @ gdep  # [1024]
+            att_gdep = torch.sigmoid(score_gdep) @ gdep  # [1024]
 
             # Concat → shallower regression (no n_masks in features)
             combined = torch.cat([q, att_rgb, att_dep, att_gdep], dim=-1)  # [4096]

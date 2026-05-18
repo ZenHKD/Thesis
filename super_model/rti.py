@@ -299,12 +299,14 @@ class RTE(nn.Module):
 
         masks_4d = masks.unsqueeze(1)  # [N, 1, H, W]
 
-        # Interpolate masks to feature map resolution
-        m = F.interpolate(masks_4d, size=f_spatial.shape[2:], mode='nearest')
+        # Downsample masks using Average Pooling to create Fractional Masks (Soft Masks)
+        # This ensures small objects < 16x16 pixels never disappear and contribute fractionally
+        m = F.adaptive_avg_pool2d(masks_4d, output_size=f_spatial.shape[2:])
+        
         feat = f_spatial[b].unsqueeze(0)  # [1, 1024, h, w]
         
-        # Pool
-        area = m.sum(dim=(2, 3)).clamp(min=1)
+        # Pool using fractional weights
+        area = m.sum(dim=(2, 3)).clamp(min=1e-6)
         pooled = (feat * m).sum(dim=(2, 3)) / area  # [N, 1024]
 
         # Project: [N, 1024]

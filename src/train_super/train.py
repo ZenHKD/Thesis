@@ -143,7 +143,7 @@ def main():
     parser.add_argument("--lr-rti",      type=float, default=1e-4)
     parser.add_argument("--lr-dist",     type=float, default=1e-4)
     parser.add_argument("--lr-count",    type=float, default=1e-4)
-    parser.add_argument("--weight-dist",  type=float, default=2.0)
+    parser.add_argument("--weight-dist",  type=float, default=100.0)
     parser.add_argument("--weight-count", type=float, default=2.0)
     parser.add_argument("--weight-mcq",   type=float, default=2.0)
     parser.add_argument("--weight-lr",    type=float, default=2.0)
@@ -152,7 +152,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--batch-size",  type=int,   default=2)
     parser.add_argument("--grad-accum",  type=int,   default=16)
-    parser.add_argument("--max-grad-norm", type=float, default=2.0)
+    parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--warmup-steps", type=int,  default=1000)
     parser.add_argument("--resolution",  default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
@@ -197,10 +197,9 @@ def main():
     print_vram_usage("after model load")
 
     if args.compile:
-        print("  [*] Compiling Qwen + RTI + Fuser + Heads with torch.compile...")
+        print("  [*] Compiling Qwen + RTI + Heads with torch.compile...")
         pipeline.qwen = torch.compile(pipeline.qwen)
         pipeline.region_token_extractor = torch.compile(pipeline.region_token_extractor)
-        pipeline.visual_fuser = torch.compile(pipeline.visual_fuser)
         pipeline.mcq_head = torch.compile(pipeline.mcq_head)
         pipeline.lr_head = torch.compile(pipeline.lr_head)
         pipeline.dist_head = torch.compile(pipeline.dist_head)
@@ -255,7 +254,6 @@ def main():
     decoder_params = [p for p in pipeline.qwen.model.language_model.layers.parameters() if p.requires_grad] + \
                      [p for p in pipeline.qwen.model.language_model.norm.parameters() if p.requires_grad]
     rti_params = [p for p in pipeline.region_token_extractor.parameters() if p.requires_grad]
-    fuser_params = [p for p in pipeline.visual_fuser.parameters() if p.requires_grad]
     dist_params = [p for p in pipeline.dist_head.parameters() if p.requires_grad]
     count_params = [p for p in pipeline.count_head.parameters() if p.requires_grad]
 
@@ -263,10 +261,9 @@ def main():
         ("Vision Encoder",  vision_params,        args.lr_vision),
         ("Special Embed",   [special_embed],       args.lr_backbone),
         ("Decoder",         decoder_params,        args.lr_backbone),
-        ("RTI",             rti_params,            args.lr_rti),
-        ("Visual Fuser",    fuser_params,          args.lr_rti),
-        ("Distance Head",   dist_params,           args.lr_dist),
-        ("Count Head",      count_params,          args.lr_count),
+        ("RTI Modules",     rti_params,            args.lr_rti),
+        ("Distance Head",   dist_params,           args.lr_rti),
+        ("Count Head",      count_params,          args.lr_rti),
     ]
 
     for name, params, lr in groups:

@@ -8,17 +8,13 @@ Input:  1. hidden state at <|dist|> token [B_dist, 1024]
 Output: continuous scalar predictions [B_dist] (non-negative, meters)
 
 Architecture:
-    1. SharedVisualFuser: h_dist + vis_tokens → q [1024]
-    2. Tri-Source Attention:
-       att_rgb  = softmax(q · rgb^T  / √1024) · rgb   → [1024]
-       att_dep  = softmax(q · dep^T  / √1024) · dep   → [1024]
-       att_gdep = softmax(q · gdep^T / √1024) · gdep  → [1024]
-    3. Regression MLP:
-       concat(q, att_rgb, att_dep, att_gdep) [4096]
-       → LN → Linear(4096, 1024) → GELU → Dropout → Linear(1024, 1) → relu
+    1. Query-Guided Gating: Uses q to generate a sigmoid mask to filter out visual noise (e.g., color) from att_rgb, att_dep, att_gdep.
+    2. Transformer-style Residual Fusion: clean visual features are projected and added (res) to q, rather than concatenated.
+    3. Regression MLP: q_fused [1024] → Linear(1024, 512) → GELU → Dropout → Linear(512, 1) → relu
 
-Params: ~4.20M (private regression MLP only)
-    regression: LN(4096) + Linear(4096,1024) + Linear(1024,1) = ~4,204,545
+Params: ~6.5M 
+    gates & projs: 6 * 1M = ~6.2M
+    regression: 1024*512 + 512*1 = ~0.5M
 """
 
 import math
@@ -42,13 +38,25 @@ class DistanceHead(nn.Module):
         self.hidden_dim = hidden_dim
         self.scale = math.sqrt(hidden_dim)
 
-        # Regression MLP: concat(q, att_rgb, att_dep, att_gdep) → scalar
+        # Query-guided gates to filter out visual noise (e.g. color/texture)
+        self.gate_rgb  = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_dep  = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_gdep = nn.Linear(hidden_dim, hidden_dim)
+
+        # Projections to align visual features for residual addition
+        self.proj_rgb  = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_dep  = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_gdep = nn.Linear(hidden_dim, hidden_dim)
+
+        # Fusion normalization
+        self.fusion_norm = nn.LayerNorm(hidden_dim)
+
+        # Lightweight Regression MLP: q_fused -> scalar
         self.regression = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 4),
-            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Linear(hidden_dim, 512),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(512, 1),
         )
 
     def forward(
@@ -57,7 +65,6 @@ class DistanceHead(nn.Module):
         rgb_list: list,                 # list of [N_masks, 1024]
         dep_list: list,                 # list of [N_masks, 1024]
         gdep_list: list,                # list of [N_masks, 1024]
-        q_list: list,                   # list of [1, 1024] — pre-fused queries from SharedVisualFuser
     ) -> torch.Tensor:
         """
         Args:
@@ -65,7 +72,6 @@ class DistanceHead(nn.Module):
             rgb_list:  list of [N_masks_b, 1024] tensors.
             dep_list:  list of [N_masks_b, 1024] tensors.
             gdep_list: list of [N_masks_b, 1024] tensors.
-            q_list:    list of [1, 1024] — fused queries from SharedVisualFuser.
 
         Returns:
             [B_dist] — predicted distances (non-negative via relu)
@@ -76,25 +82,32 @@ class DistanceHead(nn.Module):
 
         preds = []
         for i in range(B_dist):
-            q = q_list[i].squeeze(0)  # [1024]
+            q = h_token[i]  # [1024]
 
             rgb  = rgb_list[i]   # [N_masks, 1024]
             dep  = dep_list[i]   # [N_masks, 1024]
             gdep = gdep_list[i]  # [N_masks, 1024]
 
-            # Tri-Source Attention @ full 1024-dim
+            # Tri-Source Attention & Filtering
             score_rgb = (q @ rgb.T) / self.scale
             att_rgb = torch.softmax(score_rgb, dim=-1) @ rgb    # [1024]
+            clean_rgb = att_rgb * torch.sigmoid(self.gate_rgb(q)) # Filter noise
+            res_rgb = self.proj_rgb(clean_rgb)
 
             score_dep = (q @ dep.T) / self.scale
             att_dep = torch.softmax(score_dep, dim=-1) @ dep    # [1024]
+            clean_dep = att_dep * torch.sigmoid(self.gate_dep(q))
+            res_dep = self.proj_dep(clean_dep)
 
             score_gdep = (q @ gdep.T) / self.scale
             att_gdep = torch.softmax(score_gdep, dim=-1) @ gdep  # [1024]
+            clean_gdep = att_gdep * torch.sigmoid(self.gate_gdep(q))
+            res_gdep = self.proj_gdep(clean_gdep)
 
-            # Concat all sources + query → regression
-            combined = torch.cat([q, att_rgb, att_dep, att_gdep], dim=-1)  # [4096]
-            pred = self.regression(combined.unsqueeze(0)).squeeze(-1).squeeze(-1)
+            # Residual Addition Fusion (Transformer-style)
+            q_fused = self.fusion_norm(q + res_rgb + res_dep + res_gdep)
+
+            pred = self.regression(q_fused.unsqueeze(0)).squeeze(-1).squeeze(-1)
             preds.append(pred)
 
         return torch.relu(torch.stack(preds))  # [B_dist]

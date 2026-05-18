@@ -551,7 +551,7 @@ def main():
     print("SECTION 5: INFERENCE (pipeline.generate)")
     print("=" * 70)
 
-    question = batch["_question"][0] if "_question" in batch and len(batch["_question"]) > 0 else "Dummy Question <mask >"
+    question = batch["_question"][0] if "_question" in batch and len(batch["_question"]) > 0 else "Dummy Question <mask>"
 
     import re
     mask_idx = [0]
