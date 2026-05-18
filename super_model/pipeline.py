@@ -831,11 +831,16 @@ class SpatialVLM(nn.Module):
         question: str,
         depth_map: torch.Tensor,        # [H, W] raw
         rle_list: list = None,
-        max_new_tokens: int = 150,
+        max_new_tokens: int = 1,        # Only need 1 token for the category!
     ) -> dict:
-        """Single-shot inference: image + question -> {category, answer, raw}."""
+        """Single-shot inference: image + question -> {category, answer, raw}.
+        Uses Decoupled Reasoning (Heads) to predict the final answer.
+        """
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache # type: ignore
+
         dev   = self.device
         dtype = next(self.qwen.parameters()).dtype
+        lm = self.qwen.model.language_model
 
         input_ids = self.processor.tokenizer(
             question, return_tensors="pt", padding=False
@@ -858,20 +863,96 @@ class SpatialVLM(nn.Module):
             rle_list_batched = None
             mask_positions_batched = None
 
-        output_ids = self.generate(
+        # Build embeddings with RTI
+        inputs_embeds, n_visual, region_tokens, vis_rgb_list, vis_dep_list = self._build_inputs_embeds(
             pixel_values, image_grid_thw, depth_batch, input_ids,
-            rle_list=rle_list_batched,
-            mask_token_positions=mask_positions_batched,
-            max_new_tokens=max_new_tokens,
+            rle_list=rle_list_batched, mask_token_positions=mask_positions_batched,
         )
-        raw_output = self.processor.tokenizer.decode(
-            output_ids[0], skip_special_tokens=False
-        ).replace("<|endoftext|>", "").replace("<|im_end|>", "").strip()
 
+        # 1. Forward the prompt to predict the Category Token
+        B, T, _ = inputs_embeds.shape
+        cache = Qwen3_5DynamicCache(config=lm.config)
+        attn_mask = torch.ones(B, T, dtype=torch.long, device=dev)
+        cache_position = torch.arange(T, device=dev)
+
+        hidden = self._backbone_forward(
+            inputs_embeds, attention_mask=attn_mask,
+            past_key_values=cache, cache_position=cache_position,
+        )
+        hidden_norm = lm.norm(hidden[:, -1:, :])
+        logits = self.qwen.lm_head(hidden_norm)
+        
+        # Predict the category token (e.g. <|mcq|>)
+        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        cat_token_id = next_tok[0, 0].item()
+        
+        # Decode to get string category (just for logging/parsing)
+        raw_output = self.processor.tokenizer.decode([cat_token_id]).strip()
         parsed = self.parse_output(raw_output)
+        category = parsed.get("category", "unknown")
+
+        # If it's not a spatial reasoning token, just return early
+        if category == "unknown":
+            return {"category": "unknown", "answer": None, "raw": raw_output}
+
+        # 2. Forward the Category Token to get its Hidden State for the Head
+        tok_embed = lm.embed_tokens(next_tok)
+        step_cache_pos = torch.tensor([T], device=dev)
+        attn_mask = torch.cat([attn_mask, torch.ones(B, 1, dtype=torch.long, device=dev)], dim=1)
+
+        hidden_head = self._backbone_forward(
+            tok_embed, past_key_values=cache, cache_position=step_cache_pos,
+            attention_mask=attn_mask,
+        )
+        # The hidden state of the category token
+        h_cat = lm.norm(hidden_head[:, 0, :])  # [1, 1024]
+
+        # 3. Prepare visual features for the Heads
+        rgb_batch, dep_batch, gdep_batch = None, None, None
+        vis_rgb, vis_dep = None, None
+        
+        if region_tokens and len(region_tokens[0]) > 0:
+            rgb_list, dep_list, gdep_list = [], [], []
+            for rgb, dep, gdep in region_tokens[0]:
+                rgb_list.append(rgb.squeeze(0))
+                dep_list.append(dep.squeeze(0))
+                gdep_list.append(gdep.squeeze(0))
+            rgb_batch = torch.stack(rgb_list)   # [N_masks, 1024]
+            dep_batch = torch.stack(dep_list)
+            gdep_batch = torch.stack(gdep_list)
+            
+            # Use visual features from the first image
+            if vis_rgb_list and len(vis_rgb_list) > 0:
+                vis_rgb = lm.norm(vis_rgb_list[0].unsqueeze(0))
+            if vis_dep_list and len(vis_dep_list) > 1:
+                vis_dep = lm.norm(vis_dep_list[1].unsqueeze(0))
+
+        answer = None
+
+        # 4. Route to the correct Head
+        if category == "mcq" and rgb_batch is not None:
+            q, _ = self.visual_fuser(h_cat, vis_rgb, vis_dep)
+            scores = self.mcq_head(rgb_batch, dep_batch, gdep_batch, q)
+            answer = scores.argmax().item()  # 0-8
+            
+        elif category == "left_right" and rgb_batch is not None:
+            q, _ = self.visual_fuser(h_cat, vis_rgb, vis_dep)
+            scores = self.lr_head(rgb_batch, dep_batch, gdep_batch, q)
+            answer = scores.argmax().item()  # 0-1
+            
+        elif category == "distance" and rgb_batch is not None:
+            q, scene = self.visual_fuser(h_cat, vis_rgb, vis_dep)
+            pred = self.dist_head(h_cat, rgb_batch, dep_batch, gdep_batch, [q], [scene])
+            answer = round(pred[0].item(), 2)
+            
+        elif category == "count" and rgb_batch is not None:
+            q, scene = self.visual_fuser(h_cat, vis_rgb, vis_dep)
+            pred = self.count_head(h_cat.unsqueeze(0), [rgb_batch], [dep_batch], [gdep_batch], [q], [scene])
+            answer = round(pred[0].item())
+
         return {
-            "category": parsed["category"],
-            "answer":   parsed["answer"],
+            "category": category,
+            "answer":   answer,
             "raw":      raw_output,
         }
 

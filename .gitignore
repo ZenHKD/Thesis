@@ -7,3 +7,5 @@ result/
 
 model/qwen3.5-0.8b/
 model_micro/qwen3.5-micro/
+
+super_model/qwen3.5-super/

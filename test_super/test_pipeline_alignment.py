@@ -362,26 +362,14 @@ def main():
     answer_start = next((i for i, v in enumerate(lbls) if v != -100), n_text)
 
     # Show every text token with its backbone position
-    prev_pos = -1
     mask_region_idx = 0
     i = 0
     
-    # In Super, 3 tokens (<, mask, >) are replaced by 1 token.
-    # Therefore backbone position is:
-    # backbone_pos = i - (2 * completed_masks) - (current_mask_offset if currently inside mask else 0)
+    # In Super, 3 tokens (<, mask, >) are replaced by 3 tokens (mask_rgb, mask_depth, mask_gdep)
+    # Therefore backbone position is exactly 1:1 with input_ids
 
     while i < n_text:
-        # Calculate backbone position mapping
-        completed_masks = sum(1 for mp in mask_positions_flat if i > mp + mask_token_len - 1)
-        in_mask = False
-        current_offset = 0
-        for mp in mask_positions_flat:
-            if mp <= i < mp + mask_token_len:
-                in_mask = True
-                current_offset = i - mp
-                break
-        
-        backbone_pos = i - (2 * completed_masks) - current_offset
+        backbone_pos = i
 
         tok_id  = ids[i]
         lbl     = lbls[i]
@@ -401,19 +389,17 @@ def main():
                 offset = 0
 
             if offset == 0:
-                rti_label = "region_dpt"
-                src_type = f"[RTI] Region {mask_region_idx}"
-                content  = f"[{rti_label}] (was: {decoded})"
-                lbl_str = str(lbl) if lbl != -100 else "─"
-                active  = "  YES  ←" if lbl != -100 else ""
-                print(f"  {backbone_pos:>8}  {i:>8}  {src_type:<20}  {content:<25}  {lbl_str:>6}  {active}")
+                rti_label = "mask_rgb"
+            elif offset == 1:
+                rti_label = "mask_depth"
             else:
-                # the < and > are removed from sequence
-                src_type = f"[RTI dropped]"
-                content  = f"(was: {decoded})"
-                lbl_str = str(lbl) if lbl != -100 else "─"
-                active  = "  YES  ←" if lbl != -100 else ""
-                print(f"  {'─':>8}  {i:>8}  {src_type:<20}  {content:<25}  {lbl_str:>6}  {active}")
+                rti_label = "mask_gdep"
+                
+            src_type = f"[RTI] Region {mask_region_idx}"
+            content  = f"[{rti_label}] (was: {decoded})"
+            lbl_str = str(lbl) if lbl != -100 else "─"
+            active  = "  YES  ←" if lbl != -100 else ""
+            print(f"  {backbone_pos:>8}  {i:>8}  {src_type:<20}  {content:<25}  {lbl_str:>6}  {active}")
         else:
             if i == answer_start:
                 src_type = ">> ANSWER START"
@@ -439,8 +425,8 @@ def main():
     summary_vis_tok = n_visual if n_visual > 0 else int(h_vis * w_vis)
     print(f"    Visual padding:    {summary_vis_tok} tokens inline over <|image_pad|>")
     print(f"    Text tokens:       {n_text} tokens")
-    print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*1} positions replaced")
-    print(f"        [<] [mask] [>]  -> [region_dpt] (dropped 2)")
+    print(f"    RTI replacements:  {n_masks} × 3 tokens = {n_masks*3} positions replaced")
+    print(f"        [<] [mask] [>]  -> [mask_rgb] [mask_depth] [mask_gdep]")
     print(f"    Total backbone:    {total_seq} positions")
     print(f"    Depth map:         {list(depth_maps_1b.shape)}")
     print()
