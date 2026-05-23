@@ -6,58 +6,41 @@
 
 ## Architecture
 
-### Original model, see `model/`
+**Super Model**, see `super_model/`
 
-**Qwen 3.5 0.8B** (native VLM)
+The "Super" architecture is heavily optimized for spatial fidelity and boundary awareness, eliminating the parameter bloat of previous iterations.
 
-### Micro model, see `model_micro/`
-
-Pruned from **Qwen 3.5 0.8B** (853M): Vision Encoder (12 -> 4 blocks), Backbone (full 24 layers, **single-pass** — no looping). **Full original vocabulary** (248,076 + `<num>` = 248,077 tokens -> remain 248,320 tokens (padded)). Adds **Number Head** for direct numeric regression and **Category Head** (Bilinear) for MCQ/left-right classification. Two parallel input streams: visual (Vision Encoder -> 160 tokens) and region (RTI, independent of Vision Encoder -> 3 learned tokens per `<mask>`). 2-stage fine-tuning (~797M parameters).
+### Core Components
+1. **Vision Encoder**: Qwen 3.5 0.8B ViT (or seamlessly scalable to Qwen 2B ViT for higher patch resolution).
+2. **Backbone**: Qwen 3.5 0.8B Language Model.
+3. **Dual-Image Input**: Both RGB and Depth maps are processed via the Vision Encoder as separate "pictures" (`Picture 1` and `Picture 2`). This solves the global depth context leakage.
+4. **Region Token Injection v2 (RTI v2)**: Replaces lossy CNN pools. Uses a DPT-based Polyphase Multiplexing Module that hooks directly into intermediate ViT layers. Extracts sub-pixel boundary geometry using Multi-Head Mask-Guided Pooling.
+5. **Smart Routing via Special Tokens**: The LLM generates exactly **one** special token per spatial query (`<|dist|>`, `<|count|>`, `<|mcq|>`, or `<|lr|>`). This token acts as a dynamic router—triggering a secondary forward pass that diverts the token's hidden state directly into the specialized heads. No more parsing numbers from text.
 
 ```text
-Stream 1 (Visual)
-RGB Image --------> [Vision Encoder] --> [Merger] ======> visual tokens [160, 1024]
-                     (4 ViT blocks)                              ||
-                                                                 ||
-Stream 2 (Region)                                                ||
-RGB Image --------> [RTI: Region Token Injection]                ||
-Depth Map -------->  (Independent of Vision Encoder)             ||
-RLE Masks -------->  (mask_rgb + mask_depth + mask_geo)          ||
-                                                    |            ||
-                                                    v            ||
+Stream 1 (Global Context)
+[RGB Image]   --> [Vision Encoder] --> [Merger] ======> visual_rgb_tokens [160, 1024]
+[Depth Image] --> [Vision Encoder] --> [Merger] ======> visual_dep_tokens [160, 1024]
+                                                               ||
+Stream 2 (Region-Level Detail)                                 ||
+[Intermediate ViT Features]                                    ||
+[RLE Masks] ------------------> [RTI v2 (Mask-Guided Pooling)] ||
+                                                     |         ||
+                                                     v         ||
 Question* --------> [Token Embedding] ==========> [Inject] ==> [Concat Fusion]
-(*w/ <mask..>)    (Full 248,320 vocab)       (3->3 Replace)     ||
-                                                                 vv
-                                                   [Qwen Backbone] 24 layers (single pass)
-                                                   (6 × [3 DeltaNet + 1 GatedAttn])
-                                                                 ||
-                                +==================+=============++==============+
-                                v                  v                             v
-                            [LM Head]        [Category Head]               [Number Head]
-                                |            (Bilinear Attn)                     |
-                                v                  v                             v
-                           Structured          MCQ/LR pred               Numeric Prediction
-                     <think>reasoning</think>      |                      distance / count
-                        category | answer          |                             |
-                                 |                 |                             |
-                                 v                 v                             v
-                               L_CE             L_Focal                   L_SmoothL1 (dynamic β)
-                                 |                 |                             |
-                                 +------------------L_total ---------------------+
-                                            L = L_CE + α·L_SmoothL1 + γ·L_Focal
+(*w/ <mask..>)                               (3->3 Replace)    ||
+                                                               vv
+                                                [Qwen 0.8B Backbone]
+                                                               ||
+                        [Auto-Regressive Generation of 1 Special Token]
+                                                               ||
+                                 +==================+=============++==============+
+                                 v                  v              v              v
+                            [Dist Head]        [Count Head]   [MCQ Head]      [LR Head]
+                                 |                  |              |              |
+                                 v                  v              v              v
+                            (float) dist       (int) count    (class) mcq     (class) lr
 ```
-
-**Key differences from original model:**
-| Component | Original | Micro |
-|-----------|----------|----------|
-| Vision Encoder | 12 ViT blocks | **4 ViT blocks** (last 4 kept) |
-| Decoder | 24 layers | **24 layers, single pass** |
-| RTI tokens | - | **mask_rgb + mask_depth + mask_geo** |
-| RTI coupling | - | **Independent (raw RGB+Depth+RLE)** |
-| Category Head | - | **Bilinear attention (MCQ + left_right)** |
-| Number Head | - | **xVal regression (distance + count)** |
-| Output format | Direct answer | **`<think>CoT</think>` + structured answer** |
-| Trainable params | ~853M | **~797M** |
 
 ## Dataset
 
@@ -77,46 +60,25 @@ Question* --------> [Token Embedding] ==========> [Inject] ==> [Concat Fusion]
 
 ## Project Structure
 
-```
+```text
 Thesis/
-├── model/
-│   └── qwen3.5-0.8b/               # Local model weights (gitignored)
-├── model_micro/
-│   ├── pipeline.py                 # Micro pipeline (single-pass, no GSA/LoopLM)
-│   ├── rti.py                      # RTI (independent of Vision Encoder, batched)
-│   ├── num_head.py                 # Number Head (xVal-style softplus regression)
-│   ├── cat_head.py                 # Category Head (Bilinear attention)
-│   ├── loss.py                     # Combined CE + SmoothL1 + Focal loss
-│   ├── prune.py                    # Pruning script (Qwen 3.5 0.8B -> Micro)
-│   ├── architecture_micro.md       # Detailed Micro architecture documentation
-│   └── qwen3.5-micro/              # Micro model weights (gitignored)
-├── notebooks/
-│   ├── 00_EDA.ipynb                # Exploratory Data Analysis
-│   ├── 01_RLE_Mask.ipynb           # Mask Analysis
-│   ├── 02_Error_Image.ipynb        # Error Image Analysis
-│   └── 03_Mask_Features.ipynb      # RTI feature visualization (RGB/Depth/Geo)
-├── analysis/                       # Question type analysis (train + val + test)
+├── super_model/
+│   ├── pipeline.py                 # Core VLM Pipeline & Head Routing
+│   ├── dataloader.py               # Multiprocessing DataLoader (Dual-Image + RLE masks)
+│   └── rti.py                      # DPT-based Region Token Injection modules
 ├── src/
-│   ├── dataloader/                 # Dataset loader (batched RTI, decoded masks)
-│   └── train_micro/                # Training + validation + evaluation
-│       ├── train.py                # 2-stage training (Stage 1: frozen decoder, Stage 2: full)
-│       ├── val.py                  # Validation (teacher-forced metrics)
-│       └── evaluation.py           # Inference evaluation (autoregressive, multi-threshold)
-├── test_micro/
-│   ├── test_inference.py           # Inference test (per-sample debug output)
-│   ├── test_backprop.py            # Backprop test (all components)
-│   ├── test_dataloader.py          # Dataloader test (batched RTI, decoded masks)
-│   └── test_pipeline_alignment.py  # Pipeline alignment test
+│   └── train_super/                # Training + inference infrastructure
+│       ├── train.py                # Multi-stage training
+│       ├── test.py                 # High-speed private test inference via DataLoader
+│       └── evaluation.py           # Validation pipeline & accuracy metrics
 ├── data/
-│   ├── balance_train_data.py       # Data balancing script (stratified down/upsampling)
+│   ├── balance_train_data.py       # Data balancing script
 │   └── nvidia_warehouse_dataset/   # Dataset directory (gitignored)
-├── checkpoints/micro/              # Training checkpoints + training.csv (gitignored)
+├── checkpoints/super/              # Training checkpoints (gitignored)
 └── README.md
 ```
 
-## Setup
-
-### Installation
+## Setup & Inference
 
 ```bash
 # Clone the repo
@@ -129,16 +91,27 @@ hf download Qwen/Qwen3.5-0.8B --local-dir model/qwen3.5-0.8b
 # Setup HF token for dataset access
 echo "HF_TOKEN=hf_your_token_here" > .env
 
-# Download the dataset
-python setup_nvidia_dataset.py
+# Generate Private Test Submission
+python src/train_super/test.py \
+    --checkpoint checkpoints/super/stage3/epoch_X \
+    --split test \
+    --batch-size 16
 ```
 
 ## References
-
-- **SmolRGPT**: [arXiv 2509.15490](https://arxiv.org/abs/2509.15490) -- Region-level spatial reasoning for warehouse environments, submitted to ICCVW (primary inspiration for RTI)
 - **RegionGPT**: [CVPR 2024](https://arxiv.org/abs/2403.02330) -- Region understanding VLM with `<region>` token injection (foundation for RTI design)
 - **Qwen 3.5**: [Qwen Team](https://huggingface.co/Qwen/Qwen3.5-0.8B) -- Base VLM backbone
 - **Qwen-VL**: [arXiv 2308.12966](https://arxiv.org/abs/2308.12966) -- Visual grounding token boundary mapping (`<|object_ref_start|>`)
-- **DBNet++**: [TPAMI 2022](https://arxiv.org/abs/2202.10304) -- Differentiable Binarization (soft mask in RTI)
-- **xVal**: [NeurIPS 2023](https://arxiv.org/abs/2310.02989) -- A Continuous Numerical Tokenization (Number Head)
-- **Fast R-CNN**: [ICCV 2015](https://arxiv.org/abs/1504.08083) -- SmoothL1 evaluation metric for bounded geometric distance regression
+
+
+## Download Dataset
+```bash
+HF_TOKEN=$(grep HF_TOKEN .env | cut -d= -f2) && \
+hf download nvidia/PhysicalAI-Spatial-Intelligence-Warehouse \
+  --repo-type dataset \
+  --local-dir ./data/nvidia_warehouse_dataset \
+  --token "$HF_TOKEN"
+
+find ./data/nvidia_warehouse_dataset -name 'chunk_*.tar.gz' -print0 | \
+  xargs -0 -P 8 -I {} sh -c 'echo "[EXTRACT] $(basename "$1")"; tar --no-same-owner -xzf "$1" -C "$(dirname "$1")" && echo "[REMOVE] $(basename "$1")" && rm "$1"' _ {}
+```

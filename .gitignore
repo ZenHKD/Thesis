@@ -6,6 +6,10 @@ result/
 .env
 
 model/qwen3.5-0.8b/
+model/qwen3.5-2b/
 model_micro/qwen3.5-micro/
 
 super_model/qwen3.5-super/
+
+!data/balance_train_data.py
+!data/train_balance.txt 
