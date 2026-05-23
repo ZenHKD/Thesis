@@ -2,9 +2,10 @@
 SpatialVLM Super Training — 4-Head Architecture (DPT Pipeline)
 ==========================================================
 
-2-Stage Training:
+3-Stage Training:
     Stage 1 (--stage 1): Freeze Qwen Vision Encoder
     Stage 2 (--stage 2): Unfreeze Qwen Vision Encoder
+    Stage 3 (--stage 3): DistanceHead v2 
 
 Both stages: Embeddings FROZEN (only <|mcq|>, <|lr|>, <|dist|>, <|count|> trainable)
 
@@ -134,8 +135,8 @@ def main():
     parser.add_argument("--attn-impl",   default="flash_attention_2",
                         choices=["flash_attention_2", "sdpa", "eager"])
     # Training
-    parser.add_argument("--stage",       type=int, default=1, choices=[1, 2],
-                        help="Training stage: 1=freeze vision, 2=unfreeze vision")
+    parser.add_argument("--stage",       type=int, default=1, choices=[1, 2, 3],
+                        help="Training stage: 1=freeze vision, 2=unfreeze vision, 3=dist_head v2 only")
     parser.add_argument("--split",       default="train_balanced", choices=["train", "train_balanced", "train_sample"])
     parser.add_argument("--epochs",      type=int,   default=1)
     parser.add_argument("--lr-vision",   type=float, default=5e-5)
@@ -180,7 +181,7 @@ def main():
 
     CHECKPOINT_DIR = os.path.join(CHECKPOINT_BASE, f"stage{args.stage}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    csv_path = os.path.join(CHECKPOINT_BASE, "training.csv")
+    csv_path = os.path.join(CHECKPOINT_BASE, f"training_stage{args.stage}.csv")
 
     # ====================================================================
     # 1. LOAD MODEL
@@ -193,6 +194,7 @@ def main():
         dtype=dtype,
         device_map=args.device,
         attn_implementation=args.attn_impl,
+        dist_head_version=2 if args.stage == 3 else 1,
     )
     print_vram_usage("after model load")
 
@@ -210,7 +212,21 @@ def main():
         wt_path = os.path.join(args.init_weights, "model.safetensors")
         if os.path.exists(wt_path):
             from safetensors.torch import load_file as _lf
-            pipeline.load_state_dict(_lf(wt_path), strict=False)
+            ckpt_state = _lf(wt_path)
+
+            # Filter out keys with shape mismatch (e.g. dist_head v1 → v2)
+            model_state = pipeline.state_dict()
+            skipped = []
+            for k in list(ckpt_state.keys()):
+                if k in model_state and ckpt_state[k].shape != model_state[k].shape:
+                    skipped.append(f"{k}: ckpt={list(ckpt_state[k].shape)} vs model={list(model_state[k].shape)}")
+                    del ckpt_state[k]
+            if skipped:
+                print(f"  [*] Skipped {len(skipped)} shape-mismatched keys:")
+                for s in skipped:
+                    print(f"      {s}")
+
+            pipeline.load_state_dict(ckpt_state, strict=False)
             print(f"  [*] Loaded weights from: {wt_path}")
         else:
             raise FileNotFoundError(f"No model.safetensors in {args.init_weights}")
@@ -243,11 +259,17 @@ def main():
         for p in pipeline.qwen.model.visual.parameters():
             p.requires_grad = False
         print(f"  [*] Vision Encoder FROZEN (Stage 1)")
-    else:
+    elif args.stage == 2:
         # Stage 2: Unfreeze vision encoder
         for p in pipeline.qwen.model.visual.parameters():
             p.requires_grad = True
         print(f"  [*] Vision Encoder TRAINABLE (Stage 2)")
+    elif args.stage == 3:
+        # Stage 3: Like Stage 2 (all trainable) but with DistanceHeadV2
+        # Backbone must adapt hidden states at <|dist|> for new head
+        for p in pipeline.qwen.model.visual.parameters():
+            p.requires_grad = True
+        print(f"  [*] Stage 3: Vision TRAINABLE + DistanceHeadV2 (Concat Fusion)")
 
     # Build optimizer param groups (only include params with requires_grad)
     vision_params = [p for p in pipeline.qwen.model.visual.parameters() if p.requires_grad]
@@ -579,6 +601,7 @@ def main():
                 if args.val_steps > 0 and global_step % args.val_steps == 0 and global_step > 0:
                     print(f"\n  [{'='*70}]")
                     print(f"  Running validation at step {global_step}...")
+                    optimizer.zero_grad(set_to_none=True)  # Free gradient VRAM
                     torch.cuda.empty_cache()
 
                     val_results = validate(

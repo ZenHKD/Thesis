@@ -248,35 +248,43 @@ class SpatialVLMDataset(Dataset):
         question = question_raw.replace("<image>\n", "").replace("<image>", "").strip()
 
         # 4. Determine task type fields
-        category = entry["category"]
-        is_numeric = category in ("distance", "count")
-        is_categorical = category in ("mcq", "left_right")
-        target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
-        
-        # For classification heads: target index = which mask is the answer
-        if is_categorical:
-            raw_answer = str(entry["normalized_answer"]).strip().strip('"').strip("'")
-            if category == "mcq":
-                target_cat_index = int(raw_answer)  # Region index (0-12)
-            elif category == "left_right":
-                target_cat_index = 0 if raw_answer == "left" else 1
+        if self.split == "test":
+            category = "unknown"
+            is_numeric = False
+            is_categorical = False
+            target_num = 0.0
+            target_cat_index = -1
+            ans_text = ""
+        else:
+            category = entry["category"]
+            is_numeric = category in ("distance", "count")
+            is_categorical = category in ("mcq", "left_right")
+            target_num = float(entry["normalized_answer"]) if is_numeric else 0.0
+            
+            # For classification heads: target index = which mask is the answer
+            if is_categorical:
+                raw_answer = str(entry["normalized_answer"]).strip().strip('"').strip("'")
+                if category == "mcq":
+                    target_cat_index = int(raw_answer)  # Region index (0-12)
+                elif category == "left_right":
+                    target_cat_index = 0 if raw_answer == "left" else 1
+                else:
+                    target_cat_index = -1
             else:
                 target_cat_index = -1
-        else:
-            target_cat_index = -1
 
-        # 5. Build answer string (direct token output, no category prefix)
-        if category == "distance":
-            ans_text = ""
-        elif category == "count":
-            ans_text = ""
-        elif category == "mcq":
-            ans_text = ""
-        elif category == "left_right":
-            ans_text = ""
-        else:
-            raw = str(entry["normalized_answer"])
-            ans_text = f'"{raw}"'
+            # 5. Build answer string (direct token output, no category prefix)
+            if category == "distance":
+                ans_text = ""
+            elif category == "count":
+                ans_text = ""
+            elif category == "mcq":
+                ans_text = ""
+            elif category == "left_right":
+                ans_text = ""
+            else:
+                raw = str(entry["normalized_answer"])
+                ans_text = f'"{raw}"'
 
         tail_str = "<|im_end|>\n"
 
@@ -365,17 +373,20 @@ class SpatialVLMDataset(Dataset):
             count_token_pos = self._find_token_pos(input_ids, self.count_token_id)
 
         # 13. Format answer for metadata
-        raw_answer = str(entry["normalized_answer"])
-        if category == "mcq":
-            answer_str = f"<|mcq|>={raw_answer}"
-        elif category == "left_right":
-            answer_str = f"<|lr|>={raw_answer}"
-        elif category == "distance":
-            answer_str = f"<|dist|>={raw_answer}"
-        elif category == "count":
-            answer_str = f"<|count|>={raw_answer}"
+        if self.split == "test":
+            answer_str = ""
         else:
-            answer_str = raw_answer
+            raw_answer = str(entry["normalized_answer"])
+            if category == "mcq":
+                answer_str = f"<|mcq|>={raw_answer}"
+            elif category == "left_right":
+                answer_str = f"<|lr|>={raw_answer}"
+            elif category == "distance":
+                answer_str = f"<|dist|>={raw_answer}"
+            elif category == "count":
+                answer_str = f"<|count|>={raw_answer}"
+            else:
+                answer_str = raw_answer
 
         # 14. Pre-decode RLE masks + soft masks (use RGB grid for mask resolution)
         _, h_p, w_p = [int(x) for x in image_grid_thw[0].tolist()]
@@ -413,6 +424,8 @@ class SpatialVLMDataset(Dataset):
             "category":       category,
             "answer":         answer_str,
             "image_name":     image_name,
+            "_question":      question,
+            "_id":            entry["id"],
             "is_numeric":     is_numeric,
             "is_categorical": is_categorical,
             "target_num":     target_num,

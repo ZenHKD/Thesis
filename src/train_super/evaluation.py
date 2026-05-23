@@ -302,10 +302,12 @@ def main():
                         choices=["flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--resolution",     default="320p",
                         choices=["1080p", "720p", "540p", "450p", "320p"])
-    parser.add_argument("--batch-size",     type=int, default=1,
+    parser.add_argument("--batch-size",     type=int, default=16,
                         help="Batch size for inference")
     parser.add_argument("--compile",        action="store_true",
                         help="Enable torch.compile for faster inference")
+    parser.add_argument("--dist-head-version", type=int, default=2, choices=[1, 2],
+                        help="Distance head version: 1=v1 (residual), 2=v2 (concat)")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -321,6 +323,7 @@ def main():
         dtype=torch.bfloat16,
         device_map=args.device,
         attn_implementation=args.attn_impl,
+        dist_head_version=args.dist_head_version,
     )
     
     ckpt_path = args.checkpoint
@@ -367,6 +370,13 @@ def main():
 
     num_thresholds = [0.10, 0.15, 0.20]
     num_thresh_results = {t: {cat: {"correct": 0, "total": 0} for cat in ["count", "distance"]} for t in num_thresholds}
+
+    # Distance accuracy by GT range bins
+    dist_range_bins = [(0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12), (12, 14), (14, 16), (16, float('inf'))]
+    dist_range_results = {
+        t: {(lo, hi): {"correct": 0, "total": 0} for (lo, hi) in dist_range_bins}
+        for t in num_thresholds
+    }
 
     # Build batches on-the-fly
     num_batches = (N + args.batch_size - 1) // args.batch_size
@@ -426,6 +436,13 @@ def main():
                                     if rel_err <= t:
                                         num_thresh_results[t]["distance"]["correct"] += 1
                                     num_thresh_results[t]["distance"]["total"] += 1
+                                    # Per-range tracking
+                                    for (lo, hi) in dist_range_bins:
+                                        if lo <= gt_num < hi:
+                                            dist_range_results[t][(lo, hi)]["total"] += 1
+                                            if rel_err <= t:
+                                                dist_range_results[t][(lo, hi)]["correct"] += 1
+                                            break
                             else:
                                 near_match = abs(dist_pred - gt_num) < 0.5
                                 match = near_match
@@ -433,6 +450,10 @@ def main():
                                     if near_match:
                                         num_thresh_results[t]["distance"]["correct"] += 1
                                     num_thresh_results[t]["distance"]["total"] += 1
+                                    # Bin 0-2 for near-zero GT
+                                    dist_range_results[t][(0, 2)]["total"] += 1
+                                    if near_match:
+                                        dist_range_results[t][(0, 2)]["correct"] += 1
                         except (ValueError, TypeError):
                             match = False
 
@@ -523,6 +544,24 @@ def main():
         total = num_thresh_results[num_thresholds[0]][num_cat]["total"]
         print(f"  {num_cat:<12}  {'  '.join(accs)}  {total:>6}")
 
+    # Distance accuracy by GT range
+    print(f"\n{'='*70}")
+    print(f"DISTANCE ACCURACY BY RANGE")
+    print(f"{'='*70}")
+    print(f"  {'Range':<12}  {'@10%':>8}  {'@15%':>8}  {'@20%':>8}  {'Total':>6}")
+    print(f"  {'-'*50}")
+    for (lo, hi) in dist_range_bins:
+        label = f"[{lo}-{hi}]" if hi != float('inf') else f"[{lo}+]"
+        accs = []
+        total_bin = 0
+        for t in num_thresholds:
+            r = dist_range_results[t][(lo, hi)]
+            total_bin = r["total"]
+            acc = r["correct"] / max(r["total"], 1) * 100
+            accs.append(f"{acc:>7.1f}%")
+        if total_bin > 0:
+            print(f"  {label:<12}  {'  '.join(accs)}  {total_bin:>6}")
+
     print(f"\n{'='*70}")
     print(f"CATEGORY CONFUSION MATRIX (Row=GT, Col=Pred)")
     print(f"{'='*70}")
@@ -590,6 +629,25 @@ def main():
             accs.append(f"{acc:>7.1f}%")
         total = num_thresh_results[num_thresholds[0]][num_cat]["total"]
         lines.append(f"  {num_cat:<12}  {'  '.join(accs)}  {total:>6}")
+    lines.append("")
+
+    # Distance accuracy by GT range in file
+    lines.append("=" * 70)
+    lines.append("DISTANCE ACCURACY BY RANGE")
+    lines.append("=" * 70)
+    lines.append(f"  {'Range':<12}  {'@10%':>8}  {'@15%':>8}  {'@20%':>8}  {'Total':>6}")
+    lines.append(f"  {'-'*50}")
+    for (lo, hi) in dist_range_bins:
+        label = f"[{lo}-{hi}]" if hi != float('inf') else f"[{lo}+]"
+        accs = []
+        total_bin = 0
+        for t in num_thresholds:
+            r = dist_range_results[t][(lo, hi)]
+            total_bin = r["total"]
+            acc = r["correct"] / max(r["total"], 1) * 100
+            accs.append(f"{acc:>7.1f}%")
+        if total_bin > 0:
+            lines.append(f"  {label:<12}  {'  '.join(accs)}  {total_bin:>6}")
     lines.append("")
 
     lines.append("=" * 70)

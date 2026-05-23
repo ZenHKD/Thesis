@@ -39,7 +39,7 @@ from transformers.masking_utils import create_causal_mask
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from super_model.rti import RTE
-from super_model.heads import MCQHead, LeftRightHead, DistanceHead, CountHead
+from super_model.heads import MCQHead, LeftRightHead, DistanceHead, DistanceHeadV2, CountHead
 
 
 # Default model path
@@ -128,7 +128,7 @@ class SpatialVLM(nn.Module):
         self.region_token_extractor  - RTE (DPT-style multi-layer ViT features)
         self.mcq_head                - MCQHead
         self.lr_head                 - LeftRightHead
-        self.dist_head               - DistanceHead
+        self.dist_head               - DistanceHead (v1) or DistanceHeadV2 (v2)
         self.count_head              - CountHead
 
     Qwen built-in (from Qwen 3.5 0.8B):
@@ -144,8 +144,10 @@ class SpatialVLM(nn.Module):
         dtype                          = torch.bfloat16,
         device_map:              str   = "auto",
         attn_implementation:     str   = "sdpa",
+        dist_head_version:       int   = 1,
     ):
         super().__init__()
+        self.dist_head_version = dist_head_version
 
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
@@ -187,7 +189,11 @@ class SpatialVLM(nn.Module):
         self.region_token_extractor = RTE(hidden_dim=1024, vit_dim=768)
         self.mcq_head   = MCQHead(hidden_dim=1024)
         self.lr_head    = LeftRightHead(hidden_dim=1024)
-        self.dist_head  = DistanceHead(hidden_dim=1024)
+        if dist_head_version == 2:
+            self.dist_head = DistanceHeadV2(hidden_dim=1024)
+            print(f"  [*] Using DistanceHeadV2 (Concat Fusion)")
+        else:
+            self.dist_head = DistanceHead(hidden_dim=1024)
         self.count_head = CountHead(hidden_dim=1024)
 
         self.decoder_dropout = nn.Dropout(dropout)
@@ -334,7 +340,7 @@ class SpatialVLM(nn.Module):
         self,
         pixel_values:         torch.Tensor,
         image_grid_thw:       torch.Tensor,   # [B*2, 3] — RGB + Depth per sample
-        depth_maps:           torch.Tensor,
+        depth_maps:           torch.Tensor,   # Hold if in the future, use other vision encoder for Depth image
         input_ids:            torch.Tensor,   # [B, L]
         rle_list:             list = None,    # [B][num_masks]
         mask_token_positions: list = None,    # [B][num_masks]
@@ -673,12 +679,11 @@ class SpatialVLM(nn.Module):
         input_ids:            torch.Tensor,
         rle_list:             list = None,
         mask_token_positions: list = None,
-        max_new_tokens:       int  = 20,
-        repetition_penalty:   float = 1.2,
+        max_new_tokens:       int  = 3,
         decoded_masks:        list = None,
         **gen_kwargs,
     ) -> torch.Tensor:
-        """Autoregressive generation with repetition penalty."""
+        """Autoregressive generation (greedy argmax)."""
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache  # type: ignore
 
         inputs_embeds, _region_tokens = self._build_inputs_embeds(
@@ -704,18 +709,9 @@ class SpatialVLM(nn.Module):
         hidden_norm = lm.norm(hidden[:, -1:, :])
         logits = self.qwen.lm_head(hidden_norm)
 
-        if repetition_penalty != 1.0:
-            for b in range(B):
-                for tok_id in input_ids[b].unique():
-                    if logits[b, -1, tok_id] > 0:
-                        logits[b, -1, tok_id] /= repetition_penalty
-                    else:
-                        logits[b, -1, tok_id] *= repetition_penalty
-
         next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         generated = [next_tok]
-        all_generated = next_tok.clone()
 
         for step in range(max_new_tokens - 1):
             if eos_id is not None and (next_tok == eos_id).all():
@@ -733,18 +729,9 @@ class SpatialVLM(nn.Module):
             hidden_norm = lm.norm(hidden)
             logits = self.qwen.lm_head(hidden_norm)
 
-            if repetition_penalty != 1.0:
-                for b in range(B):
-                    for tok_id in all_generated[b].unique():
-                        if logits[b, -1, tok_id] > 0:
-                            logits[b, -1, tok_id] /= repetition_penalty
-                        else:
-                            logits[b, -1, tok_id] *= repetition_penalty
-
             next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
             generated.append(next_tok)
-            all_generated = torch.cat([all_generated, next_tok], dim=1)
 
         output_ids = torch.cat(generated, dim=1)
         return output_ids
@@ -766,149 +753,6 @@ class SpatialVLM(nn.Module):
             category = _TOKEN_TO_CATEGORY.get(token, "unknown")
             return {"category": category, "answer": token}
         return {"category": "unknown", "answer": None}
-
-    # ---- Full inference ----
-
-    @torch.no_grad()
-    def predict(
-        self,
-        image_processor_output,         # Dict from image_processor (dual-image)
-        question: str,
-        depth_map: torch.Tensor,        # [H, W] raw
-        rle_list: list = None,
-        max_new_tokens: int = 1,        # Only need 1 token for the category!
-    ) -> dict:
-        """Single-shot inference: image + question -> {category, answer, raw}.
-        Uses Decoupled Reasoning (Heads) to predict the final answer.
-        """
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache # type: ignore
-
-        dev   = self.device
-        dtype = next(self.qwen.parameters()).dtype
-        lm = self.qwen.model.language_model
-
-        import re
-        mask_idx = [0]
-        def replace_mask(m):
-            i = mask_idx[0]
-            mask_idx[0] += 1
-            return f"[Region {i}]: <|object_ref_start|>{m.group(1)}<|object_ref_end|>"
-        formatted_question = re.sub(r'(<mask.*?>)', replace_mask, question)
-
-        image_grid_thw = image_processor_output["image_grid_thw"].to(device=dev)
-        # RGB tokens (first image)
-        h_p_rgb, w_p_rgb = image_grid_thw[0, 1].item(), image_grid_thw[0, 2].item()
-        num_visual_rgb = int((h_p_rgb // 2) * (w_p_rgb // 2))
-        # Depth tokens (second image)
-        h_p_dep, w_p_dep = image_grid_thw[1, 1].item(), image_grid_thw[1, 2].item()
-        num_visual_dep = int((h_p_dep // 2) * (w_p_dep // 2))
-        
-        vision_str_1 = "Picture 1 (RGB): <|vision_start|>" + "<|image_pad|>" * num_visual_rgb + "<|vision_end|>\n"
-        vision_str_2 = "Picture 2 (Depth): <|vision_start|>" + "<|image_pad|>" * num_visual_dep + "<|vision_end|>\n"
-        user_str = f"<|im_start|>user\n{vision_str_1}{vision_str_2}{formatted_question}<|im_end|>\n"
-        full_prompt = user_str + "<|im_start|>assistant\n"
-
-        input_ids = self.processor.tokenizer(
-            full_prompt, return_tensors="pt", padding=False
-        ).input_ids.to(dev)
-
-        pixel_values   = image_processor_output["pixel_values"].to(device=dev, dtype=dtype)
-        depth_batch    = depth_map.unsqueeze(0).to(device=dev, dtype=dtype)
-
-        # Auto-find <mask> positions
-        mask_positions = find_mask_positions(input_ids, self.processor.tokenizer)
-
-        if rle_list is not None and len(rle_list) > 0:
-            n = min(len(mask_positions), len(rle_list))
-            mask_positions = mask_positions[:n]
-            rle_list = rle_list[:n]
-            rle_list_batched = [rle_list]
-            mask_positions_batched = [mask_positions]
-        else:
-            rle_list_batched = None
-            mask_positions_batched = None
-
-        # Build embeddings with RTI
-        inputs_embeds, region_tokens = self._build_inputs_embeds(
-            pixel_values, image_grid_thw, depth_batch, input_ids,
-            rle_list=rle_list_batched, mask_token_positions=mask_positions_batched,
-        )
-
-        # 1. Forward the prompt to predict the Category Token
-        B, T, _ = inputs_embeds.shape
-        cache = Qwen3_5DynamicCache(config=lm.config)
-        attn_mask = torch.ones(B, T, dtype=torch.long, device=dev)
-        cache_position = torch.arange(T, device=dev)
-
-        hidden = self._backbone_forward(
-            inputs_embeds, attention_mask=attn_mask,
-            past_key_values=cache, cache_position=cache_position,
-        )
-        hidden_norm = lm.norm(hidden[:, -1:, :])
-        logits = self.qwen.lm_head(hidden_norm)
-        
-        # Predict the category token (e.g. <|mcq|>)
-        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        cat_token_id = next_tok[0, 0].item()
-        
-        # Decode to get string category (just for logging/parsing)
-        raw_output = self.processor.tokenizer.decode([cat_token_id]).strip()
-        parsed = self.parse_output(raw_output)
-        category = parsed.get("category", "unknown")
-
-        # If it's not a spatial reasoning token, just return early
-        if category == "unknown":
-            return {"category": "unknown", "answer": None, "raw": raw_output}
-
-        # 2. Forward the Category Token to get its Hidden State for the Head
-        tok_embed = lm.embed_tokens(next_tok)
-        step_cache_pos = torch.tensor([T], device=dev)
-        attn_mask = torch.cat([attn_mask, torch.ones(B, 1, dtype=torch.long, device=dev)], dim=1)
-
-        hidden_head = self._backbone_forward(
-            tok_embed, past_key_values=cache, cache_position=step_cache_pos,
-            attention_mask=attn_mask,
-        )
-        # The hidden state of the category token
-        h_cat = lm.norm(hidden_head[:, 0, :])  # [1, 1024]
-
-        # 3. Prepare visual features for the Heads
-        rgb_batch, dep_batch, gdep_batch = None, None, None
-        
-        if region_tokens and len(region_tokens[0]) > 0:
-            rgb_list, dep_list, gdep_list = [], [], []
-            for rgb, dep, gdep in region_tokens[0]:
-                rgb_list.append(rgb.squeeze(0))
-                dep_list.append(dep.squeeze(0))
-                gdep_list.append(gdep.squeeze(0))
-            rgb_batch = torch.stack(rgb_list)   # [N_masks, 1024]
-            dep_batch = torch.stack(dep_list)
-            gdep_batch = torch.stack(gdep_list)
-
-        answer = None
-
-        # 4. Route to the correct Head
-        if category == "mcq" and rgb_batch is not None:
-            scores = self.mcq_head(rgb_batch, dep_batch, gdep_batch, h_cat)
-            answer = scores.argmax().item()  
-            
-        elif category == "left_right" and rgb_batch is not None:
-            scores = self.lr_head(rgb_batch, dep_batch, gdep_batch, h_cat)
-            answer = scores.argmax().item()  # 0-1
-            
-        elif category == "distance" and rgb_batch is not None:
-            pred = self.dist_head(h_cat, [rgb_batch], [dep_batch], [gdep_batch])
-            answer = round(pred[0].item(), 2)
-            
-        elif category == "count" and rgb_batch is not None:
-            pred = self.count_head(h_cat, [rgb_batch], [dep_batch], [gdep_batch])
-            answer = round(pred[0].item())
-
-        return {
-            "category": category,
-            "answer":   answer,
-            "raw":      raw_output,
-        }
 
 
 def count_parameters(model: nn.Module) -> dict:
